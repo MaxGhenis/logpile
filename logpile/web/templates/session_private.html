@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Private session — Logpile{% endblock %}
+{% block page_title %}Session{% endblock %}
+
+{% block content %}
+<div class="session-header" style="margin-bottom:20px;">
+  <div class="session-meta-grid">
+    <div class="meta-item">
+      <span class="meta-label">ID</span>
+      <span class="meta-value mono">{{ session.session_id[:20] }}...</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Operator</span>
+      <span class="meta-value"><span class="badge-user">{{ session.user_display_name or session.username }}</span></span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Tool</span>
+      <span class="meta-value">
+        <span class="badge-source badge-source-{{ session.source }}">
+          {{ 'CC' if session.source == 'claudecode' else 'Codex' }}
+        </span>
+      </span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Messages</span>
+      <span class="meta-value">{{ session.user_message_count }} user / {{ session.assistant_message_count }} assistant</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Tool calls</span>
+      <span class="meta-value">{{ session.tool_call_count }}</span>
+    </div>
+  </div>
+</div>
+
+<div class="private-notice">
+  <div class="private-icon">&#9679;</div>
+  <div class="private-title">Private session</div>
+  <div class="private-desc">
+    This session's transcript is not visible.<br>
+    It is excluded from public listings and public profile totals.
+  </div>
+</div>
+{% endblock %}

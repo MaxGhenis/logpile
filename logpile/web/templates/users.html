@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}People — Logpile{% endblock %}
+{% block page_title %}People{% endblock %}
+
+{% block content %}
+<div class="people-grid">
+  {% for r in rows %}
+  <a href="{{ url_for('user_profile', slug=r.slug) }}" class="person-card">
+    <div class="person-name">@{{ r.slug }}</div>
+    {% if r.display_name != r.slug %}
+    <div style="color:var(--text-dim);font-size:0.85rem;">{{ r.display_name }}</div>
+    {% endif %}
+    <div class="person-stats">
+      <div class="person-stat-item">
+        <span class="person-stat-value">{{ "{:,}".format(r.sessions or 0) }}</span>
+        <span class="person-stat-label">sessions</span>
+      </div>
+      <div class="person-stat-item">
+        <span class="person-stat-value">{{ "{:,}".format(r.messages or 0) }}</span>
+        <span class="person-stat-label">messages</span>
+      </div>
+      <div class="person-stat-item">
+        <span class="person-stat-value">{{ "{:,}".format(r.tool_calls or 0) }}</span>
+        <span class="person-stat-label">tool calls</span>
+      </div>
+      <div class="person-stat-item">
+        <span class="person-stat-value">{{ "{:,.0f}".format((r.tokens or 0) / 1000000) }}M</span>
+        <span class="person-stat-label">tokens</span>
+      </div>
+    </div>
+    <div class="person-meta">
+      {{ fmt_ts(r.first_seen) }} &mdash; {{ fmt_ts(r.last_seen) }}
+    </div>
+  </a>
+  {% else %}
+  <div class="empty-cell" style="grid-column:1/-1;">No users indexed yet.</div>
+  {% endfor %}
+</div>
+{% endblock %}

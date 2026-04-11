@@ -1,0 +1,163 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Logpile{% endblock %}
+{% block page_title %}Dashboard{% endblock %}
+
+{% block content %}
+<div class="stats-grid" style="margin-bottom:16px;">
+  <div class="stat-card">
+    <div class="stat-value">{{ "{:,}".format(stats.total_sessions or 0) }}</div>
+    <div class="stat-label">sessions</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{ "{:,}".format((stats.total_user_msgs or 0) + (stats.total_assistant_msgs or 0)) }}</div>
+    <div class="stat-label">messages</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{ "{:,.0f}".format(((stats.total_input_tokens or 0) + (stats.total_output_tokens or 0)) / 1000000) }}M</div>
+    <div class="stat-label">tokens</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{ stats.active_users or 0 }}</div>
+    <div class="stat-label">operators</div>
+  </div>
+</div>
+
+<div class="split-grid split-grid-main" style="margin-bottom:16px;">
+  <div class="chart-card">
+    <div class="chart-title">Activity — last 30 days</div>
+    <canvas id="chartMsgsUser" height="130"></canvas>
+  </div>
+  <div class="chart-card">
+    <div class="chart-title">CC vs Codex</div>
+    <canvas id="chartMsgsTool" height="130"></canvas>
+  </div>
+</div>
+
+<div class="split-grid split-grid-main" style="margin-bottom:24px;">
+  <div class="chart-card">
+    <div class="chart-title">Most-used tools</div>
+    <canvas id="chartTopTools" height="130"></canvas>
+  </div>
+  <div class="chart-card">
+    <div class="chart-title">Errors by operator</div>
+    <canvas id="chartErrors" height="130"></canvas>
+  </div>
+</div>
+
+<div class="card-section">
+  <div class="section-title">Recent sessions</div>
+  <div class="table-scroll table-scroll-wide">
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>When</th>
+        <th>Operator</th>
+        <th>Tool</th>
+        <th>Project</th>
+        <th>Msgs</th>
+        <th>Tokens</th>
+        <th>First message</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in recent %}
+      <tr>
+        <td class="ts">{{ fmt_ts(r.first_timestamp) }}</td>
+        <td><a href="{{ url_for('user_profile', slug=r.user_slug or r.username) }}" class="badge-user-link"><span class="badge-user">{{ r.user_display_name }}</span></a></td>
+        <td><span class="badge-source badge-source-{{ r.source }}">{{ 'CC' if r.source == 'claudecode' else 'Codex' }}</span></td>
+        <td class="project-cell">{{ display_project(r.project) | truncate(30, True, '\u2026') }}</td>
+        <td>{{ (r.user_message_count or 0) + (r.assistant_message_count or 0) }}</td>
+        <td class="mono">{{ "{:,}".format(r.tokens or 0) }}</td>
+        <td class="preview-cell">
+          <a href="{{ url_for('session_detail', session_id=r.session_id) }}" class="preview-link">
+            {{ (r.first_user_message or '\u2014') | truncate(80, True, '\u2026') }}
+          </a>
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty-cell">No sessions yet. Run <code>logpile sync</code> to populate.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <div class="section-footer">
+    <a href="{{ url_for('sessions') }}">View all sessions &rarr;</a>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const chartColors = {
+  amber: '#f59e0b',
+  amberDim: '#d97706',
+  blue: '#60a5fa',
+  green: '#84cc16',
+  grid: '#292524',
+  tick: '#78716c',
+  legend: '#a8a29e',
+};
+
+const chartDefaults = {
+  responsive: true,
+  plugins: {
+    legend: {
+      labels: {
+        color: chartColors.legend,
+        font: { family: "'Plus Jakarta Sans', sans-serif", size: 11 },
+        boxWidth: 12,
+        padding: 16,
+      }
+    }
+  },
+  scales: {
+    x: {
+      ticks: { color: chartColors.tick, maxTicksLimit: 8, font: { size: 10 } },
+      grid: { color: chartColors.grid, drawBorder: false },
+    },
+    y: {
+      ticks: { color: chartColors.tick, font: { size: 10 } },
+      grid: { color: chartColors.grid, drawBorder: false },
+      beginAtZero: true,
+    },
+  },
+};
+
+async function loadChart(url, canvasId, type, overrides) {
+  const res = await fetch(url);
+  const data = await res.json();
+
+  /* re-color datasets with warm palette */
+  const palette = ['#f59e0b','#60a5fa','#84cc16','#ef4444','#a78bfa','#fb923c','#22d3ee','#f472b6'];
+  data.datasets.forEach((ds, i) => {
+    if (type === 'line') {
+      ds.borderColor = ds.borderColor || palette[i % palette.length];
+      ds.backgroundColor = (ds.borderColor || palette[i]) + '18';
+      ds.borderWidth = 2;
+      ds.pointRadius = 0;
+      ds.pointHoverRadius = 4;
+      ds.tension = 0.35;
+    } else if (type === 'bar') {
+      ds.backgroundColor = palette[i % palette.length] + '99';
+      ds.borderColor = palette[i % palette.length];
+      ds.borderWidth = 1;
+      ds.borderRadius = 3;
+    }
+  });
+
+  const opts = JSON.parse(JSON.stringify(chartDefaults));
+  if (type === 'bar') {
+    opts.scales.x.ticks.maxRotation = 45;
+    opts.scales.x.ticks.font = { size: 9 };
+  }
+  Object.assign(opts, overrides || {});
+
+  new Chart(document.getElementById(canvasId), { type, data, options: opts });
+}
+
+loadChart('/api/messages-per-day',  'chartMsgsUser',  'line');
+loadChart('/api/messages-per-tool', 'chartMsgsTool',  'line');
+loadChart('/api/top-tools',        'chartTopTools',   'bar');
+loadChart('/api/error-rate',       'chartErrors',     'bar');
+</script>
+{% endblock %}

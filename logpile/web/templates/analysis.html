@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}Analysis — Logpile{% endblock %}
+{% block page_title %}Analysis{% endblock %}
+
+{% block content %}
+<div class="card-section" style="margin-bottom:20px;">
+  <div class="section-title">Operator stats</div>
+  <div class="table-scroll table-scroll-wide">
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Operator</th>
+        <th>Sessions</th>
+        <th>Msgs</th>
+        <th>Tool calls</th>
+        <th>Errors</th>
+        <th>Tokens</th>
+        <th>First seen</th>
+        <th>Last seen</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in user_rows %}
+      <tr>
+        <td><a href="{{ url_for('user_profile', slug=r.slug or r.username) }}" class="badge-user-link"><span class="badge-user">{{ r.display_name }}</span></a></td>
+        <td>{{ r.sessions }}</td>
+        <td>{{ r.user_msgs or 0 }}</td>
+        <td>{{ r.tool_calls or 0 }}</td>
+        <td>{% if r.errors %}<span class="text-danger">{{ r.errors }}</span>{% else %}0{% endif %}</td>
+        <td class="mono">{{ "{:,.0f}".format((r.tokens or 0) / 1000000) }}M</td>
+        <td class="ts">{{ fmt_ts(r.first_seen) }}</td>
+        <td class="ts">{{ fmt_ts(r.last_seen) }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="empty-cell">No data yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="split-grid split-grid-equal" style="margin-bottom:20px;">
+  <div class="card-section">
+    <div class="section-title">Top tool calls</div>
+    <div class="table-scroll table-scroll-compact">
+    <table class="data-table">
+      <thead><tr><th>Tool</th><th>Calls</th><th></th></tr></thead>
+      <tbody>
+        {% set max_cnt = tool_rows[0].cnt if tool_rows else 1 %}
+        {% for r in tool_rows %}
+        <tr>
+          <td class="mono">{{ r.tool_name }}</td>
+          <td>{{ r.cnt }}</td>
+          <td><div class="mini-bar" style="width:{{ (r.cnt / max_cnt * 100) | int }}%"></div></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="3" class="empty-cell">No tool calls recorded.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="card-section">
+    <div class="section-title">Top bash / shell commands</div>
+    <div class="table-scroll table-scroll-compact">
+    <table class="data-table">
+      <thead><tr><th>Command</th><th>Count</th></tr></thead>
+      <tbody>
+        {% for item in bash_cmds %}
+        <tr>
+          <td class="mono cmd-cell">{{ item.cmd }}</td>
+          <td>{{ item.cnt }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="2" class="empty-cell">No bash commands recorded.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+</div>
+
+<div class="card-section">
+  <div class="section-title">Shared utility candidates
+    <span class="section-subtitle">&mdash; commands run by 2+ operators</span>
+  </div>
+  <div class="table-scroll table-scroll-wide">
+  <table class="data-table">
+    <thead>
+      <tr><th>Command</th><th>Operators</th><th>Total runs</th></tr>
+    </thead>
+    <tbody>
+      {% for r in shared_rows %}
+      <tr>
+        <td class="mono cmd-cell">{{ r.command | truncate(100, True, '\u2026') }}</td>
+        <td><span class="badge-source" style="background:var(--amber-glow);color:var(--amber);border:1px solid rgba(245,158,11,0.25);">{{ r.users }}</span></td>
+        <td>{{ r.total }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="empty-cell">
+        Not enough operators yet &mdash; invite teammates and re-sync.
+      </td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% endblock %}

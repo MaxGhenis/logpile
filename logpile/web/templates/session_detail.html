@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+{% block title %}Session {{ session.session_id[:12] }}… — Logpile{% endblock %}
+{% block page_title %}Session detail{% endblock %}
+
+{% block content %}
+<!-- Session header -->
+<div class="session-header mb-4">
+  <div class="session-meta-grid">
+    <div class="meta-item">
+      <span class="meta-label">ID</span>
+      <span class="meta-value mono">{{ session.session_id[:20] }}…</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">User</span>
+      <span class="meta-value"><a href="{{ url_for('user_profile', slug=session.user_slug or session.username) }}" class="badge-user-link"><span class="badge-user">{{ session.user_display_name }}</span></a></span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Tool</span>
+      <span class="meta-value">
+        <span class="badge-source badge-source-{{ session.source }}">
+          {{ 'CC' if session.source == 'claudecode' else 'Codex' }}
+        </span>
+      </span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Project</span>
+      <span class="meta-value">{{ display_project(session.project) }}</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Started</span>
+      <span class="meta-value">{{ fmt_ts(session.first_timestamp) }}</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Duration</span>
+      <span class="meta-value">{{ fmt_dur(session.duration_seconds) }}</span>
+    </div>
+    {% if session.model %}
+    <div class="meta-item">
+      <span class="meta-label">Model</span>
+      <span class="meta-value mono">{{ session.model }}</span>
+    </div>
+    {% endif %}
+    <div class="meta-item">
+      <span class="meta-label">Messages</span>
+      <span class="meta-value">{{ session.user_message_count }} user / {{ session.assistant_message_count }} assistant</span>
+    </div>
+    <div class="meta-item">
+      <span class="meta-label">Tool calls</span>
+      <span class="meta-value">{{ session.tool_call_count }}
+        {% if session.error_count %}<span class="text-danger">({{ session.error_count }} errors)</span>{% endif %}
+      </span>
+    </div>
+    {% if session.total_input_tokens %}
+    <div class="meta-item">
+      <span class="meta-label">Tokens</span>
+      <span class="meta-value mono">{{ "{:,}".format(session.total_input_tokens) }} in / {{ "{:,}".format(session.total_output_tokens) }} out</span>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Transcript -->
+<div class="transcript">
+  {% for turn in turns %}
+
+  {% if turn.type == 'user' %}
+  <div class="turn turn-user">
+    <div class="turn-role">User{% if turn.cwd %} <span class="turn-cwd">{{ turn.cwd }}</span>{% endif %}</div>
+    <div class="turn-body user-body">{{ turn.content }}</div>
+    {% if turn.timestamp %}<div class="turn-ts">{{ fmt_ts(turn.timestamp) }}</div>{% endif %}
+  </div>
+
+  {% elif turn.type == 'assistant' %}
+  <div class="turn turn-assistant">
+    <div class="turn-role">
+      Assistant
+      {% if turn.model %}<span class="turn-model">{{ turn.model }}</span>{% endif %}
+      {% if turn.output_tokens %}<span class="turn-tokens">{{ turn.input_tokens | default(0) }}→{{ turn.output_tokens }} tok</span>{% endif %}
+    </div>
+    <div class="turn-body">
+      {% for block in turn.blocks %}
+        {% if block.type == 'text' %}
+        <div class="block-text">{{ block.text }}</div>
+
+        {% elif block.type == 'thinking' %}
+        <details class="block-thinking">
+          <summary>Thinking…</summary>
+          <div class="thinking-body">{{ block.text }}</div>
+        </details>
+
+        {% elif block.type == 'tool_use' %}
+        <details class="block-tool-use" open>
+          <summary>
+            <span class="tool-name">{{ block.name }}</span>
+            {% set inp = block.input %}
+            {% if inp.command %}
+            <span class="tool-preview">{{ inp.command | string | truncate(60, True, '…') }}</span>
+            {% elif inp.file_path %}
+            <span class="tool-preview">{{ inp.file_path }}</span>
+            {% elif inp.pattern %}
+            <span class="tool-preview">{{ inp.pattern }}</span>
+            {% endif %}
+          </summary>
+          <pre class="tool-input">{{ block.input | tojson(indent=2) }}</pre>
+        </details>
+        {% endif %}
+      {% endfor %}
+    </div>
+    {% if turn.timestamp %}<div class="turn-ts">{{ fmt_ts(turn.timestamp) }}</div>{% endif %}
+  </div>
+
+  {% elif turn.type == 'tool_use' %}
+  <!-- Codex inline tool call -->
+  <div class="turn turn-tool">
+    <div class="turn-role">Tool call</div>
+    <div class="turn-body">
+      <details class="block-tool-use" open>
+        <summary>
+          <span class="tool-name">{{ turn.name }}</span>
+          {% if turn.input.command %}
+          <span class="tool-preview">{{ turn.input.command | string | truncate(60, True, '…') }}</span>
+          {% endif %}
+        </summary>
+        <pre class="tool-input">{{ turn.input | tojson(indent=2) }}</pre>
+      </details>
+    </div>
+  </div>
+
+  {% elif turn.type == 'tool_result' %}
+  <div class="turn turn-result {% if turn.is_error %}turn-result-error{% endif %}">
+    <div class="turn-role">{% if turn.is_error %}Error{% else %}Result{% endif %}</div>
+    <details class="result-details">
+      <summary>{{ turn.content | truncate(100, True, '…') }}</summary>
+      <pre class="result-body">{{ turn.content }}</pre>
+    </details>
+  </div>
+
+  {% elif turn.type == 'thinking' %}
+  <!-- Codex reasoning -->
+  <div class="turn turn-thinking">
+    <details class="block-thinking">
+      <summary>Reasoning…</summary>
+      <div class="thinking-body">{{ turn.text }}</div>
+    </details>
+  </div>
+
+  {% elif turn.type == 'error' %}
+  <div class="turn turn-result-error" style="padding:16px;border-left:3px solid var(--red);">{{ turn.content }}</div>
+  {% endif %}
+
+  {% else %}
+  <div class="empty-cell" style="padding:40px 0;">No transcript available.</div>
+  {% endfor %}
+</div>
+{% endblock %}

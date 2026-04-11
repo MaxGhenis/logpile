@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+
+# Local editor/agent config
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Local runtime data
+/logpile.db*
+/shared/
+/web-history.bundle
+
+# Next app build/runtime
+/web/.next/
+/web/node_modules/
+/web/.vercel/
+/web/next-env.d.ts
+/web/*.tsbuildinfo
+
+# Environment files
+.env
+.env.*
+/web/.env
+/web/.env.*
+
+# Logs
+*.log

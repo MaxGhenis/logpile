@@ -1,0 +1,597 @@
+import json
+import sqlite3
+import subprocess
+import tempfile
+import unittest
+from contextlib import closing
+from pathlib import Path
+
+from logpile.db import create_visibility_rule, set_session_visibility, update_user
+from logpile.sync import sync_sessions
+from logpile.web.app import create_app
+
+
+def write_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record))
+            fh.write("\n")
+
+
+def open_sqlite(path: Path):
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return closing(conn)
+
+
+class WebAppTests(unittest.TestCase):
+    def _write_claude_session(
+        self,
+        home: Path,
+        *,
+        session_id: str = "session-1",
+        message: str = "hello world",
+        assistant_content: list[dict] | None = None,
+        cwd: str = "/tmp/demo",
+    ) -> None:
+        write_jsonl(
+            home / ".claude" / "projects" / "-Users-alice-demo" / f"{session_id}.jsonl",
+            [
+                {
+                    "timestamp": "2026-04-10T10:00:00Z",
+                    "type": "user",
+                    "cwd": cwd,
+                    "message": {"content": message},
+                },
+                {
+                    "timestamp": "2026-04-10T10:00:05Z",
+                    "type": "assistant",
+                    "message": {
+                        "id": "msg-1",
+                        "model": "claude-3.7",
+                        "usage": {"input_tokens": 1, "output_tokens": 2},
+                        "content": assistant_content or [{"type": "text", "text": "hi"}],
+                    },
+                },
+            ],
+        )
+
+    def _seed_user(
+        self,
+        *,
+        root: Path,
+        username: str = "alice",
+        session_id: str = "session-1",
+        message: str = "hello world",
+        assistant_content: list[dict] | None = None,
+        cwd: str = "/tmp/demo",
+    ) -> tuple[Path, Path]:
+        home = root / username
+        shared = root / "shared"
+        db_path = root / "logpile.db"
+        self._write_claude_session(
+            home,
+            session_id=session_id,
+            message=message,
+            assistant_content=assistant_content,
+            cwd=cwd,
+        )
+        sync_sessions(
+            shared_dir=shared,
+            db_path=db_path,
+            username=username,
+            machine="machine-1",
+            home=home,
+        )
+        return shared, db_path
+
+    def _init_git_repo(self, root: Path) -> tuple[Path, str]:
+        repo = root / "repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.email", "tests@example.com"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "user.name", "Logpile Tests"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        (repo / "README.md").write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "init"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        branch = subprocess.run(
+            ["git", "-C", str(repo), "branch", "--show-current"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        return repo, branch
+
+    def test_private_profiles_are_hidden_from_public_surfaces(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+
+            with open_sqlite(db_path) as conn:
+                update_user(conn, "alice", profile_visibility="private")
+                conn.commit()
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                self.assertEqual(client.get("/u/alice").status_code, 404)
+                self.assertEqual(client.get("/api/users/alice").status_code, 404)
+                self.assertEqual(client.get("/api/users/alice/stats").status_code, 404)
+                self.assertEqual(client.get("/api/users/alice/sessions").status_code, 404)
+                self.assertEqual(client.get("/api/sessions").get_json(), [])
+                sessions_page = client.get("/sessions")
+                self.assertEqual(sessions_page.status_code, 200)
+                self.assertNotIn(b"hello world", sessions_page.data)
+                self.assertEqual(client.get("/sessions/session-1").status_code, 404)
+
+    def test_unlisted_sessions_stay_direct_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+
+            with open_sqlite(db_path) as conn:
+                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
+                conn.commit()
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                profile = client.get("/u/alice")
+                profile_json = client.get("/api/users/alice").get_json()
+                sessions_json = client.get("/api/users/alice/sessions").get_json()
+                detail = client.get("/sessions/session-1")
+
+                self.assertEqual(profile.status_code, 200)
+                self.assertIn(b"No public sessions yet.", profile.data)
+                self.assertEqual(profile_json["summary"]["total_sessions"], 0)
+                self.assertEqual(sessions_json["total"], 0)
+                self.assertEqual(sessions_json["sessions"], [])
+                self.assertEqual(detail.status_code, 200)
+                self.assertIn(b"hello world", detail.data)
+
+    def test_user_sessions_api_omits_message_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                payload = client.get("/api/users/alice/sessions").get_json()
+
+            self.assertEqual(payload["total"], 1)
+            self.assertNotIn("first_user_message", payload["sessions"][0])
+
+    def test_invalid_pagination_params_return_400(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                self.assertEqual(client.get("/sessions?page=x").status_code, 400)
+                self.assertEqual(client.get("/api/users/alice/sessions?limit=foo").status_code, 400)
+                self.assertEqual(client.get("/api/users/alice/sessions?offset=foo").status_code, 400)
+
+    def test_sessions_page_invalid_activity_filter_is_inline_error(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                response = client.get("/sessions?activity=unknown")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(b"Invalid activity filter", response.data)
+            self.assertIn(b"Unknown activity filter", response.data)
+
+    def test_duplicate_display_names_stay_distinct_in_chart_apis(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(
+                root=root,
+                username="alice",
+                session_id="session-a",
+                message="alpha",
+            )
+            self._seed_user(
+                root=root,
+                username="bob",
+                session_id="session-b",
+                message="beta",
+            )
+
+            with open_sqlite(db_path) as conn:
+                update_user(conn, "alice", display_name="Sam")
+                update_user(conn, "bob", display_name="Sam")
+                conn.commit()
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                messages_payload = client.get("/api/messages-per-day").get_json()
+                error_payload = client.get("/api/error-rate").get_json()
+
+            message_labels = [dataset["label"] for dataset in messages_payload["datasets"]]
+            self.assertEqual(len(message_labels), 2)
+            self.assertEqual(len(set(message_labels)), 2)
+            self.assertTrue(all(label.startswith("Sam (@") for label in message_labels))
+
+            self.assertEqual(len(error_payload["labels"]), 2)
+            self.assertEqual(len(set(error_payload["labels"])), 2)
+            self.assertTrue(all(label.startswith("Sam (@") for label in error_payload["labels"]))
+
+    def test_path_apis_and_filters_use_extracted_session_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(
+                root=root,
+                assistant_content=[
+                    {
+                        "type": "tool_use",
+                        "name": "Edit",
+                        "id": "tool-1",
+                        "input": {"file_path": "src/app.py"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "id": "tool-2",
+                        "input": {
+                            "command": "rg -n session_paths src/app.py tests/test_sync.py"
+                        },
+                    },
+                ],
+            )
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                projects = client.get("/api/projects").get_json()
+                paths = client.get("/api/paths?project=demo").get_json()
+                filtered_sessions = client.get("/api/sessions?path=src/app.py").get_json()
+                user_sessions = client.get("/api/users/alice/sessions?path=tests/test_sync.py").get_json()
+
+            self.assertEqual(projects[0]["project"], "demo")
+            self.assertEqual(projects[0]["sessions"], 1)
+            self.assertEqual(projects[0]["messages"], 2)
+            self.assertEqual(projects[0]["tool_calls"], 2)
+            self.assertNotIn("workspace_root", projects[0])
+            self.assertEqual(
+                [(row["display_path"], row["writes"], row["reads"], row["searches"]) for row in paths],
+                [
+                    ("src/app.py", 1, 0, 1),
+                    ("tests/test_sync.py", 0, 0, 1),
+                ],
+            )
+            self.assertEqual(len(filtered_sessions), 1)
+            self.assertEqual(filtered_sessions[0]["session_id"], "session-1")
+            self.assertNotIn("workspace_root", filtered_sessions[0])
+            self.assertEqual(user_sessions["total"], 1)
+            self.assertEqual(user_sessions["sessions"][0]["session_id"], "session-1")
+
+    def test_repo_apis_and_filters_use_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo, branch = self._init_git_repo(root)
+            workspace = repo / "packages"
+            workspace.mkdir(parents=True, exist_ok=True)
+            shared, db_path = self._seed_user(
+                root=root,
+                cwd=str(workspace),
+                assistant_content=[
+                    {
+                        "type": "tool_use",
+                        "name": "Edit",
+                        "id": "tool-1",
+                        "input": {"file_path": "src/app.py"},
+                    }
+                ],
+            )
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                repos = client.get("/api/repos").get_json()
+                projects = client.get(f"/api/projects?repo={repo.name}").get_json()
+                paths = client.get(f"/api/paths?repo={repo.name}").get_json()
+                sessions = client.get(f"/api/sessions?repo={repo.name}&branch={branch}").get_json()
+                user_sessions = client.get(
+                    f"/api/users/alice/sessions?repo={repo.name}&branch={branch}&path=packages/src/app.py"
+                ).get_json()
+
+            self.assertEqual(repos[0]["repo_name"], repo.name)
+            self.assertEqual(repos[0]["sessions"], 1)
+            self.assertEqual(repos[0]["messages"], 2)
+            self.assertEqual(repos[0]["tool_calls"], 1)
+            self.assertEqual(repos[0]["worktrees"], 1)
+            self.assertEqual(repos[0]["branches"], 1)
+            self.assertNotIn("repo_root", repos[0])
+
+            self.assertEqual(projects[0]["repo_name"], repo.name)
+            self.assertNotIn("repo_root", projects[0])
+            self.assertNotIn("worktree_root", projects[0])
+
+            self.assertEqual(paths[0]["repo_name"], repo.name)
+            self.assertEqual(paths[0]["display_path"], "packages/src/app.py")
+            self.assertEqual(paths[0]["repo_relative_path"], "packages/src/app.py")
+
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0]["repo_name"], repo.name)
+            self.assertNotIn("repo_root", sessions[0])
+            self.assertNotIn("git_branch", sessions[0])
+
+            self.assertEqual(user_sessions["total"], 1)
+            self.assertEqual(user_sessions["sessions"][0]["repo_name"], repo.name)
+            self.assertNotIn("repo_root", user_sessions["sessions"][0])
+
+    def test_activity_filters_and_metrics_are_exposed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "alice"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            write_jsonl(
+                home / ".claude" / "projects" / "-Users-alice-demo" / "session-1.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-10T10:00:00Z",
+                        "type": "user",
+                        "cwd": "/tmp/demo",
+                        "message": {"content": "Ship it"},
+                    },
+                    {
+                        "timestamp": "2026-04-10T10:00:05Z",
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg-1",
+                            "model": "claude-3.7",
+                            "usage": {"input_tokens": 1, "output_tokens": 2},
+                            "content": [
+                                {"type": "tool_use", "name": "Edit", "id": "edit-1", "input": {"file_path": "src/app.py"}},
+                                {"type": "tool_use", "name": "Bash", "id": "test-1", "input": {"command": "pytest -q"}},
+                                {"type": "tool_use", "name": "Bash", "id": "build-1", "input": {"command": "npm run build"}},
+                                {"type": "tool_use", "name": "Bash", "id": "commit-1", "input": {"command": "git commit -m ship"}},
+                            ],
+                        },
+                    },
+                    {
+                        "timestamp": "2026-04-10T10:00:06Z",
+                        "type": "user",
+                        "message": {
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": "test-1", "is_error": True, "content": "1 failed"},
+                                {"type": "tool_result", "tool_use_id": "build-1", "is_error": False, "content": "built"},
+                                {"type": "tool_result", "tool_use_id": "commit-1", "is_error": False, "content": "[main abc123] ship"},
+                            ]
+                        },
+                    },
+                ],
+            )
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                test_failed = client.get("/api/sessions?activity=test_failed").get_json()
+                writes = client.get("/api/users/alice/sessions?activity=write").get_json()
+                commits = client.get("/api/users/alice/sessions?activity=git_commit").get_json()
+                bad_filter = client.get("/api/sessions?activity=unknown")
+                stats = client.get("/api/users/alice/stats").get_json()
+
+            self.assertEqual(len(test_failed), 1)
+            self.assertEqual(test_failed[0]["test_run_count"], 1)
+            self.assertEqual(test_failed[0]["test_failure_count"], 1)
+            self.assertEqual(test_failed[0]["build_run_count"], 1)
+            self.assertEqual(test_failed[0]["git_commit_count"], 1)
+            self.assertEqual(test_failed[0]["session_status"], "partial")
+            self.assertIn("Made progress", test_failed[0]["session_outcome"])
+
+            self.assertEqual(writes["total"], 1)
+            self.assertEqual(writes["sessions"][0]["write_path_count"], 1)
+            self.assertEqual(writes["sessions"][0]["session_goal"], "Ship it")
+            self.assertIn("Touched 1 file", writes["sessions"][0]["session_summary"])
+            self.assertEqual(commits["total"], 1)
+            self.assertEqual(commits["sessions"][0]["git_commit_count"], 1)
+            self.assertEqual(bad_filter.status_code, 400)
+
+            self.assertEqual(stats["summary"]["test_runs"], 1)
+            self.assertEqual(stats["summary"]["test_failures"], 1)
+            self.assertEqual(stats["summary"]["build_runs"], 1)
+            self.assertEqual(stats["summary"]["build_failures"], 0)
+            self.assertEqual(stats["summary"]["git_commits"], 1)
+            self.assertEqual(stats["summary"]["partial_sessions"], 1)
+            self.assertEqual(stats["summary"]["success_sessions"], 0)
+
+    def test_publish_queue_and_review_apis_are_private_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root, message="Publish this safely.")
+
+            private_app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
+            with private_app.test_client() as client:
+                queue_payload = client.get("/api/publish/queue?visibility=all&reviews=1").get_json()
+                review_payload = client.get("/api/publish/review/session-1").get_json()
+
+            self.assertEqual(queue_payload["total"], 1)
+            self.assertEqual(queue_payload["candidates"][0]["session_id"], "session-1")
+            self.assertEqual(queue_payload["candidates"][0]["visibility"], "public")
+            self.assertEqual(queue_payload["candidates"][0]["review_recommendation"], "public")
+            self.assertEqual(review_payload["session_id"], "session-1")
+            self.assertEqual(review_payload["recommendation"], "public")
+
+            public_app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with public_app.test_client() as client:
+                self.assertEqual(client.get("/api/publish/queue").status_code, 404)
+                self.assertEqual(client.get("/api/publish/review/session-1").status_code, 404)
+
+    def test_unlisted_profiles_are_direct_only_in_public_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+
+            with open_sqlite(db_path) as conn:
+                update_user(conn, "alice", profile_visibility="unlisted")
+                conn.commit()
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                self.assertNotIn(b"alice", client.get("/u").data.lower())
+                self.assertNotIn(b"hello world", client.get("/").data)
+                self.assertNotIn(b"hello world", client.get("/sessions").data)
+                self.assertEqual(client.get("/api/sessions").get_json(), [])
+                self.assertEqual(client.get("/analysis").status_code, 200)
+                self.assertNotIn(b"alice", client.get("/analysis").data.lower())
+
+                profile = client.get("/u/alice")
+                profile_json = client.get("/api/users/alice").get_json()
+                sessions_json = client.get("/api/users/alice/sessions").get_json()
+
+                self.assertEqual(profile.status_code, 200)
+                self.assertEqual(profile_json["user"]["profile_visibility"], "unlisted")
+                self.assertEqual(profile_json["summary"]["total_sessions"], 1)
+                self.assertEqual(sessions_json["total"], 1)
+
+    def test_private_mode_is_more_permissive_than_public_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+
+            with open_sqlite(db_path) as conn:
+                update_user(conn, "alice", profile_visibility="unlisted")
+                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
+                conn.commit()
+
+            public_app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            private_app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
+
+            with public_app.test_client() as client:
+                self.assertEqual(client.get("/api/sessions").get_json(), [])
+                self.assertEqual(client.get("/api/users/alice/sessions").get_json()["total"], 0)
+
+            with private_app.test_client() as client:
+                self.assertEqual(len(client.get("/api/sessions").get_json()), 1)
+                self.assertEqual(client.get("/api/users/alice/sessions").get_json()["total"], 1)
+
+    def test_private_sessions_return_404(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+
+            with open_sqlite(db_path) as conn:
+                set_session_visibility(conn, "session-1", "private", shared_dir=shared)
+                conn.commit()
+
+            public_app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            private_app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
+
+            with public_app.test_client() as client:
+                self.assertEqual(client.get("/sessions/session-1").status_code, 404)
+                self.assertEqual(client.get("/api/sessions").get_json(), [])
+                self.assertEqual(client.get("/api/users/alice").get_json()["summary"]["total_sessions"], 0)
+                self.assertEqual(client.get("/api/users/alice/sessions").get_json()["total"], 0)
+
+            with private_app.test_client() as client:
+                self.assertEqual(client.get("/sessions/session-1").status_code, 404)
+                self.assertEqual(client.get("/api/sessions").get_json(), [])
+                self.assertEqual(client.get("/api/users/alice").get_json()["summary"]["total_sessions"], 0)
+                self.assertEqual(client.get("/api/users/alice/sessions").get_json()["total"], 0)
+
+    def test_private_mode_session_filter_lists_private_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+
+            with open_sqlite(db_path) as conn:
+                update_user(conn, "alice", profile_visibility="private")
+                conn.commit()
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
+            with app.test_client() as client:
+                page = client.get("/sessions")
+
+            self.assertEqual(page.status_code, 200)
+            self.assertIn(b'value="alice"', page.data)
+
+    def test_public_mode_restricts_aggregate_json_endpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+
+            with open_sqlite(db_path) as conn:
+                update_user(conn, "alice", profile_visibility="unlisted")
+                conn.execute(
+                    "UPDATE sessions SET error_count = 2 WHERE session_id = 'session-1'"
+                )
+                conn.execute(
+                    """
+                    INSERT INTO tool_calls (session_id, tool_name, command, timestamp, is_error)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    ("session-1", "Bash", "rg TODO", "2026-04-10T10:00:02Z", 0),
+                )
+                conn.commit()
+
+            public_app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            private_app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
+
+            with public_app.test_client() as client:
+                self.assertEqual(client.get("/api/messages-per-day").get_json()["datasets"], [])
+                self.assertEqual(client.get("/api/messages-per-tool").get_json()["datasets"], [])
+                self.assertEqual(client.get("/api/top-tools").get_json()["labels"], [])
+                self.assertEqual(client.get("/api/error-rate").get_json()["labels"], [])
+
+            with private_app.test_client() as client:
+                self.assertEqual(len(client.get("/api/messages-per-day").get_json()["datasets"]), 1)
+                self.assertEqual(len(client.get("/api/messages-per-tool").get_json()["datasets"]), 1)
+                self.assertEqual(client.get("/api/top-tools").get_json()["labels"], ["Bash"])
+                self.assertEqual(len(client.get("/api/error-rate").get_json()["labels"]), 1)
+
+    def test_user_rules_api_is_private_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+
+            with open_sqlite(db_path) as conn:
+                create_visibility_rule(
+                    conn,
+                    "alice",
+                    field="project",
+                    match_mode="contains",
+                    pattern="demo",
+                    visibility="private",
+                )
+                conn.commit()
+
+            public_app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            private_app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
+
+            with public_app.test_client() as client:
+                self.assertEqual(client.get("/api/users/alice/rules").status_code, 404)
+
+            with private_app.test_client() as client:
+                payload = client.get("/api/users/alice/rules").get_json()
+
+            self.assertEqual(len(payload["rules"]), 1)
+            self.assertEqual(payload["rules"][0]["pattern"], "demo")
+            self.assertEqual(payload["rules"][0]["visibility"], "private")
+
+
+if __name__ == "__main__":
+    unittest.main()

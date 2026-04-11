@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% block title %}@{{ user.slug }} — Logpile{% endblock %}
+{% block page_title %}Profile{% endblock %}
+
+{% block content %}
+<div class="profile-hero" style="margin-bottom:20px;">
+  <div>
+    <div class="profile-kicker">operator profile</div>
+    <h1 class="profile-name">@{{ user.slug }}</h1>
+    <div class="profile-meta">
+      {{ user.display_name }}
+      {% if user.display_name != user.username %} &middot; {{ user.username }}{% endif %}
+      {% if user.bio %} &middot; {{ user.bio }}{% endif %}
+      <br>
+      active since {{ fmt_ts(summary.first_seen) }}
+      &middot; {{ summary.active_days or 0 }} active days
+      &middot; {{ summary.known_projects or 0 }} projects
+    </div>
+  </div>
+  <div class="profile-actions">
+    {% if not public_mode or user.profile_visibility == 'public' %}
+    <a class="ghost-link" href="{{ url_for('sessions', user=user.slug) }}">View sessions</a>
+    {% endif %}
+    <a class="ghost-link" href="{{ url_for('api_user_stats', slug=user.slug) }}">JSON</a>
+  </div>
+</div>
+
+<div class="stats-grid" style="margin-bottom:20px;">
+  <div class="stat-card">
+    <div class="stat-value">{{ "{:,}".format(summary.total_sessions or 0) }}</div>
+    <div class="stat-label">sessions</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{ "{:,}".format(summary.total_messages or 0) }}</div>
+    <div class="stat-label">messages</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{ "{:,}".format(summary.total_tool_calls or 0) }}</div>
+    <div class="stat-label">tool calls</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{ "{:,.0f}".format((summary.total_tokens or 0) / 1000000) }}M</div>
+    <div class="stat-label">tokens</div>
+  </div>
+</div>
+
+<div class="split-grid split-grid-main" style="margin-bottom:20px;">
+  <div class="chart-card">
+    <div class="chart-title">Activity — last 60 days</div>
+    <canvas id="chartUserActivity" height="120"></canvas>
+  </div>
+  <div class="chart-card">
+    <div class="chart-title">Session mix</div>
+    <canvas id="chartUserSources" height="120"></canvas>
+  </div>
+</div>
+
+<div class="split-grid split-grid-equal" style="margin-bottom:20px;">
+  <div class="card-section">
+    <div class="section-title">Top tools</div>
+    <div class="table-scroll table-scroll-compact">
+    <table class="data-table">
+      <thead><tr><th>Tool</th><th>Calls</th><th></th></tr></thead>
+      <tbody>
+        {% set max_cnt = tool_rows[0].cnt if tool_rows else 1 %}
+        {% for r in tool_rows %}
+        <tr>
+          <td class="mono">{{ r.tool_name }}</td>
+          <td>{{ r.cnt }}</td>
+          <td><div class="mini-bar" style="width:{{ (r.cnt / max_cnt * 100) | int }}%"></div></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="3" class="empty-cell">No tool calls recorded.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+  <div class="card-section">
+    <div class="section-title">Model mix</div>
+    <div class="table-scroll table-scroll-compact">
+    <table class="data-table">
+      <thead><tr><th>Model</th><th>Sessions</th><th>Messages</th></tr></thead>
+      <tbody>
+        {% for r in model_rows %}
+        <tr>
+          <td class="mono">{{ r.model_name }}</td>
+          <td>{{ r.sessions or 0 }}</td>
+          <td>{{ r.messages or 0 }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="3" class="empty-cell">No model data.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+</div>
+
+<div class="card-section">
+  <div class="section-title">Recent sessions</div>
+  <div class="table-scroll table-scroll-wide">
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>When</th>
+        <th>Tool</th>
+        <th>Project</th>
+        <th>Model</th>
+        <th>Messages</th>
+        <th>Tool calls</th>
+        <th>Duration</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in recent_rows %}
+      <tr>
+        <td class="ts"><a href="{{ url_for('session_detail', session_id=r.session_id) }}" class="preview-link">{{ fmt_ts(r.first_timestamp) }}</a></td>
+        <td><span class="badge-source badge-source-{{ r.source }}">{{ 'CC' if r.source == 'claudecode' else 'Codex' }}</span></td>
+        <td class="project-cell">{{ display_project(r.project) | truncate(25, True, '\u2026') }}</td>
+        <td class="mono">{{ r.model or '\u2014' }}</td>
+        <td>{{ (r.user_message_count or 0) + (r.assistant_message_count or 0) }}</td>
+        <td>{{ r.tool_call_count or 0 }}</td>
+        <td class="mono">{{ fmt_dur(r.duration_seconds) }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="empty-cell">No public sessions yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const activity = {{ activity | tojson }};
+const sources = {{ source_breakdown | tojson }};
+
+new Chart(document.getElementById('chartUserActivity'), {
+  type: 'line',
+  data: {
+    labels: activity.labels,
+    datasets: [
+      {
+        label: 'Messages',
+        data: activity.messages,
+        borderColor: '#f59e0b',
+        backgroundColor: '#f59e0b18',
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        tension: 0.35,
+        fill: true,
+      },
+      {
+        label: 'Tool calls',
+        data: activity.tool_calls,
+        borderColor: '#60a5fa',
+        backgroundColor: '#60a5fa12',
+        borderWidth: 2,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        tension: 0.35,
+        fill: false,
+      },
+    ],
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { labels: { color: '#a8a29e', font: { family: "'Plus Jakarta Sans', sans-serif", size: 11 } } } },
+    scales: {
+      x: { ticks: { color: '#78716c', maxTicksLimit: 8, font: { size: 10 } }, grid: { color: '#292524', drawBorder: false } },
+      y: { ticks: { color: '#78716c', font: { size: 10 } }, grid: { color: '#292524', drawBorder: false }, beginAtZero: true },
+    },
+  },
+});
+
+new Chart(document.getElementById('chartUserSources'), {
+  type: 'doughnut',
+  data: {
+    labels: sources.labels,
+    datasets: [{
+      label: 'Sessions',
+      data: sources.sessions,
+      backgroundColor: sources.colors,
+      borderColor: '#0c0a09',
+      borderWidth: 3,
+    }],
+  },
+  options: {
+    responsive: true,
+    plugins: { legend: { labels: { color: '#a8a29e', font: { family: "'Plus Jakarta Sans', sans-serif", size: 11 } } } },
+  },
+});
+</script>
+{% endblock %}

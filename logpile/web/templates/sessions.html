@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+{% block title %}Sessions — Logpile{% endblock %}
+{% block page_title %}Sessions{% endblock %}
+
+{% block content %}
+<form method="get" action="{{ url_for('sessions') }}" class="filter-bar" style="margin-bottom:20px;">
+  <input type="text" name="q" value="{{ q }}" placeholder="Search first message..." class="filter-input">
+  <select name="source" class="filter-select">
+    <option value="">All tools</option>
+    <option value="claudecode" {% if source == 'claudecode' %}selected{% endif %}>CC</option>
+    <option value="codex"      {% if source == 'codex'      %}selected{% endif %}>Codex</option>
+  </select>
+  <select name="user" class="filter-select">
+    <option value="">All operators</option>
+    {% for u in users %}
+    <option value="{{ u.slug }}" {% if username == u.slug %}selected{% endif %}>{{ u.display_name }}</option>
+    {% endfor %}
+  </select>
+  <button type="submit" class="filter-btn">Filter</button>
+  {% if q or source or username %}
+  <a href="{{ url_for('sessions') }}" class="filter-clear">Clear</a>
+  {% endif %}
+</form>
+
+<div class="result-count" style="margin-bottom:14px;">
+  {% if invalid_activity %}
+  Invalid activity filter
+  {% else %}
+  {{ "{:,}".format(total) }} session{{ 's' if total != 1 }}
+  {% endif %}
+</div>
+
+{% if invalid_activity %}
+<div class="empty-cell" style="margin-bottom:16px; text-align:left;">
+  Unknown activity filter: <code>{{ activity }}</code>. Clear the filter or pick a supported activity.
+</div>
+{% endif %}
+
+<div class="card-section">
+<div class="table-scroll table-scroll-wide">
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>When</th>
+      <th>Operator</th>
+      <th>Tool</th>
+      <th>Project</th>
+      <th>Duration</th>
+      <th>Msgs</th>
+      <th>Tools</th>
+      <th>Tokens</th>
+      <th>First message</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td class="ts">{{ fmt_ts(r.first_timestamp) }}</td>
+      <td><a href="{{ url_for('user_profile', slug=r.user_slug or r.username) }}" class="badge-user-link"><span class="badge-user">{{ r.user_display_name }}</span></a></td>
+      <td><span class="badge-source badge-source-{{ r.source }}">{{ 'CC' if r.source == 'claudecode' else 'Codex' }}</span></td>
+      <td class="project-cell">{{ display_project(r.project) | truncate(25, True, '\u2026') }}</td>
+      <td class="mono">{{ fmt_dur(r.duration_seconds) }}</td>
+      <td>{{ (r.user_message_count or 0) + (r.assistant_message_count or 0) }}</td>
+      <td>{{ r.tool_call_count }}</td>
+      <td class="mono">{{ "{:,}".format(r.tokens or 0) }}</td>
+      <td class="preview-cell">
+        <a href="{{ url_for('session_detail', session_id=r.session_id) }}" class="preview-link">
+          {{ (r.first_user_message or '(no message)') | truncate(90, True, '\u2026') }}
+        </a>
+      </td>
+    </tr>
+    {% else %}
+    <tr>
+      <td colspan="9" class="empty-cell">
+        {% if invalid_activity %}
+        Select a valid activity filter to load sessions.
+        {% else %}
+        No sessions match your filters.
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+</div>
+
+{% if total > per_page %}
+<div class="pagination-bar" style="margin-top:16px;">
+  {% set total_pages = ((total - 1) // per_page) + 1 %}
+  {% if page > 1 %}
+  <a href="?q={{ q }}&source={{ source }}&user={{ username }}&page={{ page - 1 }}" class="page-link">&larr; prev</a>
+  {% endif %}
+  <span class="page-info">page {{ page }} / {{ total_pages }}</span>
+  {% if page < total_pages %}
+  <a href="?q={{ q }}&source={{ source }}&user={{ username }}&page={{ page + 1 }}" class="page-link">next &rarr;</a>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}

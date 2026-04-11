@@ -1,0 +1,128 @@
+import sqlite3
+import tempfile
+import unittest
+from contextlib import closing
+from pathlib import Path
+
+from logpile.db import ensure_user, get_db, init_db, upsert_session, update_user
+
+
+def open_sqlite(path: Path):
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    return closing(conn)
+
+
+def make_session(session_id: str, *, slug: str, visibility: str) -> dict:
+    return {
+        "session_id": session_id,
+        "source": "claudecode",
+        "username": slug,
+        "user_slug": slug,
+        "machine": "machine-1",
+        "project": "demo",
+        "workspace_root": "/tmp/demo",
+        "worktree_root": "/tmp/demo",
+        "repo_root": "/tmp/demo",
+        "repo_name": "demo",
+        "git_branch": "main",
+        "git_commit": "abc123",
+        "git_dirty": 0,
+        "source_path": f"/tmp/{session_id}.jsonl",
+        "shared_path": f"/shared/{session_id}.jsonl",
+        "first_timestamp": "2026-04-11T12:00:00+00:00",
+        "last_timestamp": "2026-04-11T12:05:00+00:00",
+        "duration_seconds": 300,
+        "user_message_count": 1,
+        "assistant_message_count": 1,
+        "tool_call_count": 0,
+        "error_count": 0,
+        "write_path_count": 0,
+        "read_path_count": 0,
+        "search_path_count": 0,
+        "test_run_count": 0,
+        "test_failure_count": 0,
+        "lint_run_count": 0,
+        "lint_failure_count": 0,
+        "build_run_count": 0,
+        "build_failure_count": 0,
+        "format_run_count": 0,
+        "format_failure_count": 0,
+        "git_status_count": 0,
+        "git_diff_count": 0,
+        "git_commit_count": 0,
+        "activity_version": 1,
+        "total_input_tokens": 10,
+        "total_output_tokens": 20,
+        "first_user_message": "hello",
+        "visibility": visibility,
+        "visibility_source": "default",
+        "visibility_rule_id": None,
+        "visibility_reason": f"default:{visibility}",
+        "is_private": 1 if visibility == "private" else 0,
+        "file_hash": "hash",
+        "synced_at": "2026-04-11T12:05:00+00:00",
+        "model": "claude-3.7",
+    }
+
+
+class ContractViewTests(unittest.TestCase):
+    def test_session_catalog_exposes_public_and_direct_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "logpile.db"
+            init_db(db_path)
+
+            with get_db(db_path) as conn:
+                slug = ensure_user(conn, "alice")
+                update_user(conn, slug, profile_visibility="unlisted")
+                upsert_session(conn, make_session("public-1", slug=slug, visibility="public"))
+                upsert_session(conn, make_session("unlisted-1", slug=slug, visibility="unlisted"))
+                upsert_session(conn, make_session("private-1", slug=slug, visibility="private"))
+
+            with open_sqlite(db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT session_id, listed_public, listed_private, direct_public, direct_private
+                    FROM session_catalog
+                    ORDER BY session_id
+                    """
+                ).fetchall()
+
+            self.assertEqual(
+                [tuple(row) for row in rows],
+                [
+                    ("private-1", 0, 0, 0, 0),
+                    ("public-1", 0, 1, 1, 1),
+                    ("unlisted-1", 0, 1, 0, 1),
+                ],
+            )
+
+    def test_user_catalog_exposes_listed_and_direct_profile_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "logpile.db"
+            init_db(db_path)
+
+            with get_db(db_path) as conn:
+                public_slug = ensure_user(conn, "alice")
+                unlisted_slug = ensure_user(conn, "bob")
+                private_slug = ensure_user(conn, "carol")
+                update_user(conn, unlisted_slug, profile_visibility="unlisted")
+                update_user(conn, private_slug, profile_visibility="private")
+
+            with open_sqlite(db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT slug, listed_public, listed_private, direct_public, direct_private
+                    FROM user_catalog
+                    ORDER BY slug
+                    """
+                ).fetchall()
+
+            self.assertEqual(
+                [tuple(row) for row in rows],
+                [
+                    (public_slug, 1, 1, 1, 1),
+                    (unlisted_slug, 0, 1, 1, 1),
+                    (private_slug, 0, 1, 0, 1),
+                ],
+            )
