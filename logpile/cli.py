@@ -534,12 +534,19 @@ def publish_queue(user, visibility, status_filter, limit, reviews, db, json_outp
     """List candidate sessions for publication."""
     from .db import get_db
     from .publish import (
+        count_publish_candidates,
         format_publish_queue,
         list_publish_candidates,
         serialize_publish_candidate,
     )
 
     with get_db(_prepare_db(db)) as conn:
+        total = count_publish_candidates(
+            conn,
+            user_identifier=user,
+            visibility=visibility,
+            status=status_filter,
+        )
         candidates = list_publish_candidates(
             conn,
             user_identifier=user,
@@ -552,7 +559,7 @@ def publish_queue(user, visibility, status_filter, limit, reviews, db, json_outp
             click.echo(
                 json.dumps(
                     {
-                        "total": len(candidates),
+                        "total": total,
                         "limit": limit,
                         "visibility": visibility,
                         "status": status_filter,

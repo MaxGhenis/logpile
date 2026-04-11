@@ -381,28 +381,11 @@ def list_publish_candidates(
     limit: int = 25,
     include_reviews: bool = False,
 ) -> list[PublishCandidate]:
-    clauses = ["1 = 1"]
-    params: list[object] = []
-
-    if user_identifier:
-        clauses.append("(s.user_slug = ? OR s.username = ?)")
-        params.extend([user_identifier, user_identifier])
-
-    normalized_visibility = (visibility or "pending").strip().lower()
-    if normalized_visibility == "pending":
-        clauses.append("s.visibility IN ('private', 'unlisted')")
-    elif normalized_visibility in {"private", "unlisted", "public"}:
-        clauses.append("s.visibility = ?")
-        params.append(normalized_visibility)
-    elif normalized_visibility != "all":
-        raise ValueError(f"Unsupported publish queue visibility filter: {visibility}")
-
-    normalized_status = (status or "").strip().lower()
-    if normalized_status:
-        if normalized_status not in {"exploration", "success", "partial", "failed"}:
-            raise ValueError(f"Unsupported publish queue status filter: {status}")
-        clauses.append("COALESCE(s.session_status, 'exploration') = ?")
-        params.append(normalized_status)
+    where_sql, params = _publish_queue_filter_sql(
+        user_identifier=user_identifier,
+        visibility=visibility,
+        status=status,
+    )
 
     rows = conn.execute(
         f"""
@@ -423,7 +406,7 @@ def list_publish_candidates(
             s.session_outcome
         FROM sessions s
         LEFT JOIN users u ON u.slug = s.user_slug
-        WHERE {' AND '.join(clauses)}
+        WHERE {where_sql}
         ORDER BY
             CASE s.visibility WHEN 'unlisted' THEN 0 WHEN 'private' THEN 1 ELSE 2 END,
             s.first_timestamp DESC,
@@ -461,6 +444,57 @@ def list_publish_candidates(
                 candidate.medium_findings = sum(1 for finding in review.findings if finding.severity == "medium")
         candidates.append(candidate)
     return candidates
+
+
+def count_publish_candidates(
+    conn: sqlite3.Connection,
+    *,
+    user_identifier: str | None = None,
+    visibility: str = "pending",
+    status: str | None = None,
+) -> int:
+    where_sql, params = _publish_queue_filter_sql(
+        user_identifier=user_identifier,
+        visibility=visibility,
+        status=status,
+    )
+    row = conn.execute(
+        f"SELECT COUNT(*) AS count FROM sessions s WHERE {where_sql}",
+        params,
+    ).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def _publish_queue_filter_sql(
+    *,
+    user_identifier: str | None = None,
+    visibility: str = "pending",
+    status: str | None = None,
+) -> tuple[str, list[object]]:
+    clauses = ["1 = 1"]
+    params: list[object] = []
+
+    if user_identifier:
+        clauses.append("(s.user_slug = ? OR s.username = ?)")
+        params.extend([user_identifier, user_identifier])
+
+    normalized_visibility = (visibility or "pending").strip().lower()
+    if normalized_visibility == "pending":
+        clauses.append("s.visibility IN ('private', 'unlisted')")
+    elif normalized_visibility in {"private", "unlisted", "public"}:
+        clauses.append("s.visibility = ?")
+        params.append(normalized_visibility)
+    elif normalized_visibility != "all":
+        raise ValueError(f"Unsupported publish queue visibility filter: {visibility}")
+
+    normalized_status = (status or "").strip().lower()
+    if normalized_status:
+        if normalized_status not in {"exploration", "success", "partial", "failed"}:
+            raise ValueError(f"Unsupported publish queue status filter: {status}")
+        clauses.append("COALESCE(s.session_status, 'exploration') = ?")
+        params.append(normalized_status)
+
+    return " AND ".join(clauses), params
 
 
 def serialize_publish_candidate(candidate: PublishCandidate) -> dict:

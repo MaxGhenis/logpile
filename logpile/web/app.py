@@ -1412,7 +1412,11 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
     def api_publish_queue():
         if _is_public_mode():
             abort(404)
-        from ..publish import list_publish_candidates, serialize_publish_candidate
+        from ..publish import (
+            count_publish_candidates,
+            list_publish_candidates,
+            serialize_publish_candidate,
+        )
 
         limit = _parse_int_arg("limit", 25, minimum=1, maximum=200)
         visibility = request.args.get("visibility", "pending").strip() or "pending"
@@ -1420,6 +1424,12 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         user = request.args.get("user", "").strip() or None
         include_reviews = request.args.get("reviews", "").strip().lower() in {"1", "true", "yes"}
         try:
+            total = count_publish_candidates(
+                _db(),
+                user_identifier=user,
+                visibility=visibility,
+                status=status_filter,
+            )
             candidates = list_publish_candidates(
                 _db(),
                 user_identifier=user,
@@ -1432,7 +1442,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             abort(400, description=str(exc))
         return jsonify(
             {
-                "total": len(candidates),
+                "total": total,
                 "limit": limit,
                 "visibility": visibility,
                 "status": status_filter,

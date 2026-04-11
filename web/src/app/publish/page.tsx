@@ -1,7 +1,6 @@
 import { Topbar } from "@/components/topbar";
 import { StatusBadge, VisibilityBadge } from "@/components/status-badge";
 import { SourceBadge } from "@/components/badge";
-import { getPublishQueueCount } from "@/lib/db";
 import { fmtTs, fmtNum, truncate } from "@/lib/format";
 import { config } from "@/lib/config";
 import type { PublishCandidate } from "@/lib/types";
@@ -36,6 +35,20 @@ export default async function PublishQueuePage({
   const user = params.user || "";
   const limit = Math.min(Math.max(parseInt(params.limit || "50", 10) || 50, 1), 200);
 
+  let pendingCount = 0;
+  try {
+    const pendingPayload = await getPublishQueueResponse({
+      visibility: "pending",
+      limit: 1,
+      reviews: false,
+    });
+    pendingCount = pendingPayload.total;
+  } catch (error) {
+    if (!(error instanceof PublishReviewCommandError || error instanceof RangeError)) {
+      throw error;
+    }
+  }
+
   let queueError: string | null = null;
   let candidates: PublishCandidate[] = [];
   try {
@@ -54,7 +67,6 @@ export default async function PublishQueuePage({
       throw error;
     }
   }
-  const pendingCount = getPublishQueueCount({ visibility: "pending" });
 
   return (
     <>

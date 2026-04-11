@@ -1136,32 +1136,3 @@ export function getPublishQueue(opts?: {
     )
     .all(...params, Math.min(Math.max(limit, 1), 200)) as import("./types").PublishCandidate[];
 }
-
-export function getPublishQueueCount(opts?: {
-  visibility?: string;
-  status?: string;
-}): number {
-  if (config.publicMode) return 0;
-
-  const db = getDb();
-  const { visibility = "pending", status } = opts ?? {};
-  const clauses: string[] = ["1 = 1"];
-  const params: unknown[] = [];
-
-  const normVis = (visibility || "pending").toLowerCase();
-  if (normVis === "pending") {
-    clauses.push("s.visibility IN ('private', 'unlisted')");
-  } else if (["private", "unlisted", "public"].includes(normVis)) {
-    clauses.push("s.visibility = ?");
-    params.push(normVis);
-  }
-
-  if (status && ["exploration", "success", "partial", "failed"].includes(status)) {
-    clauses.push("COALESCE(s.session_status, 'exploration') = ?");
-    params.push(status);
-  }
-
-  return (
-    db.prepare(`SELECT COUNT(*) AS c FROM sessions s WHERE ${clauses.join(" AND ")}`).get(...params) as { c: number }
-  ).c;
-}

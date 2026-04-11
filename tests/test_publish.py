@@ -176,6 +176,42 @@ class PublishTests(unittest.TestCase):
             self.assertEqual(payload["candidates"][0]["session_id"], "session-1")
             self.assertEqual(payload["candidates"][0]["review_recommendation"], "public")
 
+    def test_publish_queue_json_total_is_not_truncated_by_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+            self._write_session(home, session_id="session-1", body="First candidate.")
+            self._write_session(home, session_id="session-2", body="Second candidate.")
+
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "publish",
+                    "queue",
+                    "--db",
+                    str(db_path),
+                    "--limit",
+                    "1",
+                    "--json",
+                ],
+            )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            payload = json.loads(result.output)
+            self.assertEqual(payload["total"], 2)
+            self.assertEqual(len(payload["candidates"]), 1)
+
     def test_review_json_outputs_structured_payload(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
