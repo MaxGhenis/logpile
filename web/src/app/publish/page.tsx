@@ -1,10 +1,12 @@
 import { Topbar } from "@/components/topbar";
 import { StatusBadge, VisibilityBadge } from "@/components/status-badge";
 import { SourceBadge } from "@/components/badge";
-import { getPublishQueue, getPublishQueueCount } from "@/lib/db";
+import { getPublishQueueCount } from "@/lib/db";
 import { fmtTs, fmtNum, truncate } from "@/lib/format";
 import { config } from "@/lib/config";
+import type { PublishCandidate } from "@/lib/types";
 import { SESSION_STATUSES } from "@/lib/types";
+import { getPublishQueueResponse, PublishReviewCommandError } from "@/lib/publish";
 import Link from "next/link";
 import { IconShieldCheck, IconAlertTriangle } from "@tabler/icons-react";
 
@@ -34,7 +36,24 @@ export default async function PublishQueuePage({
   const user = params.user || "";
   const limit = Math.min(Math.max(parseInt(params.limit || "50", 10) || 50, 1), 200);
 
-  const candidates = getPublishQueue({ visibility, status: status || undefined, user: user || undefined, limit });
+  let queueError: string | null = null;
+  let candidates: PublishCandidate[] = [];
+  try {
+    const payload = await getPublishQueueResponse({
+      visibility,
+      status: status || undefined,
+      user: user || undefined,
+      limit,
+      reviews: true,
+    });
+    candidates = payload.candidates;
+  } catch (error) {
+    if (error instanceof PublishReviewCommandError || error instanceof RangeError) {
+      queueError = error.message;
+    } else {
+      throw error;
+    }
+  }
   const pendingCount = getPublishQueueCount({ visibility: "pending" });
 
   return (
@@ -93,6 +112,18 @@ export default async function PublishQueuePage({
 
         {/* Queue */}
         <div className="flex flex-col gap-3">
+          {queueError && (
+            <div className="bg-lp-surface border border-lp-red/20 rounded-lg p-5 text-center">
+              <div className="inline-flex items-center gap-1.5 text-sm font-medium text-lp-red mb-1">
+                <IconAlertTriangle size={16} stroke={1.8} />
+                Queue unavailable
+              </div>
+              <div className="text-xs text-lp-text-faint max-w-md mx-auto leading-relaxed">
+                {queueError}
+              </div>
+            </div>
+          )}
+
           {candidates.map((c) => (
             <Link
               key={c.session_id}
@@ -168,7 +199,7 @@ export default async function PublishQueuePage({
             </Link>
           ))}
 
-          {candidates.length === 0 && (
+          {candidates.length === 0 && !queueError && (
             <div className="bg-lp-surface border border-lp-border-dim rounded-lg p-10 text-center">
               <div className="text-lp-green mb-2">
                 <IconShieldCheck size={32} stroke={1.5} className="mx-auto" />

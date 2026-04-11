@@ -529,10 +529,15 @@ def publish_group():
 @click.option("--limit", default=25, show_default=True, type=int)
 @click.option("--reviews/--no-reviews", default=True, show_default=True)
 @click.option("--db", default=str(DEFAULT_DB), show_default=True)
-def publish_queue(user, visibility, status_filter, limit, reviews, db):
+@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
+def publish_queue(user, visibility, status_filter, limit, reviews, db, json_output):
     """List candidate sessions for publication."""
     from .db import get_db
-    from .publish import format_publish_queue, list_publish_candidates
+    from .publish import (
+        format_publish_queue,
+        list_publish_candidates,
+        serialize_publish_candidate,
+    )
 
     with get_db(_prepare_db(db)) as conn:
         candidates = list_publish_candidates(
@@ -543,6 +548,23 @@ def publish_queue(user, visibility, status_filter, limit, reviews, db):
             limit=limit,
             include_reviews=reviews,
         )
+        if json_output:
+            click.echo(
+                json.dumps(
+                    {
+                        "total": len(candidates),
+                        "limit": limit,
+                        "visibility": visibility,
+                        "status": status_filter,
+                        "reviews": reviews,
+                        "candidates": [
+                            serialize_publish_candidate(candidate)
+                            for candidate in candidates
+                        ],
+                    }
+                )
+            )
+            return
         for line in format_publish_queue(candidates):
             click.echo(line)
 
