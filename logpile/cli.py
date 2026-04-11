@@ -1,4 +1,5 @@
 """Click CLI for Logpile."""
+import json
 import os
 import socket
 from pathlib import Path
@@ -144,6 +145,7 @@ def serve(shared, db, host, port, public, dev, flask):
                 "LOGPILE_DB_PATH": str(db_path.resolve()),
                 "LOGPILE_SHARED_DIR": str(Path(shared).resolve()),
                 "LOGPILE_PUBLIC_MODE": "true" if public else "false",
+                "LOGPILE_PYTHON_BIN": sys.executable,
             },
         )
 
@@ -157,6 +159,7 @@ def serve(shared, db, host, port, public, dev, flask):
         "LOGPILE_DB_PATH": str(db_path.resolve()),
         "LOGPILE_SHARED_DIR": str(Path(shared).resolve()),
         "LOGPILE_PUBLIC_MODE": "true" if public else "false",
+        "LOGPILE_PYTHON_BIN": sys.executable,
     }
 
     cmd = [bun, "run", cmd_name, "--port", str(port), "--hostname", host]
@@ -547,20 +550,50 @@ def publish_queue(user, visibility, status_filter, limit, reviews, db):
 @publish_group.command("review")
 @click.argument("session_id")
 @click.option("--db", default=str(DEFAULT_DB), show_default=True)
-def publish_review(session_id, db):
+@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
+def publish_review(session_id, db, json_output):
     """Inspect a session for risky content before publishing."""
-    from .publish import format_publish_review, review_publish_session
+    from .publish import (
+        format_publish_review,
+        review_publish_session,
+        serialize_publish_review,
+    )
     from .db import get_db
 
     with get_db(_prepare_db(db)) as conn:
         try:
             review = review_publish_session(conn, session_id)
         except ValueError as exc:
-            click.echo(str(exc), err=True)
+            if json_output:
+                click.echo(
+                    json.dumps(
+                        {
+                            "error": str(exc),
+                            "code": "ambiguous",
+                            "session_id": session_id,
+                        }
+                    )
+                )
+            else:
+                click.echo(str(exc), err=True)
             raise SystemExit(1)
         if not review:
-            click.echo(f"No session found matching '{session_id}'")
+            if json_output:
+                click.echo(
+                    json.dumps(
+                        {
+                            "error": "not found",
+                            "code": "not_found",
+                            "session_id": session_id,
+                        }
+                    )
+                )
+            else:
+                click.echo(f"No session found matching '{session_id}'")
             raise SystemExit(1)
+        if json_output:
+            click.echo(json.dumps(serialize_publish_review(review)))
+            return
         for line in format_publish_review(review):
             click.echo(line)
 

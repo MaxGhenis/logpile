@@ -1,6 +1,8 @@
 import path from "path";
 
 export const config = {
+  repoRoot: path.resolve(process.cwd(), ".."),
+
   /** Absolute path to the SQLite database */
   dbPath:
     process.env.LOGPILE_DB_PATH ||

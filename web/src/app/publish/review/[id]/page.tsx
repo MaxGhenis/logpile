@@ -6,30 +6,15 @@ import { SourceBadge } from "@/components/badge";
 import { getSession } from "@/lib/db";
 import { config } from "@/lib/config";
 import { fmtTs, truncate, displayProject } from "@/lib/format";
-import type { PublishReview } from "@/lib/types";
+import { getPublishReview, PublishReviewCommandError } from "@/lib/publish";
 import {
   IconShieldCheck,
   IconAlertTriangle,
-  IconLock,
   IconEye,
   IconArrowLeft,
 } from "@tabler/icons-react";
 
 export const dynamic = "force-dynamic";
-
-async function fetchReview(sessionId: string): Promise<PublishReview | null> {
-  // Call the Flask backend's review endpoint (runs Python publish.py logic)
-  try {
-    const res = await fetch(
-      `http://127.0.0.1:5001/api/publish/review/${encodeURIComponent(sessionId)}`,
-      { cache: "no-store" }
-    );
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
 
 export default async function PublishReviewPage({
   params,
@@ -51,7 +36,17 @@ export default async function PublishReviewPage({
   const session = getSession(id);
   if (!session) notFound();
 
-  const review = await fetchReview(id);
+  let reviewError: string | null = null;
+  let review = null;
+  try {
+    review = await getPublishReview(id);
+  } catch (error) {
+    if (error instanceof PublishReviewCommandError) {
+      reviewError = error.message;
+    } else {
+      throw error;
+    }
+  }
 
   const highFindings = review?.findings.filter((f) => f.severity === "high") ?? [];
   const mediumFindings = review?.findings.filter((f) => f.severity === "medium") ?? [];
@@ -204,15 +199,24 @@ export default async function PublishReviewPage({
               </div>
             )}
           </div>
-        ) : (
+        ) : reviewError ? (
           <div className="bg-lp-surface border border-lp-border-dim rounded-lg p-8 text-center">
-            <IconLock size={28} stroke={1.5} className="mx-auto text-lp-text-faint mb-2" />
+            <IconAlertTriangle size={28} stroke={1.5} className="mx-auto text-lp-red mb-2" />
             <div className="text-sm font-medium text-lp-text mb-1">
-              Review not available
+              Review failed
             </div>
             <div className="text-xs text-lp-text-faint max-w-sm mx-auto leading-relaxed">
-              The Flask backend must be running on port 5001 for publish reviews.
-              Start it with <code className="text-lp-amber">logpile serve --flask --port 5001</code>
+              {reviewError}
+            </div>
+          </div>
+        ) : (
+          <div className="bg-lp-surface border border-lp-border-dim rounded-lg p-8 text-center">
+            <IconAlertTriangle size={28} stroke={1.5} className="mx-auto text-lp-amber mb-2" />
+            <div className="text-sm font-medium text-lp-text mb-1">
+              Review not found
+            </div>
+            <div className="text-xs text-lp-text-faint max-w-sm mx-auto leading-relaxed">
+              No publish review data was found for this session.
             </div>
           </div>
         )}

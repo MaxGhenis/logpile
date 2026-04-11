@@ -12,6 +12,7 @@ Override those paths with:
 
 - `LOGPILE_DB_PATH`
 - `LOGPILE_SHARED_DIR`
+- `LOGPILE_PYTHON_BIN`
 - `LOGPILE_PUBLIC_MODE=true`
 
 ## Local development

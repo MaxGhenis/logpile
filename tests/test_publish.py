@@ -137,6 +137,52 @@ class PublishTests(unittest.TestCase):
             self.assertIn("outcome:", result.output)
             self.assertIn("review: public", result.output)
 
+    def test_review_json_outputs_structured_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+            self._write_session(home, body="Discuss the change with the team.")
+
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            result = CliRunner().invoke(
+                cli,
+                ["publish", "review", "session-1", "--db", str(db_path), "--json"],
+            )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            payload = json.loads(result.output)
+            self.assertEqual(payload["session_id"], "session-1")
+            self.assertEqual(payload["recommendation"], "public")
+            self.assertEqual(payload["current_visibility"], "private")
+            self.assertIsInstance(payload["metadata"], dict)
+            self.assertIsInstance(payload["findings"], list)
+
+    def test_review_json_reports_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+
+            result = CliRunner().invoke(
+                cli,
+                ["publish", "review", "missing-session", "--db", str(db_path), "--json"],
+            )
+
+            self.assertEqual(result.exit_code, 1)
+            payload = json.loads(result.output)
+            self.assertEqual(payload["error"], "not found")
+            self.assertEqual(payload["code"], "not_found")
+
     def test_approve_sets_public_visibility_for_clean_session(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
