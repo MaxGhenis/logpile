@@ -31,3 +31,7 @@ __pycache__/
 
 # Logs
 *.log
+
+# sync artifacts
+*.sync.lock
+*.tmp-sync

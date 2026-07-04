@@ -893,5 +893,103 @@ class SyncTests(unittest.TestCase):
             self.assertEqual((rows[1]["session_id"], rows[1]["visibility"]), ("session-2", "unlisted"))
 
 
+# --- archive-integrity tests -------------------------------------------------
+# Imports are grouped here (not at top of file) so this block stays a single
+# self-contained appended hunk.
+import errno as _errno  # noqa: E402
+import fcntl as _fcntl  # noqa: E402
+import shutil as _shutil  # noqa: E402
+from unittest import mock as _mock  # noqa: E402
+
+from logpile import sync as _sync_module  # noqa: E402
+from logpile.sync import _copy_session  # noqa: E402
+
+
+class CopySessionAtomicityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.src = root / "src" / "session.jsonl"
+        self.src.parent.mkdir(parents=True)
+        self.src.write_text('{"a": 1}\n')
+        self.dst = root / "shared" / "session.jsonl"
+        self.dst.parent.mkdir(parents=True)
+
+    def _tmp_leftovers(self) -> list[Path]:
+        return list(self.dst.parent.glob("*.tmp-sync"))
+
+    def test_copies_new_file_and_leaves_no_temp(self) -> None:
+        self.assertTrue(_copy_session(self.src, self.dst))
+        self.assertEqual(self.dst.read_text(), self.src.read_text())
+        self.assertEqual(self._tmp_leftovers(), [])
+
+    def test_skips_identical_existing_copy(self) -> None:
+        _shutil.copy2(self.src, self.dst)
+        self.assertFalse(_copy_session(self.src, self.dst))
+
+    def test_replaces_stale_copy(self) -> None:
+        self.dst.write_text("stale\n")
+        self.assertTrue(_copy_session(self.src, self.dst))
+        self.assertEqual(self.dst.read_text(), self.src.read_text())
+        self.assertEqual(self._tmp_leftovers(), [])
+
+    def test_upgrades_enospc_symlink_to_real_copy(self) -> None:
+        self.dst.symlink_to(self.src)
+        self.assertTrue(_copy_session(self.src, self.dst))
+        self.assertFalse(self.dst.is_symlink())
+        self.assertEqual(self.dst.read_text(), self.src.read_text())
+
+    def test_generic_error_preserves_existing_copy_and_cleans_temp(self) -> None:
+        self.dst.write_text("previous complete copy\n")
+
+        def boom(src, dst):
+            Path(dst).write_text("partial")
+            raise OSError(_errno.EIO, "boom")
+
+        with _mock.patch.object(_sync_module.shutil, "copy2", side_effect=boom):
+            with self.assertRaises(OSError):
+                _copy_session(self.src, self.dst)
+        self.assertEqual(self.dst.read_text(), "previous complete copy\n")
+        self.assertEqual(self._tmp_leftovers(), [])
+
+    def test_enospc_keeps_existing_complete_copy_over_symlink(self) -> None:
+        self.dst.write_text("previous complete copy\n")
+
+        def full(src, dst):
+            raise OSError(_errno.ENOSPC, "disk full")
+
+        with _mock.patch.object(_sync_module.shutil, "copy2", side_effect=full):
+            self.assertFalse(_copy_session(self.src, self.dst))
+        self.assertFalse(self.dst.is_symlink())
+        self.assertEqual(self.dst.read_text(), "previous complete copy\n")
+
+    def test_enospc_without_existing_copy_falls_back_to_symlink(self) -> None:
+        def full(src, dst):
+            raise OSError(_errno.ENOSPC, "disk full")
+
+        with _mock.patch.object(_sync_module.shutil, "copy2", side_effect=full):
+            self.assertTrue(_copy_session(self.src, self.dst))
+        self.assertTrue(self.dst.is_symlink())
+        self.assertEqual(self.dst.resolve(), self.src.resolve())
+
+
+class SyncLockTests(unittest.TestCase):
+    def test_concurrent_sync_skips_instead_of_interleaving(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            db_path = root / "logpile.db"
+            shared = root / "shared"
+            lock_path = Path(f"{db_path}.sync.lock")
+            with open(lock_path, "w") as holder:
+                _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                result = sync_sessions(shared, db_path, "alice", "test-machine", home)
+            self.assertEqual(result, (0, 0, 0))
+            # Skipped before init_db: no database was created.
+            self.assertFalse(db_path.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

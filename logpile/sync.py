@@ -1,5 +1,6 @@
 """Sync JSONL sessions to a shared directory and update the SQLite index."""
 import errno
+import fcntl
 import fnmatch
 import re
 import shutil
@@ -53,25 +54,38 @@ _FORMAT_PATTERNS = (
 )
 
 def _copy_session(src: Path, dst: Path) -> bool:
-    """Copy a session file into the shared directory."""
-    if dst.is_symlink():
+    """Copy a session file into the shared directory.
+
+    Atomic: writes to a temp file beside dst, then os.replace()s it into
+    place, so the shared copy is always a complete file (old or new) even if
+    sync dies mid-copy. A symlink dst (from an earlier ENOSPC fallback) is
+    upgraded to a real copy once a copy succeeds, and an existing complete
+    copy is never removed in favor of a failed one.
+    """
+    was_symlink = dst.is_symlink()
+    if not was_symlink and dst.exists() and file_hash(dst) == file_hash(src):
+        return False
+    tmp = dst.with_name(dst.name + ".tmp-sync")
+    try:
+        shutil.copy2(src, tmp)
+        tmp.replace(dst)
+    except OSError as exc:
         try:
-            if dst.resolve() == src.resolve():
-                return False
+            tmp.unlink(missing_ok=True)
         except OSError:
             pass
-        dst.unlink()
-    elif dst.exists():
-        if file_hash(dst) == file_hash(src):
-            return False
-        dst.unlink()
-    try:
-        shutil.copy2(src, dst)
-    except OSError as exc:
-        if dst.exists() or dst.is_symlink():
-            dst.unlink()
         if exc.errno != errno.ENOSPC:
             raise
+        if was_symlink:
+            try:
+                if dst.resolve() == src.resolve():
+                    return False
+            except OSError:
+                pass
+        elif dst.exists():
+            return False
+        if dst.is_symlink():
+            dst.unlink()
         dst.symlink_to(src.resolve())
     return True
 
@@ -649,7 +663,32 @@ def sync_sessions(
     """
     Discover, parse, and copy sessions.
     Returns (new, updated, skipped) counts.
+
+    Holds an exclusive lock for the duration: a concurrent sync (e.g. the
+    usage-tracker launchd job overlapping a manual run) returns (0, 0, 0)
+    instead of interleaving copies onto the same shared files.
     """
+    lock_path = Path(f"{db_path}.sync.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            if verbose:
+                print("  Another logpile sync is running; skipping.")
+            return (0, 0, 0)
+        return _sync_sessions(shared_dir, db_path, username, machine, home, verbose)
+
+
+def _sync_sessions(
+    shared_dir: Path,
+    db_path: Path,
+    username: str,
+    machine: str,
+    home: Path,
+    verbose: bool = False,
+) -> tuple[int, int, int]:
+    """Locked body of sync_sessions."""
     init_db(db_path)
     patterns = load_ignore_patterns(home)
     now = datetime.now(timezone.utc).isoformat()
