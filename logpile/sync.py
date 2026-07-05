@@ -2,9 +2,11 @@
 import errno
 import fcntl
 import fnmatch
+import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,7 +67,10 @@ def _copy_session(src: Path, dst: Path) -> bool:
     was_symlink = dst.is_symlink()
     if not was_symlink and dst.exists() and file_hash(dst) == file_hash(src):
         return False
-    tmp = dst.with_name(dst.name + ".tmp-sync")
+    # Per-writer tmp name: reconcile_session_storage (publish/visibility paths)
+    # copies without holding the sync lock, so a shared tmp name would let one
+    # writer os.replace() another's half-written file into place.
+    tmp = dst.with_name(f"{dst.name}.{os.getpid()}.tmp-sync")
     try:
         shutil.copy2(src, tmp)
         tmp.replace(dst)
@@ -674,8 +679,9 @@ def sync_sessions(
         try:
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            if verbose:
-                print("  Another logpile sync is running; skipping.")
+            # Always audible: a silent (0, 0, 0) reads as "synced, all quiet"
+            # to humans and scripts checking the summary line.
+            print("Skipped: another logpile sync holds the lock.", file=sys.stderr)
             return (0, 0, 0)
         return _sync_sessions(shared_dir, db_path, username, machine, home, verbose)
 
