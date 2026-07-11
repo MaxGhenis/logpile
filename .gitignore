@@ -35,3 +35,4 @@ __pycache__/
 # sync artifacts
 *.sync.lock
 *.tmp-sync
+/supabase/.temp/
