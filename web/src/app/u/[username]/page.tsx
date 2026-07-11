@@ -3,9 +3,10 @@ import Link from "next/link";
 import { Topbar } from "@/components/topbar";
 import { StatCard } from "@/components/stat-card";
 import { SourceBadge } from "@/components/badge";
+import { StatusBadge } from "@/components/status-badge";
 import { UserActivityChart, UserSourceChart } from "@/components/charts/profile-charts";
 import {
-  getUserBySlug,
+  getUserByUsername,
   getUserSummary,
   getUserActivity,
   getUserSourceBreakdown,
@@ -13,10 +14,18 @@ import {
   getUserModels,
   getUserRecentSessions,
   getUserTopRepos,
+  getUserGithubActivity,
+  getUserGithubTotals,
   isProfileDirectlyVisible,
 } from "@/lib/db";
 import { fmtNum, fmtTokens, fmtTs, fmtDuration, displayProject } from "@/lib/format";
 import { config } from "@/lib/config";
+import {
+  normalizeAnalyticsOrigin,
+  originQueryValue,
+  withOriginQuery,
+} from "@/lib/origin-lens";
+import { WorkflowLensBar } from "@/components/workflow-lens-bar";
 import {
   IconPencil,
   IconTestPipe,
@@ -29,27 +38,35 @@ export const dynamic = "force-dynamic";
 
 export default async function UserProfilePage({
   params,
+  searchParams,
 }: {
-  params: Promise<{ slug: string }>;
+  params: Promise<{ username: string }>;
+  searchParams?: Promise<{ origin?: string }>;
 }) {
-  const { slug } = await params;
-  const user = getUserBySlug(slug);
+  const { username } = await params;
+  const resolvedSearchParams = searchParams ? await searchParams : undefined;
+  const originLens = normalizeAnalyticsOrigin(resolvedSearchParams?.origin);
+  const origin = originQueryValue(originLens);
+  const user = getUserByUsername(username);
   if (!user || !isProfileDirectlyVisible(user)) notFound();
 
-  const summary = getUserSummary(user.slug);
+  const summary = getUserSummary(user.username, origin);
   if (!summary) notFound();
 
-  const activityRows = getUserActivity(user.slug, 60);
-  const sourceRows = getUserSourceBreakdown(user.slug);
-  const toolRows = getUserTopTools(user.slug, 12);
-  const modelRows = getUserModels(user.slug, 8);
-  const recentRows = getUserRecentSessions(user.slug, 12);
-  const topRepos = getUserTopRepos(user.slug, 8);
+  const activityRows = getUserActivity(user.username, 60, origin);
+  const sourceRows = getUserSourceBreakdown(user.username, origin);
+  const toolRows = getUserTopTools(user.username, 12, origin);
+  const modelRows = getUserModels(user.username, 8, origin);
+  const recentRows = getUserRecentSessions(user.username, 12, origin);
+  const topRepos = getUserTopRepos(user.username, 8, origin);
+  const githubDaily = getUserGithubActivity(user.username, 60);
+  const githubTotals = getUserGithubTotals(user.username, 180);
 
   const activity = {
     labels: activityRows.map((r) => r.day),
     messages: activityRows.map((r) => r.messages ?? 0),
     tool_calls: activityRows.map((r) => r.tool_calls ?? 0),
+    github_contributions: activityRows.map((r) => githubDaily[r.day]?.contributions ?? 0),
   };
   const displayName = user.display_name ?? user.username;
 
@@ -67,34 +84,66 @@ export default async function UserProfilePage({
     <>
       <Topbar title="Profile" />
       <div className="p-7 max-w-[1400px] animate-fade-up">
+        <WorkflowLensBar basePath={`/u/${user.username}`} originLens={originLens} />
+
         {/* Hero */}
         <div className="flex items-end justify-between gap-5 p-8 border border-lp-border-dim rounded-xl mb-5 bg-[radial-gradient(ellipse_at_top_left,rgba(245,158,11,0.08),transparent_50%),radial-gradient(ellipse_at_bottom_right,rgba(96,165,250,0.05),transparent_50%),var(--color-lp-surface)]">
-          <div>
-            <div className="text-[0.68rem] text-lp-amber-dim uppercase tracking-[1.2px] font-bold mb-2.5">
-              operator profile
+          <div className="min-w-0">
+            <div className="text-[0.68rem] text-lp-amber-dim uppercase tracking-[1.2px] font-bold mb-2.5 flex flex-wrap items-center gap-2">
+              <span>operator profile</span>
+              {config.publicMode && (
+                <>
+                  <span className="text-lp-text-faint">·</span>
+                  <Link
+                    href="/"
+                    className="text-lp-text-faint hover:text-lp-amber no-underline normal-case tracking-normal font-medium"
+                  >
+                    on <span className="font-brand font-bold tracking-tight">Logpile</span>
+                  </Link>
+                </>
+              )}
             </div>
             <h1 className="font-brand text-[clamp(2.2rem,5vw,3.5rem)] font-black leading-[0.95] tracking-tight text-lp-text m-0">
-              @{user.slug}
+              @{user.username}
             </h1>
             <div className="text-sm text-lp-text-faint mt-3">
               {displayName}
-              {displayName !== user.username && ` \u00b7 ${user.username}`}
               {user.bio && ` \u00b7 ${user.bio}`}
               <br />
               active since {fmtTs(summary.first_seen)} &middot; {summary.active_days} active
               days &middot; {summary.known_repos} repos &middot; {summary.known_projects} projects
+              {githubTotals && (
+                <>
+                  <br />
+                  <span className="text-lp-green">
+                    {fmtNum(githubTotals.contributions)} GitHub contributions
+                    {githubTotals.prs_opened > 0 && ` · ${fmtNum(githubTotals.prs_opened)} PRs`}
+                  </span>
+                  <span className="text-lp-text-faint"> (last 180 days)</span>
+                </>
+              )}
             </div>
           </div>
-          {(!config.publicMode || user.profile_visibility === "public") && (
-            <div className="flex gap-2.5 flex-wrap">
+          <div className="flex gap-2.5 flex-wrap justify-end">
+            {(!config.publicMode || user.profile_visibility === "public") && (
               <Link
-                href={`/sessions?user=${user.slug}`}
+                href={withOriginQuery("/sessions", originLens, { user: user.username })}
                 className="inline-flex items-center justify-center min-w-[108px] px-3.5 py-2 rounded-full border border-lp-border text-sm font-medium text-lp-text-dim bg-lp-bg/60 no-underline hover:border-lp-amber hover:text-lp-amber hover:bg-lp-amber-glow transition-all"
               >
                 View sessions
               </Link>
-            </div>
-          )}
+            )}
+            {config.publicMode && (
+              <a
+                href="https://github.com/MaxGhenis/logpile#quick-start"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center justify-center px-3.5 py-2 rounded-full border border-lp-amber bg-lp-amber-glow text-sm font-semibold text-lp-amber no-underline hover:bg-lp-amber hover:text-lp-bg transition-all"
+              >
+                Get your own
+              </a>
+            )}
+          </div>
         </div>
 
         {/* Stat cards — primary */}
@@ -152,8 +201,13 @@ export default async function UserProfilePage({
         {/* Charts */}
         <div className="grid grid-cols-[2fr_1fr] gap-4 mb-5">
           <div className="bg-lp-surface border border-lp-border-dim rounded-lg p-5">
-            <div className="text-[0.72rem] text-lp-text-faint uppercase tracking-widest font-semibold mb-4">
-              Activity — last 60 days
+            <div className="text-[0.72rem] text-lp-text-faint uppercase tracking-widest font-semibold mb-4 flex items-center justify-between">
+              <span>Activity — last 60 days</span>
+              {githubTotals && (
+                <span className="text-[0.65rem] text-lp-text-faint normal-case tracking-normal font-normal italic">
+                  with GitHub overlay
+                </span>
+              )}
             </div>
             <UserActivityChart data={activity} />
           </div>
@@ -186,7 +240,11 @@ export default async function UserProfilePage({
                     <tr key={`${r.repo_name}:${r.repo_root ?? "public"}`} className="border-b border-lp-border-dim last:border-b-0 hover:bg-lp-amber-glow transition-colors">
                       <td className="py-2 px-3">
                         <Link
-                          href={`/sessions?user=${user.slug}&repo=${encodeURIComponent(r.repo_name)}${r.repo_root ? `&repoRoot=${encodeURIComponent(r.repo_root)}` : ""}`}
+                          href={withOriginQuery("/sessions", originLens, {
+                            user: user.username,
+                            repo: r.repo_name,
+                            repoRoot: r.repo_root ?? undefined,
+                          })}
                           className="font-mono text-xs text-lp-text hover:text-lp-amber no-underline"
                         >
                           {r.repo_name}
@@ -269,10 +327,10 @@ export default async function UserProfilePage({
             Recent sessions
           </div>
           <div className="overflow-x-auto">
-            <table className="w-full text-sm border-collapse min-w-[700px]">
+            <table className="w-full text-sm border-collapse min-w-[800px]">
               <thead>
                 <tr className="text-lp-text-faint text-[0.68rem] uppercase tracking-wider">
-                  {["When", "Tool", "Repo", "Model", "Messages", "Tool calls", "Duration"].map((h) => (
+                  {["When", "Tool", "Repo", "Status", "Msgs", "Summary"].map((h) => (
                     <th key={h} className="text-left py-2 px-3 border-b border-lp-border font-semibold">{h}</th>
                   ))}
                 </tr>
@@ -289,14 +347,25 @@ export default async function UserProfilePage({
                     <td className="py-2 px-3 text-lp-text-dim max-w-[150px] truncate font-mono text-xs">
                       {r.repo_name || displayProject(r.project)}
                     </td>
-                    <td className="py-2 px-3 font-mono text-xs">{r.model || "\u2014"}</td>
+                    <td className="py-2 px-3"><StatusBadge status={r.session_status} /></td>
                     <td className="py-2 px-3">{(r.user_message_count ?? 0) + (r.assistant_message_count ?? 0)}</td>
-                    <td className="py-2 px-3">{r.tool_call_count ?? 0}</td>
-                    <td className="py-2 px-3 font-mono text-xs">{fmtDuration(r.duration_seconds)}</td>
+                    <td className="py-2 px-3 max-w-[400px]">
+                      <Link href={`/sessions/${r.session_id}`} className="text-lp-text hover:text-lp-amber no-underline block">
+                        {r.session_summary ? (
+                          <span className="text-sm line-clamp-2">{r.session_summary}</span>
+                        ) : r.session_goal ? (
+                          <span className="text-sm line-clamp-2 text-lp-text-dim">{r.session_goal}</span>
+                        ) : (
+                          <span className="text-xs text-lp-text-faint italic">
+                            {r.tool_call_count ?? 0} tool calls · {fmtDuration(r.duration_seconds)}
+                          </span>
+                        )}
+                      </Link>
+                    </td>
                   </tr>
                 ))}
                 {recentRows.length === 0 && (
-                  <tr><td colSpan={7} className="text-center text-lp-text-faint py-10 italic">No public sessions yet.</td></tr>
+                  <tr><td colSpan={6} className="text-center text-lp-text-faint py-10 italic">No public sessions yet.</td></tr>
                 )}
               </tbody>
             </table>

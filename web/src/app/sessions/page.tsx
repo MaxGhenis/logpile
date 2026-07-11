@@ -4,7 +4,7 @@ import { StatusBadge } from "@/components/status-badge";
 import { ActivityBadges } from "@/components/activity-badges";
 import { getSessions, getUsersForFilter, getReposForFilter } from "@/lib/db";
 import { fmtTs, fmtNum, displayProject, truncate } from "@/lib/format";
-import { ACTIVITY_FILTERS, SESSION_STATUSES } from "@/lib/types";
+import { ACTIVITY_FILTERS, SESSION_ORIGINS, SESSION_STATUSES } from "@/lib/types";
 import Link from "next/link";
 
 export const dynamic = "force-dynamic";
@@ -27,12 +27,20 @@ const ACTIVITY_LABELS: Record<string, string> = {
   git_diff: "Git diff",
 };
 
+const ORIGIN_LABELS: Record<string, string> = {
+  human_direct: "Human direct",
+  human_delegated: "Human delegated",
+  pipeline_eval: "Pipeline eval",
+  meta_scaffolding: "Meta scaffolding",
+  system_generated: "System generated",
+};
+
 export default async function SessionsPage({
   searchParams,
 }: {
   searchParams: Promise<{
     q?: string; source?: string; user?: string; repo?: string;
-    repoRoot?: string; branch?: string; activity?: string; status?: string; page?: string;
+    repoRoot?: string; branch?: string; activity?: string; status?: string; origin?: string; objective?: string; objectiveLabel?: string; page?: string;
   }>;
 }) {
   const params = await searchParams;
@@ -44,18 +52,29 @@ export default async function SessionsPage({
   const branch = params.branch || "";
   const activity = params.activity || "";
   const status = params.status || "";
+  const origin = params.origin || "";
+  const objective = params.objective || "";
+  const objectiveLabel = params.objectiveLabel || "";
   const parsedPage = Number.parseInt(params.page || "1", 10);
   const page = Number.isFinite(parsedPage) && parsedPage > 0 ? parsedPage : 1;
 
   let invalidActivityFilter = false;
+  let invalidOriginFilter = false;
+  let invalidObjectiveFilter = false;
   let rows = [] as Awaited<ReturnType<typeof getSessions>>["rows"];
   let total = 0;
   let perPage = 50;
   try {
-    ({ rows, total, perPage } = getSessions({ q, source, user, repo, repoRoot, branch, activity, status, page }));
+    ({ rows, total, perPage } = getSessions({ q, objective, source, user, repo, repoRoot, branch, activity, status, origin, page }));
   } catch (error) {
     if (error instanceof RangeError) {
-      invalidActivityFilter = true;
+      if (error.message.includes("origin")) {
+        invalidOriginFilter = true;
+      } else if (error.message.includes("objective")) {
+        invalidObjectiveFilter = true;
+      } else {
+        invalidActivityFilter = true;
+      }
     } else {
       throw error;
     }
@@ -65,7 +84,7 @@ export default async function SessionsPage({
   const totalPages = Math.ceil(total / perPage);
 
   function filterUrl(overrides: Record<string, string | number>) {
-    const p = { q, source, user, repo, repoRoot, branch, activity, status, page: "1", ...overrides };
+    const p = { q, source, user, repo, repoRoot, branch, activity, status, origin, objective, objectiveLabel, page: "1", ...overrides };
     const qs = Object.entries(p)
       .filter(([, v]) => v)
       .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
@@ -73,7 +92,7 @@ export default async function SessionsPage({
     return `/sessions${qs ? `?${qs}` : ""}`;
   }
 
-  const hasFilters = q || source || user || repo || repoRoot || branch || activity || status;
+  const hasFilters = q || source || user || repo || repoRoot || branch || activity || status || origin || objective;
 
   return (
     <>
@@ -81,6 +100,8 @@ export default async function SessionsPage({
       <div className="p-7 max-w-[1400px] animate-fade-up">
         {/* Filter bar */}
         <form action="/sessions" method="get" className="flex gap-2 flex-wrap items-center mb-3">
+          {objective && <input type="hidden" name="objective" value={objective} />}
+          {objectiveLabel && <input type="hidden" name="objectiveLabel" value={objectiveLabel} />}
           <input
             type="text"
             name="q"
@@ -96,7 +117,7 @@ export default async function SessionsPage({
           <select name="user" defaultValue={user} className="bg-lp-surface border border-lp-border-dim text-lp-text rounded-lg px-3 py-2 text-sm font-body">
             <option value="">All operators</option>
             {users.map((u) => (
-              <option key={u.slug} value={u.slug}>{u.display_name}</option>
+              <option key={u.username} value={u.username}>{u.display_name}</option>
             ))}
           </select>
           {repos.length > 0 && (
@@ -119,6 +140,12 @@ export default async function SessionsPage({
               <option key={s} value={s}>{s}</option>
             ))}
           </select>
+          <select name="origin" defaultValue={origin} className="bg-lp-surface border border-lp-border-dim text-lp-text rounded-lg px-3 py-2 text-sm font-body">
+            <option value="">All origins</option>
+            {SESSION_ORIGINS.map((o) => (
+              <option key={o} value={o}>{ORIGIN_LABELS[o] || o}</option>
+            ))}
+          </select>
           <button
             type="submit"
             className="bg-lp-amber text-lp-bg rounded-lg px-5 py-2 text-sm font-semibold font-body hover:bg-lp-amber-hot hover:shadow-[0_2px_12px_rgba(245,158,11,0.3)] transition-all cursor-pointer"
@@ -132,17 +159,46 @@ export default async function SessionsPage({
           )}
         </form>
 
+        {objective && (
+          <div className="mb-4 rounded-lg border border-lp-border-dim bg-lp-surface px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-[0.68rem] uppercase tracking-widest text-lp-text-faint font-semibold mb-1">
+                Objective family
+              </div>
+              <div className="text-sm text-lp-text">
+                {objectiveLabel || objective}
+              </div>
+            </div>
+            <Link
+              href={filterUrl({ objective: "", objectiveLabel: "", page: 1 })}
+              className="text-sm text-lp-amber hover:text-lp-amber-hot no-underline"
+            >
+              Clear objective filter
+            </Link>
+          </div>
+        )}
+
         <div className="text-xs font-mono text-lp-text-faint mb-3">
           {invalidActivityFilter
             ? "Invalid activity filter"
+            : invalidOriginFilter
+              ? "Invalid origin filter"
+              : invalidObjectiveFilter
+                ? "Invalid objective filter"
             : `${fmtNum(total)} session${total !== 1 ? "s" : ""}`}
         </div>
 
-        {invalidActivityFilter && (
+        {(invalidActivityFilter || invalidOriginFilter || invalidObjectiveFilter) && (
           <div className="mb-4 rounded-lg border border-lp-red/30 bg-lp-red/8 px-4 py-3 text-sm text-lp-text-dim">
-            <div className="font-medium text-lp-text">Unknown activity filter: {activity}</div>
+            <div className="font-medium text-lp-text">
+              {invalidOriginFilter
+                ? `Unknown origin filter: ${origin}`
+                : invalidObjectiveFilter
+                  ? `Unknown objective filter: ${objective}`
+                  : `Unknown activity filter: ${activity}`}
+            </div>
             <div className="mt-1 text-lp-text-faint">
-              Choose one of the supported activity facets from the filter menu or{" "}
+              Choose one of the supported filters from the menu or{" "}
               <Link href="/sessions" className="text-lp-amber hover:text-lp-amber-hot no-underline">
                 clear the filters
               </Link>
@@ -176,7 +232,7 @@ export default async function SessionsPage({
                       {fmtTs(r.first_timestamp)}
                     </td>
                     <td className="py-2.5 px-3">
-                      <UserBadge slug={r.user_slug || r.username} displayName={r.user_display_name} />
+                      <UserBadge username={r.username} displayName={r.user_display_name} />
                     </td>
                     <td className="py-2.5 px-3">
                       <SourceBadge source={r.source} />
@@ -227,8 +283,8 @@ export default async function SessionsPage({
                   <tr>
                     <td colSpan={7} className="text-center py-16">
                       <div className="text-lp-text-faint">
-                        {invalidActivityFilter ? (
-                          <div className="text-sm italic">Select a valid activity filter to load sessions.</div>
+                        {invalidActivityFilter || invalidOriginFilter ? (
+                          <div className="text-sm italic">Select valid filters to load sessions.</div>
                         ) : hasFilters ? (
                           <>
                             <div className="text-sm mb-2">No sessions match your filters.</div>

@@ -13,22 +13,25 @@ function parsePositiveInt(raw: string | null, fallback: number, name: string) {
 
 export async function GET(
   req: Request,
-  { params }: { params: Promise<{ slug: string }> }
+  { params }: { params: Promise<{ username: string }> }
 ) {
-  const { slug } = await params;
+  const { username } = await params;
   const url = new URL(req.url);
   let payload;
   try {
     const limit = parsePositiveInt(url.searchParams.get("limit"), 50, "limit");
     const offset = parsePositiveInt(url.searchParams.get("offset"), 0, "offset");
-    payload = getApiUserSessions(slug, {
+    payload = getApiUserSessions(username, {
       limit,
       offset,
       project: url.searchParams.get("project") || undefined,
       repo: url.searchParams.get("repo") || undefined,
+      repoRoot: url.searchParams.get("repoRoot") || undefined,
       branch: url.searchParams.get("branch") || undefined,
       activity: url.searchParams.get("activity") || undefined,
       status: url.searchParams.get("status") || undefined,
+      origin: url.searchParams.get("origin") || "human_direct",
+      objective: url.searchParams.get("objective") || undefined,
       path: url.searchParams.get("path") || undefined,
     });
   } catch (error) {
@@ -43,7 +46,6 @@ export async function GET(
 
   return Response.json({
     user: {
-      slug: payload.user.slug,
       username: payload.user.username,
       display_name: payload.user.display_name ?? payload.user.username,
       bio: payload.user.bio,

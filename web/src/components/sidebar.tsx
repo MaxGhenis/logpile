@@ -12,17 +12,20 @@ import {
   IconShieldCheck,
 } from "@tabler/icons-react";
 
-const NAV = [
+type NavItem = { href: string; label: string; icon: typeof IconLayoutDashboard; privateOnly?: boolean };
+
+const NAV: readonly NavItem[] = [
   { href: "/", label: "Dashboard", icon: IconLayoutDashboard },
   { href: "/sessions", label: "Sessions", icon: IconList },
   { href: "/repos", label: "Repos", icon: IconGitBranch },
   { href: "/u", label: "People", icon: IconUsers },
   { href: "/analysis", label: "Analysis", icon: IconChartBar },
-  { href: "/publish", label: "Publish", icon: IconShieldCheck },
+  { href: "/publish", label: "Publish", icon: IconShieldCheck, privateOnly: true },
 ] as const;
 
-export function Sidebar() {
+export function Sidebar({ publicMode = false }: { publicMode?: boolean }) {
   const pathname = usePathname();
+  const visibleNav = NAV.filter((item) => !(item.privateOnly && publicMode));
 
   function isActive(href: string) {
     if (href === "/") return pathname === "/";
@@ -43,7 +46,7 @@ export function Sidebar() {
 
       {/* Nav */}
       <ul className="list-none flex-1 py-1.5">
-        {NAV.map(({ href, label, icon: Icon }) => (
+        {visibleNav.map(({ href, label, icon: Icon }) => (
           <li key={href}>
             <Link
               href={href}

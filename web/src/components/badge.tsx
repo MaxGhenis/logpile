@@ -16,14 +16,14 @@ export function SourceBadge({ source }: { source: string }) {
 }
 
 export function UserBadge({
-  slug,
+  username,
   displayName,
 }: {
-  slug: string;
+  username: string;
   displayName: string;
 }) {
   return (
-    <Link href={`/u/${slug}`} className="no-underline group">
+    <Link href={`/u/${username}`} className="no-underline group">
       <span className="bg-lp-raised border border-lp-border-dim rounded px-2 py-0.5 text-xs font-medium text-lp-text group-hover:border-lp-amber group-hover:text-lp-amber transition-colors">
         {displayName}
       </span>

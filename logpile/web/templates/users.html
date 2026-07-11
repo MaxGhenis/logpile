@@ -5,9 +5,9 @@
 {% block content %}
 <div class="people-grid">
   {% for r in rows %}
-  <a href="{{ url_for('user_profile', slug=r.slug) }}" class="person-card">
-    <div class="person-name">@{{ r.slug }}</div>
-    {% if r.display_name != r.slug %}
+  <a href="{{ url_for('user_profile', username=r.username) }}" class="person-card">
+    <div class="person-name">@{{ r.username }}</div>
+    {% if r.display_name != r.username %}
     <div style="color:var(--text-dim);font-size:0.85rem;">{{ r.display_name }}</div>
     {% endif %}
     <div class="person-stats">

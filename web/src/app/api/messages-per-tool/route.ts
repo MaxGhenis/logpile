@@ -5,8 +5,17 @@ const SOURCE_COLORS: Record<string, { border: string; bg: string }> = {
   codex: { border: "#60a5fa", bg: "#60a5fa18" },
 };
 
-export async function GET() {
-  const rows = getMessagesByTool(30);
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url);
+  let rows;
+  try {
+    rows = getMessagesByTool(30, searchParams.get("origin") ?? undefined);
+  } catch (error) {
+    if (error instanceof RangeError) {
+      return Response.json({ error: error.message }, { status: 400 });
+    }
+    throw error;
+  }
   const daysSet = [...new Set(rows.map((r) => r.day))].sort();
   const sources = [...new Set(rows.map((r) => r.source))].sort();
 

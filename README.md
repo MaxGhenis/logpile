@@ -1,215 +1,319 @@
 # Logpile
 
-**Searchable Claude Code and Codex session logs.**
+**Your Claude Code and Codex sessions, indexed and legible.**
 
-Logpile syncs local agent session JSONL files into a shared directory, indexes them in SQLite, and serves a web UI for browsing transcripts, tracking usage, and publishing per-user profiles like `/u/maxghenis`.
+Logpile turns the JSONL session files your agent CLIs leave on disk into something you can actually browse — filtered by repo, activity (wrote files? ran tests? committed?), status (success / partial / failed / exploration), and workflow origin (your direct work vs. delegated agents vs. pipeline runs). A publish queue reviews each session for secrets and PII before anything goes on a public profile.
+
+Hosted: **[logpile.ai](https://logpile.ai)**
+Source: **[github.com/MaxGhenis/logpile](https://github.com/MaxGhenis/logpile)**
+
+---
 
 ## Quick start
 
 ```bash
-# New checkout
-cd ~/logpile
+git clone https://github.com/MaxGhenis/logpile ~/logpile && cd ~/logpile
 uv venv --python 3.11 && uv pip install -e .
 
-# Index your sessions
-logpile sync
-
-# Start the web UI
-logpile serve
-# open http://127.0.0.1:5000
+logpile sync          # index your local CC and Codex sessions
+logpile search "thing I asked about"
+logpile serve         # open http://127.0.0.1:5002
 ```
 
-Logpile defaults to `~/logpile/`. If you still have a legacy `~/agentus/` checkout or `agentus.db`, those are still detected automatically.
+`logpile serve` builds and starts the Next.js app. Add `--dev` for HMR during development. Add `--public` to expose only public sessions and profiles (safe for hosted instances).
+
+Logpile is local-first by default. Nothing leaves your machine unless you opt into the cloud backend with `LOGPILE_BACKEND=cloud`, `--backend cloud`, or the `logpile backup` commands.
+
+---
+
+## What Logpile gives you
+
+### Session archive with real filters
+Not just a JSONL viewer — filter by repo, git branch, activity (wrote files, ran tests, built, committed), session status, and workflow origin.
+
+### Workflow lens
+Every analytics page splits by *how the session started*: your direct work, delegated sub-agents, pipeline evals, meta-scaffolding, or system-generated. Stop mixing "what I coded this week" with what your test runners did overnight.
+
+### Publish queue with secret/PII scanning
+Before anything leaves `private` → `unlisted` → `public`, Logpile scans the transcript and flags findings by severity. You get a recommended visibility and a list of evidence, per session, so the triage step is actual review, not guesswork.
+
+### Context explosion analysis
+For Codex: detects fork-swarm roots whose children are carrying large inherited-context burden. Surfaces cached-input share, child-token share, spawn depth, and warnings like "mostly inherited context", "fork swarm", "giant child sessions". Tells you where your token budget is actually going.
+
+### Operator profiles at `/u/<username>`
+Public-by-default pages showing session counts, activity stats (files written, test runs, builds, commits), top repos and tools, and a curated recent-sessions feed with status badges and summaries.
+
+---
+
+## Architecture
+
+```
+┌─ Python CLI (logpile)            ┌─ Next.js 16 app (web/)
+│  - sync (JSONL → SQLite/R2)      │  - dashboard, sessions, profiles
+│  - publish queue / review        │  - reads SQLite via better-sqlite3
+│  - visibility rules engine       │  - Tailwind 4, Recharts
+└────┬──────────────────────────┐  └───┬──────────────────────────┐
+     │                          │      │                          │
+     ▼                          ▼      │                          ▼
+   sessions table       shared/*.jsonl │                     browser UI
+     (SQLite)          (local cache)   │
+                                       ▼
+                            /api/publish/review/[id]
+                            (shells to Python publish.py
+                             for secret/PII scanning)
+```
+
+**Why split like this?** The parsing and scanning logic is Python (one source of truth, covered by the CLI test suite). The UI is TypeScript (DX you'd actually want for a read-heavy app). The catalog views in SQLite are the contract between them, and the one awkward boundary (review file scanning) shells to Python on demand.
+
+---
 
 ## Commands
 
 ### `logpile sync`
 
-Copies sessions into `shared/<username>/` and updates the SQLite index.
+Indexes your local session JSONL files into SQLite by default. Use `--backend cloud` to upload immutable raw logs to R2/S3 and index exact chunks in Supabase/Postgres, or `--backend both` to do both.
 
-```text
+```
 Options:
-  --shared PATH     Shared directory
-  --db PATH         SQLite database
+  --shared PATH     Shared directory    [default: ~/logpile/shared]
+  --db PATH         SQLite database     [default: ~/logpile/logpile.db]
+  --backend MODE    local | cloud | both [default: local]
   --username TEXT   Override system username
   --machine TEXT    Override hostname
   -v, --verbose     Print each file processed
 ```
 
+Scans `~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/**/*.jsonl`, extracts repo metadata, activity counts, narrative fields, and origin classification, then writes to SQLite.
+
+### `logpile search` / `logpile show` / `logpile status`
+
+Read from either local SQLite/shared files or the cloud raw-log index.
+
+```bash
+# Auto chooses cloud when LOGPILE_SUPABASE_DB_URL is set, otherwise local.
+logpile search "specific thing x"
+logpile show <session-id>
+logpile status
+
+# Force one backend.
+logpile search "specific thing x" --backend local
+LOGPILE_SUPABASE_DB_URL="postgresql://..." logpile search "specific thing x" --backend cloud
+```
+
+Local mode is the privacy-preserving path: it reads only your local SQLite database and local JSONL files. Cloud mode reads Supabase/Postgres search chunks and links those chunks back to immutable raw objects in R2/S3.
+
+### `logpile backup`
+
+Backs up immutable raw logs to object storage and indexes exact searchable chunks in Supabase/Postgres. This is not a summarization path: message text, tool inputs, and tool outputs are chunked from the original JSONL so searches can link back to exact raw records.
+
+```bash
+# See the exact local files and bytes that would be preserved.
+logpile backup plan
+
+# Print the Postgres schema for Supabase.
+logpile backup schema
+
+# Upload raw objects to R2/S3 and index exact chunks in Supabase Postgres.
+LOGPILE_SUPABASE_DB_URL="postgresql://..." \
+LOGPILE_R2_ACCOUNT_ID="..." \
+LOGPILE_R2_BUCKET="logpile-raw" \
+LOGPILE_R2_ACCESS_KEY_ID="..." \
+LOGPILE_R2_SECRET_ACCESS_KEY="..." \
+logpile backup push
+
+# Rehydrate a new database from local originals without duplicating sha256s already indexed.
+logpile backup push --missing --defer-search-index
+
+# Search the exact raw chunks, not summaries.
+logpile backup search "specific thing x"
+
+# Build/rebuild searchable chunks from raw objects already in R2/S3.
+logpile backup index --missing
+
+# Rebuild from content-addressed R2/S3 objects when the Postgres manifest is absent.
+logpile backup index --from-r2 --missing
+
+# For large imports, defer and build the full-text search index once afterward.
+logpile backup index --from-r2 --missing --defer-search-index
+logpile backup search-index
+```
+
+Install cloud support with `uv pip install -e '.[cloud]'`. Raw objects are stored under content-addressed keys such as `raw/sha256/ab/<sha256>.jsonl`; Postgres stores object manifests, source paths, byte ranges, and exact searchable text chunks. Full-text search is indexed by default, while substring search falls back to a direct scan so bulk imports do not create a very large trigram index unless a deployment chooses to add one later. The backup command never deletes local files.
+
 ### `logpile serve`
 
-Starts the Flask viewer.
+Starts the Next.js web app.
 
-```text
+```
 Options:
   --shared PATH     Shared directory
   --db PATH         SQLite database
-  --host TEXT       Bind address      [default: 127.0.0.1]
-  --port INTEGER    Port              [default: 5000]
+  --host TEXT       Bind address        [default: 0.0.0.0]
+  --port INTEGER    Port                [default: 5002]
   --public          Public read-only mode
+  --dev             Next.js dev server with HMR
 ```
 
-`--public` enforces the hosted/public contract:
-- only `public` profiles and `public` sessions appear in global listings and aggregate APIs
-- `unlisted` profiles and sessions stay direct-link only
+`--public` mode enforces the hosted contract:
+- only `public` sessions appear in listings and aggregate APIs
+- `unlisted` sessions remain direct-link only
 - `private` sessions are hidden entirely
+- `/publish` queue is unavailable
 
-### `logpile private <session-id>`
+### `logpile publish queue`
 
-Marks a session private. It is hidden from viewers and excluded from listings, profiles, and aggregate totals.
+Prints the publish review queue as JSON — pending sessions plus review findings.
 
-### `logpile visibility <session-id> <private|unlisted|public>`
-
-Sets session visibility explicitly.
-
-### `logpile redact <session-id> <turn-number>`
-
-Currently marks the whole session private. Per-turn redaction is still planned.
-
-### `logpile users`
-
-Lists canonical user slugs and visibility defaults.
-
-### `logpile user <slug-or-username>`
-
-Updates user metadata and defaults.
-
-```text
+```
 Options:
-  --display-name TEXT
-  --bio TEXT
-  --avatar-url TEXT
-  --profile-visibility [private|unlisted|public]
-  --default-session-visibility [private|unlisted|public]
+  --visibility [pending|all|private|unlisted|public|needs_changes]
+  --status     [exploration|success|partial|failed]
+  --origin     [human_direct|human_delegated|pipeline_eval|meta_scaffolding|system_generated]
+  --user       <slug-or-username>
+  --limit      <int, 1–200>
+  --reviews / --no-reviews
+  --json
 ```
 
-### `logpile rules ...`
+### `logpile publish review <session-id>`
 
-Automatic visibility rules let you classify newly synced sessions by exact or fuzzy matching instead of only relying on per-user defaults.
+Scans one session's transcript for secrets/PII and prints a recommendation + findings as JSON.
+
+### `logpile publish approve <session-id>` / `logpile publish apply <session-id>`
+
+Apply a reviewed visibility decision. Defaults to `--visibility unlisted`. `--force` overrides the review recommendation.
+
+### `logpile private <session-id>` / `logpile visibility <session-id> <level>`
+
+Set session visibility manually. Manual settings win over rules.
+
+### `logpile users` / `logpile user <username>`
+
+Inspect or update user metadata (display name, bio, avatar, profile visibility, default session visibility).
+
+### `logpile rules <add|list|apply|test|delete>`
+
+Automatic session visibility rules per user. See the [rules reference](#visibility-rules) below.
+
+---
+
+## Privacy model
+
+Three session visibility levels:
+
+| Level | In listings | Direct-link | Profile totals | Public mode |
+|---|---|---|---|---|
+| `public` | ✓ | ✓ | ✓ | ✓ visible |
+| `unlisted` | hidden | ✓ | ✓ | direct-link only |
+| `private` | hidden | hidden | — | hidden entirely |
+
+Plus matching profile visibility at `/u/<username>`.
+
+### Three layers of control
+
+1. **Manual** — `logpile private <id>` / `logpile visibility <id> <level>`. Always wins.
+2. **Rules** — per-user patterns matched by `project`, `source_path`, `first_user_message`, `model`, `machine`, or `username`. See below.
+3. **Default** — user's `default_session_visibility`, applied to any session without a manual setting or matching rule.
+
+### Visibility rules
 
 ```bash
-# List rules
-logpile rules list --user maxghenis
-
-# Make all Claude Code demo-project sessions private
+# Make all CC demo-project sessions private
 logpile rules add maxghenis \
-  --source-scope claudecode \
-  --field project \
-  --mode contains \
-  --pattern demo \
+  --source-scope claudecode --field project --mode contains --pattern demo \
   --visibility private
 
-# Fuzzily match first prompts and make them unlisted
+# Fuzzily match first prompts and mark them unlisted
 logpile rules add maxghenis \
-  --source-scope codex \
-  --field first_user_message \
-  --mode fuzzy \
-  --pattern "client work" \
-  --threshold 0.70 \
-  --visibility unlisted
+  --source-scope codex --field first_user_message --mode fuzzy \
+  --pattern "client work" --threshold 0.70 --visibility unlisted
 
-# Recompute existing non-manual sessions after adding rules
+# Recompute all non-manual sessions with current rules
 logpile rules apply --user maxghenis
-
-# Preview how one session would be classified
-logpile rules test session-123
 ```
 
-Rules support:
-- deterministic modes: `equals`, `contains`, `prefix`, `suffix`, `regex`
-- fuzzy mode: `fuzzy` with a configurable `--threshold`
-- fields: `project`, `source_path`, `first_user_message`, `model`, `machine`, `username`
-- optional `--source-scope` to target `claudecode` or `codex`
+Rules support modes `equals`, `contains`, `prefix`, `suffix`, `regex`, `fuzzy` (with `--threshold`). Precedence: manual > first enabled rule by priority > user default.
 
-Precedence:
-- manual per-session visibility wins over everything
-- then the first enabled rule by ascending `priority`
-- then the user's `default_session_visibility`
+### Ignore files and inline markers
 
-## Privacy controls
+`~/.logpile-ignore` (and legacy `~/.agentus-ignore`) skip files at sync time, gitignore-style:
 
-### Ignore files
-
-Logpile reads both `~/.logpile-ignore` and the legacy `~/.agentus-ignore`.
-
-```text
-# ~/.logpile-ignore
+```
 *salary*
 *password*
 -Users-maxghenis-personal-*
 ```
 
-### Inline markers
+Or add `# logpile:private` (or `# agentus:private`, `# ccshare:private`) anywhere in the first user message of a session to mark it private at sync time.
 
-Add any of these markers to the first user message to skip a session during sync:
+### Publish queue
 
-- `# logpile:private`
-- `# agentus:private`
-- `# ccshare:private`
+Before publishing anything, `/publish` shows every session needing review with:
+- current visibility + status badges
+- narrative summary
+- recommended visibility from the scanner
+- finding count (high / medium severity)
+- categories: secrets, PII, structural issues
 
-## Web UI
+One-click to `/publish/review/<id>` for full findings with evidence and line numbers.
 
-| Page | URL | Description |
-|------|-----|-------------|
-| Dashboard | `/` | Overall activity, tools, errors, recent sessions |
-| Sessions | `/sessions` | Searchable session index |
-| People | `/u` | Public user directory |
-| Profile | `/u/<slug>` | Canonical per-user public page |
-| Session detail | `/sessions/<id>` | Transcript viewer |
-| Analysis | `/analysis` | Tool and command rollups |
-| API | `/api/sessions`, `/api/users`, `/api/users/<slug>`, `/api/users/<slug>/stats`, `/api/users/<slug>/sessions` | Public JSON endpoints |
-| Private API | `/api/users/<slug>/rules` | Rule inspection in non-public mode only |
+---
 
-## Data model
+## Web UI pages
 
-- `users.slug` is the canonical public identity used in URLs.
-- `sessions.user_slug` links every session to a canonical user.
-- Session `visibility` is one of `public`, `unlisted`, or `private`.
-- Session `visibility_source` is one of `default`, `rule`, or `manual`.
-- User `profile_visibility` controls whether `/u/<slug>` is public, unlisted, or hidden.
-- User `default_session_visibility` controls the default visibility for newly synced sessions.
-- `session_visibility_rules` stores automatic deterministic and fuzzy sharing rules per user.
-- In `--public` mode, public APIs and profile pages only include `public` sessions. `unlisted` sessions remain direct-link only.
+| Route | Description |
+|---|---|
+| `/` | Dashboard — stats, activity chart, CC vs Codex, top tools, errors, recent sessions |
+| `/sessions` | Session archive with search, repo/branch/activity/status/origin filters |
+| `/sessions/<id>` | Session detail: narrative header + full transcript |
+| `/u` | People directory |
+| `/u/<username>` | Operator profile — stats, activity, top repos, model mix, recent sessions |
+| `/repos` | Repo index |
+| `/analysis` | Operator stats, top tools, bash commands, shared utilities, context explosion, runaway sessions, objective relaunches |
+| `/publish` | Private publish queue with review findings (hidden in `--public` mode) |
 
-## Storage layout
+### Public JSON APIs
 
-```text
-~/logpile/
-├── logpile.db
-└── shared/
-    └── <username>/
-        ├── claudecode/
-        │   └── <project>/
-        │       └── <session>.jsonl
-        └── codex/
-            └── <project>/
-                └── <session>.jsonl
-```
+`/api/sessions`, `/api/users`, `/api/users/<username>`, `/api/users/<username>/stats`, `/api/users/<username>/sessions`. Same visibility rules as the UI.
 
-Legacy `~/agentus/agentus.db` is still supported and auto-detected.
-
-## Supported inputs
-
-| Tool | Path |
-|------|------|
-| Claude Code | `~/.claude/projects/**/*.jsonl` |
-| Codex | `~/.codex/sessions/**/*.jsonl` |
+---
 
 ## Multi-user setup
 
 Point each machine at the same shared folder and DB path:
 
 ```bash
+# On each team member's machine:
 logpile sync --shared /Volumes/team-share/logpile/shared \
              --db     /Volumes/team-share/logpile/logpile.db
 
+# One person runs the public viewer:
 logpile serve --shared /Volumes/team-share/logpile/shared \
               --db     /Volumes/team-share/logpile/logpile.db \
               --host 0.0.0.0 --public
 ```
 
-## Compatibility
+Or commit the shared directory + SQLite to a private git repo. The DB uses WAL so concurrent readers work fine while someone else is syncing.
 
-- The legacy `agentus` CLI alias still works after reinstall.
-- Existing `~/agentus/shared` and `~/agentus/agentus.db` can stay in place.
-- Existing private markers and ignore files are still honored.
+---
+
+## Requirements
+
+- Python 3.11+ (for the sync CLI and publish scanner)
+- [bun](https://bun.sh) ≥ 1.3 (for the Next.js app — installed automatically on first `logpile serve`)
+- Everything else is local. No external services, no accounts required.
+
+## Legacy compatibility
+
+The project was previously named `ccshare` then `agentus`. Legacy is preserved:
+
+- `agentus` CLI alias still works after reinstall
+- `~/agentus/agentus.db` auto-detected if `~/logpile/logpile.db` doesn't exist
+- `.agentus-ignore` files still honored
+- `# agentus:private` / `# ccshare:private` markers still skip sessions
+
+---
+
+## License
+
+MIT.

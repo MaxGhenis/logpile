@@ -2,15 +2,26 @@ import { Topbar } from "@/components/topbar";
 import { StatCard } from "@/components/stat-card";
 import { ActivityChart } from "@/components/charts/activity-chart";
 import { BarChartCard } from "@/components/charts/bar-chart";
+import { PublicIntro } from "@/components/public-intro";
 import { getDashboardStats, getRecentSessions } from "@/lib/db";
 import { fmtNum, fmtTokens, fmtTs, displayProject, truncate } from "@/lib/format";
+import { normalizeAnalyticsOrigin, originQueryValue, withOriginQuery } from "@/lib/origin-lens";
+import { WorkflowLensBar } from "@/components/workflow-lens-bar";
+import { config } from "@/lib/config";
 import Link from "next/link";
 
 export const dynamic = "force-dynamic";
 
-export default function DashboardPage() {
-  const stats = getDashboardStats();
-  const recent = getRecentSessions(10);
+export default async function DashboardPage({
+  searchParams,
+}: {
+  searchParams?: Promise<{ origin?: string }>;
+}) {
+  const params = searchParams ? await searchParams : undefined;
+  const originLens = normalizeAnalyticsOrigin(params?.origin);
+  const origin = originQueryValue(originLens);
+  const stats = getDashboardStats(origin);
+  const recent = getRecentSessions(10, origin);
 
   const totalMsgs = (stats.total_user_msgs ?? 0) + (stats.total_assistant_msgs ?? 0);
   const totalTokens = (stats.total_input_tokens ?? 0) + (stats.total_output_tokens ?? 0);
@@ -19,6 +30,9 @@ export default function DashboardPage() {
     <>
       <Topbar title="Dashboard" />
       <div className="p-7 max-w-[1400px] animate-fade-up">
+        {config.publicMode && <PublicIntro />}
+        <WorkflowLensBar basePath="/" originLens={originLens} />
+
         {/* Stat cards */}
         <div className="grid grid-cols-4 gap-4 mb-4">
           <StatCard value={fmtNum(stats.total_sessions)} label="sessions" />
@@ -29,12 +43,24 @@ export default function DashboardPage() {
 
         {/* Charts */}
         <div className="grid grid-cols-[2fr_1fr] gap-4 mb-4">
-          <ActivityChart url="/api/messages-per-day" title="Activity — last 30 days" />
-          <ActivityChart url="/api/messages-per-tool" title="CC vs Codex" />
+          <ActivityChart
+            url={withOriginQuery("/api/messages-per-day", originLens)}
+            title="Activity — last 30 days"
+          />
+          <ActivityChart
+            url={withOriginQuery("/api/messages-per-tool", originLens)}
+            title="CC vs Codex"
+          />
         </div>
         <div className="grid grid-cols-[2fr_1fr] gap-4 mb-6">
-          <BarChartCard url="/api/top-tools" title="Most-used tools" />
-          <BarChartCard url="/api/error-rate" title="Errors by operator" />
+          <BarChartCard
+            url={withOriginQuery("/api/top-tools", originLens)}
+            title="Most-used tools"
+          />
+          <BarChartCard
+            url={withOriginQuery("/api/error-rate", originLens)}
+            title="Errors by operator"
+          />
         </div>
 
         {/* Recent sessions */}
@@ -65,7 +91,7 @@ export default function DashboardPage() {
                       {fmtTs(r.first_timestamp)}
                     </td>
                     <td className="py-2.5 px-3.5">
-                      <Link href={`/u/${r.user_slug || r.username}`} className="no-underline">
+                      <Link href={`/u/${r.username}`} className="no-underline">
                         <span className="bg-lp-raised border border-lp-border-dim rounded px-2 py-0.5 text-xs font-medium text-lp-text hover:border-lp-amber hover:text-lp-amber transition-colors">
                           {r.user_display_name}
                         </span>
@@ -112,7 +138,10 @@ export default function DashboardPage() {
             </table>
           </div>
           <div className="mt-4 pt-3 border-t border-lp-border-dim text-right">
-            <Link href="/sessions" className="text-sm text-lp-amber hover:text-lp-amber-hot no-underline">
+            <Link
+              href={withOriginQuery("/sessions", originLens)}
+              className="text-sm text-lp-amber hover:text-lp-amber-hot no-underline"
+            >
               View all sessions &rarr;
             </Link>
           </div>

@@ -29,6 +29,7 @@ export async function GET(req: Request) {
     const payload = await getPublishQueueResponse({
       visibility: url.searchParams.get("visibility") || undefined,
       status: url.searchParams.get("status") || undefined,
+      origin: url.searchParams.get("origin") || undefined,
       user: url.searchParams.get("user") || undefined,
       limit: parsePositiveInt(url.searchParams.get("limit"), 25, "limit"),
       reviews: parseReviews(url.searchParams.get("reviews")),

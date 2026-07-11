@@ -3,6 +3,30 @@
 {% block page_title %}Dashboard{% endblock %}
 
 {% block content %}
+{% set current_origin = origin or 'human_direct' %}
+<div class="card-section" style="margin-bottom:16px; display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;">
+  <div>
+    <div class="section-title" style="margin-bottom:6px;">Workflow lens</div>
+    <div style="color:#a8a29e; font-size:0.9rem;">Showing
+      {% if current_origin == 'human_direct' %}My work
+      {% elif current_origin == 'human_delegated' %}Delegated
+      {% elif current_origin == 'pipeline_eval' %}Pipeline
+      {% elif current_origin == 'meta_scaffolding' %}Meta
+      {% elif current_origin == 'system_generated' %}System
+      {% else %}All
+      {% endif %}
+    </div>
+  </div>
+  <div class="profile-actions">
+    <a class="ghost-link" href="{{ url_for('dashboard', origin='human_direct') }}">My work</a>
+    <a class="ghost-link" href="{{ url_for('dashboard', origin='human_delegated') }}">Delegated</a>
+    <a class="ghost-link" href="{{ url_for('dashboard', origin='pipeline_eval') }}">Pipeline</a>
+    <a class="ghost-link" href="{{ url_for('dashboard', origin='meta_scaffolding') }}">Meta</a>
+    <a class="ghost-link" href="{{ url_for('dashboard', origin='system_generated') }}">System</a>
+    <a class="ghost-link" href="{{ url_for('dashboard', origin='all') }}">All</a>
+  </div>
+</div>
+
 <div class="stats-grid" style="margin-bottom:16px;">
   <div class="stat-card">
     <div class="stat-value">{{ "{:,}".format(stats.total_sessions or 0) }}</div>
@@ -63,7 +87,7 @@
       {% for r in recent %}
       <tr>
         <td class="ts">{{ fmt_ts(r.first_timestamp) }}</td>
-        <td><a href="{{ url_for('user_profile', slug=r.user_slug or r.username) }}" class="badge-user-link"><span class="badge-user">{{ r.user_display_name }}</span></a></td>
+        <td><a href="{{ url_for('user_profile', username=r.username) }}" class="badge-user-link"><span class="badge-user">{{ r.user_display_name }}</span></a></td>
         <td><span class="badge-source badge-source-{{ r.source }}">{{ 'CC' if r.source == 'claudecode' else 'Codex' }}</span></td>
         <td class="project-cell">{{ display_project(r.project) | truncate(30, True, '\u2026') }}</td>
         <td>{{ (r.user_message_count or 0) + (r.assistant_message_count or 0) }}</td>
@@ -81,7 +105,7 @@
   </table>
   </div>
   <div class="section-footer">
-    <a href="{{ url_for('sessions') }}">View all sessions &rarr;</a>
+    <a href="{{ url_for('sessions') if current_origin == 'all' else url_for('sessions', origin=current_origin) }}">View all sessions &rarr;</a>
   </div>
 </div>
 {% endblock %}
@@ -155,9 +179,9 @@ async function loadChart(url, canvasId, type, overrides) {
   new Chart(document.getElementById(canvasId), { type, data, options: opts });
 }
 
-loadChart('/api/messages-per-day',  'chartMsgsUser',  'line');
-loadChart('/api/messages-per-tool', 'chartMsgsTool',  'line');
-loadChart('/api/top-tools',        'chartTopTools',   'bar');
-loadChart('/api/error-rate',       'chartErrors',     'bar');
+loadChart({{ (url_for('api_messages_per_day') if current_origin == 'all' else url_for('api_messages_per_day', origin=current_origin)) | tojson }},  'chartMsgsUser',  'line');
+loadChart({{ (url_for('api_messages_per_tool') if current_origin == 'all' else url_for('api_messages_per_tool', origin=current_origin)) | tojson }}, 'chartMsgsTool',  'line');
+loadChart({{ (url_for('api_top_tools') if current_origin == 'all' else url_for('api_top_tools', origin=current_origin)) | tojson }},        'chartTopTools',   'bar');
+loadChart({{ (url_for('api_error_rate') if current_origin == 'all' else url_for('api_error_rate', origin=current_origin)) | tojson }},       'chartErrors',     'bar');
 </script>
 {% endblock %}

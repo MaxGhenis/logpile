@@ -2,17 +2,16 @@ import { getApiUserRules } from "@/lib/db";
 
 export async function GET(
   _req: Request,
-  { params }: { params: Promise<{ slug: string }> }
+  { params }: { params: Promise<{ username: string }> }
 ) {
-  const { slug } = await params;
-  const payload = getApiUserRules(slug);
+  const { username } = await params;
+  const payload = getApiUserRules(username);
   if (!payload || !payload.user) {
     return Response.json({ error: "not found" }, { status: 404 });
   }
 
   return Response.json({
     user: {
-      slug: payload.user.slug,
       username: payload.user.username,
       display_name: payload.user.display_name ?? payload.user.username,
       bio: payload.user.bio,

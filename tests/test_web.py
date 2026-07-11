@@ -4,9 +4,11 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from logpile.db import create_visibility_rule, set_session_visibility, update_user
+from logpile.db import create_visibility_rule, ensure_user, init_db, set_session_visibility, update_user
+from logpile.objectives import normalize_objective_family
 from logpile.sync import sync_sessions
 from logpile.web.app import create_app
 
@@ -26,6 +28,25 @@ def open_sqlite(path: Path):
 
 
 class WebAppTests(unittest.TestCase):
+    def _prepare_user(
+        self,
+        db_path: Path,
+        *,
+        username: str = "alice",
+        profile_visibility: str = "public",
+        default_session_visibility: str = "public",
+    ) -> None:
+        init_db(db_path)
+        with open_sqlite(db_path) as conn:
+            ensure_user(conn, username, display_name=username)
+            update_user(
+                conn,
+                username,
+                profile_visibility=profile_visibility,
+                default_session_visibility=default_session_visibility,
+            )
+            conn.commit()
+
     def _write_claude_session(
         self,
         home: Path,
@@ -35,23 +56,99 @@ class WebAppTests(unittest.TestCase):
         assistant_content: list[dict] | None = None,
         cwd: str = "/tmp/demo",
     ) -> None:
+        # Relative to now so fixtures stay inside the rolling 30-day windows
+        # the chart/analysis endpoints query (a fixed date silently ages out).
+        recent = datetime.now(timezone.utc) - timedelta(days=1)
         write_jsonl(
             home / ".claude" / "projects" / "-Users-alice-demo" / f"{session_id}.jsonl",
             [
                 {
-                    "timestamp": "2026-04-10T10:00:00Z",
+                    "timestamp": recent.isoformat().replace("+00:00", "Z"),
                     "type": "user",
                     "cwd": cwd,
                     "message": {"content": message},
                 },
                 {
-                    "timestamp": "2026-04-10T10:00:05Z",
+                    "timestamp": (recent + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
                     "type": "assistant",
                     "message": {
                         "id": "msg-1",
                         "model": "claude-3.7",
                         "usage": {"input_tokens": 1, "output_tokens": 2},
                         "content": assistant_content or [{"type": "text", "text": "hi"}],
+                    },
+                },
+            ],
+        )
+
+    def _write_codex_session(
+        self,
+        home: Path,
+        *,
+        session_id: str,
+        message: str,
+        timestamp: datetime,
+        cwd: str = "/tmp/demo",
+        parent_session_id: str | None = None,
+        spawn_depth: int = 0,
+        total_input_tokens: int = 1200,
+        cached_input_tokens: int = 300,
+        total_output_tokens: int = 45,
+    ) -> None:
+        session_path = (
+            home
+            / ".codex"
+            / "sessions"
+            / timestamp.strftime("%Y")
+            / timestamp.strftime("%m")
+            / timestamp.strftime("%d")
+            / f"{session_id}.jsonl"
+        )
+        meta_payload = {
+            "id": session_id,
+            "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+            "cwd": cwd,
+            "originator": "Codex Desktop",
+        }
+        if parent_session_id:
+            meta_payload["source"] = {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": parent_session_id,
+                        "depth": spawn_depth,
+                    }
+                }
+            }
+        write_jsonl(
+            session_path,
+            [
+                {
+                    "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+                    "type": "session_meta",
+                    "payload": meta_payload,
+                },
+                {
+                    "timestamp": (timestamp + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": message}],
+                    },
+                },
+                {
+                    "timestamp": (timestamp + timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": total_input_tokens,
+                                "cached_input_tokens": cached_input_tokens,
+                                "output_tokens": total_output_tokens,
+                                "total_tokens": total_input_tokens + total_output_tokens,
+                            }
+                        },
                     },
                 },
             ],
@@ -70,6 +167,7 @@ class WebAppTests(unittest.TestCase):
         home = root / username
         shared = root / "shared"
         db_path = root / "logpile.db"
+        self._prepare_user(db_path, username=username)
         self._write_claude_session(
             home,
             session_id=session_id,
@@ -198,6 +296,378 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertIn(b"Invalid activity filter", response.data)
             self.assertIn(b"Unknown activity filter", response.data)
+
+    def test_origin_filters_distinguish_direct_and_pipeline_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "alice"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._write_claude_session(home, session_id="direct-1", message="make more progress on logpile")
+            self._write_claude_session(
+                home,
+                session_id="eval-1",
+                message=(
+                    "You are a senior statutory-fidelity reviewer for RAC (Rules as Code) encodings.\n\n"
+                    "Review the file holistically for citation fidelity."
+                ),
+            )
+            self._prepare_user(db_path, username="alice")
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                pipeline = client.get("/api/sessions?origin=pipeline_eval")
+                direct = client.get("/api/users/alice/sessions?origin=human_direct")
+                invalid = client.get("/api/sessions?origin=bogus")
+
+            self.assertEqual(pipeline.status_code, 200)
+            self.assertEqual(direct.status_code, 200)
+            self.assertEqual(invalid.status_code, 400)
+
+            pipeline_rows = pipeline.get_json()
+            direct_payload = direct.get_json()
+            self.assertEqual(len(pipeline_rows), 1)
+            self.assertEqual(pipeline_rows[0]["session_id"], "eval-1")
+            self.assertEqual(pipeline_rows[0]["session_origin"], "pipeline_eval")
+            self.assertEqual(direct_payload["total"], 1)
+            self.assertEqual(direct_payload["sessions"][0]["session_id"], "direct-1")
+            self.assertEqual(direct_payload["sessions"][0]["session_origin"], "human_direct")
+
+    def test_dashboard_defaults_to_human_direct_and_profile_stats_accept_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "alice"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._write_claude_session(home, session_id="direct-1", message="make more progress on logpile")
+            self._write_claude_session(
+                home,
+                session_id="eval-1",
+                message=(
+                    "You are a senior statutory-fidelity reviewer for RAC (Rules as Code) encodings.\n\n"
+                    "Review the file holistically for citation fidelity."
+                ),
+            )
+            self._prepare_user(db_path, username="alice")
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                dashboard = client.get("/")
+                pipeline_dashboard = client.get("/?origin=pipeline_eval")
+                direct_profile = client.get("/api/users/alice?origin=human_direct").get_json()
+                pipeline_profile = client.get("/api/users/alice/stats?origin=pipeline_eval").get_json()
+
+            self.assertEqual(dashboard.status_code, 200)
+            self.assertIn(b"make more progress on logpile", dashboard.data)
+            self.assertNotIn(b"statutory-fidelity reviewer", dashboard.data)
+            self.assertEqual(pipeline_dashboard.status_code, 200)
+            self.assertIn(b"statutory-fidelity reviewer", pipeline_dashboard.data)
+            self.assertEqual(direct_profile["summary"]["total_sessions"], 1)
+            self.assertEqual(pipeline_profile["summary"]["total_sessions"], 1)
+            self.assertEqual(pipeline_profile["summary"]["exploration_sessions"], 1)
+
+    def test_analysis_defaults_to_human_direct_and_accepts_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "alice"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._write_claude_session(
+                home,
+                session_id="direct-1",
+                message="make more progress on logpile",
+                assistant_content=[
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "id": f"tool-{i}",
+                        "input": {"command": "pytest -q"},
+                    }
+                    for i in range(220)
+                ],
+                cwd="/tmp/direct-app",
+            )
+            self._write_claude_session(
+                home,
+                session_id="eval-1",
+                message=(
+                    "You are a senior statutory-fidelity reviewer for RAC (Rules as Code) encodings.\n\n"
+                    "Review the file holistically for citation fidelity."
+                ),
+                assistant_content=[
+                    {
+                        "type": "tool_use",
+                        "name": "Bash",
+                        "id": f"eval-tool-{i}",
+                        "input": {"command": "python eval.py"},
+                    }
+                    for i in range(240)
+                ],
+                cwd="/tmp/eval-pipeline",
+            )
+            self._prepare_user(db_path, username="alice")
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                analysis = client.get("/analysis")
+                pipeline = client.get("/analysis?origin=pipeline_eval")
+
+            self.assertEqual(analysis.status_code, 200)
+            self.assertIn(b"pytest -q", analysis.data)
+            self.assertNotIn(b"python eval.py", analysis.data)
+            self.assertIn(b"direct-app", analysis.data)
+            self.assertNotIn(b"eval-pipeline", analysis.data)
+            self.assertEqual(pipeline.status_code, 200)
+            self.assertIn(b"python eval.py", pipeline.data)
+            self.assertIn(b"eval-pipeline", pipeline.data)
+            self.assertNotIn(b"direct-app", pipeline.data)
+
+    def test_analysis_surfaces_repeated_objective_relaunches_by_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "alice"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._write_claude_session(
+                home,
+                session_id="direct-1",
+                message="Make more progress on Logpile analytics.",
+                cwd="/tmp/direct-one",
+            )
+            self._write_claude_session(
+                home,
+                session_id="direct-2",
+                message="Make more progress on Logpile analytics.",
+                cwd="/tmp/direct-two",
+            )
+            self._write_claude_session(
+                home,
+                session_id="eval-1",
+                message=(
+                    "You are a senior statutory-fidelity reviewer for RAC (Rules as Code) encodings.\n\n"
+                    "Review the file holistically for citation fidelity."
+                ),
+                cwd="/tmp/eval-one",
+            )
+            self._write_claude_session(
+                home,
+                session_id="eval-2",
+                message=(
+                    "You are a senior statutory-fidelity reviewer for RAC (Rules as Code) encodings.\n\n"
+                    "Review the file holistically for citation fidelity."
+                ),
+                cwd="/tmp/eval-two",
+            )
+            self._prepare_user(db_path, username="alice")
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                analysis = client.get("/analysis")
+                pipeline = client.get("/analysis?origin=pipeline_eval")
+
+            self.assertEqual(analysis.status_code, 200)
+            self.assertIn(b"Make more progress on Logpile analytics.", analysis.data)
+            self.assertIn(b"2 launches", analysis.data)
+            self.assertNotIn(b"senior statutory-fidelity reviewer", analysis.data)
+
+            self.assertEqual(pipeline.status_code, 200)
+            self.assertIn(b"senior statutory-fidelity reviewer", pipeline.data)
+            self.assertIn(b"2 launches", pipeline.data)
+            self.assertNotIn(b"Make more progress on Logpile analytics.", pipeline.data)
+
+    def test_analysis_surfaces_codex_context_explosions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "alice"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_user(db_path, username="alice")
+
+            now = datetime.now(timezone.utc) - timedelta(days=1)
+            self._write_codex_session(
+                home,
+                session_id="root-codex",
+                message="check out mark sarneys email to me - the repo is crfb-tob-impacts",
+                timestamp=now,
+                cwd="/tmp/crfb-tob-impacts",
+                # input_tokens includes the cached portion (Codex semantics):
+                # 100M total input of which 90M is inherited/cached.
+                total_input_tokens=100_000_000,
+                cached_input_tokens=90_000_000,
+                total_output_tokens=5_000_000,
+            )
+            self._write_codex_session(
+                home,
+                session_id="child-codex-a",
+                message="Investigate the dashboard ratios.",
+                timestamp=now + timedelta(minutes=5),
+                cwd="/tmp/crfb-tob-impacts",
+                parent_session_id="root-codex",
+                spawn_depth=1,
+                total_input_tokens=400_000_000,
+                cached_input_tokens=380_000_000,
+                total_output_tokens=15_000_000,
+            )
+            self._write_codex_session(
+                home,
+                session_id="child-codex-b",
+                message="Trace the trust-fund inputs.",
+                timestamp=now + timedelta(minutes=10),
+                cwd="/tmp/crfb-tob-impacts",
+                parent_session_id="root-codex",
+                spawn_depth=2,
+                total_input_tokens=350_000_000,
+                cached_input_tokens=330_000_000,
+                total_output_tokens=10_000_000,
+            )
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                analysis = client.get("/analysis")
+
+            self.assertEqual(analysis.status_code, 200)
+            self.assertIn(b"Context explosion", analysis.data)
+            self.assertIn(b"mark sarneys email", analysis.data.lower())
+            self.assertIn(b"mostly inherited context", analysis.data.lower())
+            self.assertIn(b"2 child sessions", analysis.data)
+            self.assertIn(b"spawn depth 2", analysis.data.lower())
+
+    def test_sessions_and_api_can_filter_by_objective_family(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "alice"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._write_claude_session(
+                home,
+                session_id="match-1",
+                message="Make more progress on Logpile analytics.",
+            )
+            self._write_claude_session(
+                home,
+                session_id="match-2",
+                message="Make more progress on Logpile analytics.",
+            )
+            self._write_claude_session(
+                home,
+                session_id="other-1",
+                message="Investigate deployment regressions in the docs site.",
+            )
+            self._prepare_user(db_path, username="alice")
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            objective = normalize_objective_family("Make more progress on Logpile analytics.")
+            self.assertIsNotNone(objective)
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                page = client.get(f"/sessions?objective={objective}&objectiveLabel=Logpile")
+                payload = client.get(f"/api/sessions?objective={objective}").get_json()
+
+            self.assertEqual(page.status_code, 200)
+            self.assertIn(b"Objective family", page.data)
+            self.assertIn(b"Logpile", page.data)
+            self.assertIn(b"match-1", page.data)
+            self.assertIn(b"match-2", page.data)
+            self.assertNotIn(b"other-1", page.data)
+            self.assertEqual(sorted(row["session_id"] for row in payload), ["match-1", "match-2"])
+
+    def test_invalid_objective_filter_is_rejected_consistently(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_user(root=root)
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+
+            with app.test_client() as client:
+                page = client.get("/sessions?objective=%40%40%40")
+                payload = client.get("/api/sessions?objective=%40%40%40")
+
+            self.assertEqual(page.status_code, 200)
+            self.assertIn(b"Invalid objective filter", page.data)
+            self.assertEqual(payload.status_code, 400)
+
+    def test_api_user_profile_defaults_to_human_direct_lens(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            home = root / "alice"
+
+            self._write_claude_session(
+                home,
+                session_id="direct-1",
+                message="Ship the direct workflow.",
+                cwd="/tmp/direct-app",
+            )
+            self._write_claude_session(
+                home,
+                session_id="pipeline-1",
+                message="You are a senior statutory-fidelity reviewer for RAC...",
+                cwd="/tmp/eval-app",
+            )
+            self._prepare_user(db_path, username="alice")
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                default_profile = client.get("/api/users/alice").get_json()
+                default_stats = client.get("/api/users/alice/stats").get_json()
+                default_sessions = client.get("/api/users/alice/sessions").get_json()
+                all_profile = client.get("/api/users/alice?origin=all").get_json()
+                all_sessions = client.get("/api/users/alice/sessions?origin=all").get_json()
+
+            self.assertEqual(default_profile["summary"]["total_sessions"], 1)
+            self.assertEqual(default_stats["summary"]["total_sessions"], 1)
+            self.assertEqual(default_sessions["total"], 1)
+            self.assertEqual(all_profile["summary"]["total_sessions"], 2)
+            self.assertEqual(all_sessions["total"], 2)
 
     def test_duplicate_display_names_stay_distinct_in_chart_apis(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -379,6 +849,7 @@ class WebAppTests(unittest.TestCase):
                     },
                 ],
             )
+            self._prepare_user(db_path, username="alice")
             sync_sessions(
                 shared_dir=shared,
                 db_path=db_path,

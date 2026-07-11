@@ -5,6 +5,7 @@ import {
   JetBrains_Mono,
 } from "next/font/google";
 import { Sidebar } from "@/components/sidebar";
+import { config } from "@/lib/config";
 import "./globals.css";
 
 const brand = Playfair_Display({
@@ -45,7 +46,7 @@ export default function RootLayout({
     >
       <body className="min-h-screen antialiased">
         <div className="flex min-h-screen">
-          <Sidebar />
+          <Sidebar publicMode={config.publicMode} />
           <main className="flex-1 min-w-0 flex flex-col">
             {children}
           </main>

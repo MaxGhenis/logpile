@@ -3,6 +3,30 @@
 {% block page_title %}Analysis{% endblock %}
 
 {% block content %}
+{% set current_origin = origin or 'human_direct' %}
+<div class="card-section" style="margin-bottom:16px; display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;">
+  <div>
+    <div class="section-title" style="margin-bottom:6px;">Workflow lens</div>
+    <div style="color:#a8a29e; font-size:0.9rem;">Showing
+      {% if current_origin == 'human_direct' %}My work
+      {% elif current_origin == 'human_delegated' %}Delegated
+      {% elif current_origin == 'pipeline_eval' %}Pipeline
+      {% elif current_origin == 'meta_scaffolding' %}Meta
+      {% elif current_origin == 'system_generated' %}System
+      {% else %}All
+      {% endif %}
+    </div>
+  </div>
+  <div class="profile-actions">
+    <a class="ghost-link" href="{{ url_for('analysis', origin='human_direct') }}">My work</a>
+    <a class="ghost-link" href="{{ url_for('analysis', origin='human_delegated') }}">Delegated</a>
+    <a class="ghost-link" href="{{ url_for('analysis', origin='pipeline_eval') }}">Pipeline</a>
+    <a class="ghost-link" href="{{ url_for('analysis', origin='meta_scaffolding') }}">Meta</a>
+    <a class="ghost-link" href="{{ url_for('analysis', origin='system_generated') }}">System</a>
+    <a class="ghost-link" href="{{ url_for('analysis', origin='all') }}">All</a>
+  </div>
+</div>
+
 <div class="card-section" style="margin-bottom:20px;">
   <div class="section-title">Operator stats</div>
   <div class="table-scroll table-scroll-wide">
@@ -22,7 +46,7 @@
     <tbody>
       {% for r in user_rows %}
       <tr>
-        <td><a href="{{ url_for('user_profile', slug=r.slug or r.username) }}" class="badge-user-link"><span class="badge-user">{{ r.display_name }}</span></a></td>
+        <td><a href="{{ url_for('user_profile', username=r.username) if current_origin == 'all' else url_for('user_profile', username=r.username, origin=current_origin) }}" class="badge-user-link"><span class="badge-user">{{ r.display_name }}</span></a></td>
         <td>{{ r.sessions }}</td>
         <td>{{ r.user_msgs or 0 }}</td>
         <td>{{ r.tool_calls or 0 }}</td>
@@ -79,6 +103,160 @@
     </table>
     </div>
   </div>
+</div>
+
+<div class="card-section" style="margin-bottom:20px;">
+  <div class="section-title">Context explosion
+    <span class="section-subtitle">&mdash; Codex fork swarms carrying large inherited-context burden in the last 7 days</span>
+  </div>
+  {% if context_rows %}
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:12px;">
+    {% for r in context_rows %}
+    <div style="border:1px solid var(--border); border-radius:12px; padding:14px; background:rgba(12,18,24,0.55);">
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+        <span class="badge-source badge-source-codex">Codex</span>
+        <span class="ts">{{ fmt_ts(r.root_first_timestamp) }}</span>
+        {% for warning in r.warnings %}
+        <span class="badge-source" style="background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.25);">{{ warning }}</span>
+        {% endfor %}
+      </div>
+      <div style="margin-bottom:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        <a href="{{ url_for('user_profile', username=r.username) if current_origin == 'all' else url_for('user_profile', username=r.username, origin=current_origin) }}" class="badge-user-link"><span class="badge-user">{{ r.user_display_name }}</span></a>
+        <span class="mono" style="font-size:0.72rem; color:var(--text-faint);">{{ r.repo_name or display_project(r.project) }}</span>
+      </div>
+      <div style="font-size:0.95rem; font-weight:600; color:var(--text); margin-bottom:8px;">
+        {{ r.display_label }}
+      </div>
+      <div style="font-size:0.92rem; line-height:1.55; color:var(--text-dim); margin-bottom:10px;">
+        {{ r.root_summary or 'Large Codex fork swarm with no deterministic root summary yet.' }}
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
+        <span class="badge-source" style="background:var(--amber-glow);color:var(--amber);border:1px solid rgba(245,158,11,0.25);">{{ fmt_tokens(r.total_tokens) }} total</span>
+        <span class="badge-source" style="background:rgba(23,32,42,0.8);color:var(--text-dim);border:1px solid var(--border-dim);">{{ "%.1f"|format((r.cached_input_share or 0) * 100) }}% cached</span>
+        <span class="badge-source" style="background:rgba(23,32,42,0.8);color:var(--text-dim);border:1px solid var(--border-dim);">{{ "%.1f"|format((r.child_token_share or 0) * 100) }}% child burden</span>
+        <span class="badge-source" style="background:rgba(23,32,42,0.8);color:var(--text-dim);border:1px solid var(--border-dim);">{{ "{:,}".format(r.child_session_count or 0) }} child sessions</span>
+      </div>
+      <div style="border:1px solid var(--border-dim); border-radius:10px; padding:12px; background:rgba(10,14,20,0.45); margin-bottom:12px;">
+        <div style="font-size:0.68rem; font-weight:700; letter-spacing:0.18em; text-transform:uppercase; color:var(--text-faint); margin-bottom:8px;">
+          Largest child sessions
+        </div>
+        <div style="display:grid; gap:8px;">
+          {% for child in r.top_children %}
+          <div style="display:flex; justify-content:space-between; gap:10px; align-items:center; border:1px solid var(--border-dim); border-radius:9px; padding:8px 10px; background:rgba(23,32,42,0.6);">
+            <div style="min-width:0;">
+              <div style="font-size:0.78rem; font-weight:600; color:var(--text);">
+                Child {{ loop.index }} &middot; {{ child.session_id[:12] }}
+              </div>
+              <div class="mono" style="font-size:0.68rem; color:var(--text-faint);">
+                {{ fmt_tokens(child.total_tokens) }} &middot; {{ "%.1f"|format(((child.cached_input_tokens or 0) / (child.total_input_tokens or 1)) * 100) }}% cached &middot; depth {{ child.spawn_depth }}
+              </div>
+            </div>
+            <a href="{{ url_for('session_detail', session_id=child.session_id) }}" class="ghost-link">Inspect</a>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      <a href="{{ url_for('session_detail', session_id=r.root_session_id) }}" class="ghost-link">Inspect root session</a>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-cell" style="text-align:left;">
+    No Codex fork swarms crossed the context-explosion threshold under this workflow lens.
+  </div>
+  {% endif %}
+</div>
+
+<div class="card-section" style="margin-bottom:20px;">
+  <div class="section-title">Runaway sessions
+    <span class="section-subtitle">&mdash; tool-heavy sessions that likely need tighter scope</span>
+  </div>
+  {% if runaway_rows %}
+  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:12px;">
+    {% for r in runaway_rows %}
+    <div style="border:1px solid var(--border); border-radius:12px; padding:14px; background:rgba(12,18,24,0.55);">
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+        <span class="badge-source badge-source-{{ r.source }}">{{ 'CC' if r.source == 'claudecode' else 'Codex' }}</span>
+        <span class="badge-source" style="
+          {% if r.session_status == 'failed' %}
+          background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.25);
+          {% elif r.session_status == 'partial' %}
+          background:rgba(245,158,11,0.1);color:var(--amber);border:1px solid rgba(245,158,11,0.25);
+          {% elif r.session_status == 'success' %}
+          background:rgba(34,197,94,0.1);color:var(--green);border:1px solid rgba(34,197,94,0.25);
+          {% else %}
+          background:rgba(59,130,246,0.1);color:var(--blue);border:1px solid rgba(59,130,246,0.25);
+          {% endif %}
+        ">{{ r.session_status }}</span>
+        <span class="ts">{{ fmt_ts(r.first_timestamp) }}</span>
+      </div>
+      <div style="margin-bottom:8px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        <a href="{{ url_for('user_profile', username=r.username) if current_origin == 'all' else url_for('user_profile', username=r.username, origin=current_origin) }}" class="badge-user-link"><span class="badge-user">{{ r.user_display_name }}</span></a>
+        <span class="mono" style="font-size:0.72rem; color:var(--text-faint);">{{ r.repo_name or display_project(r.project) }}</span>
+      </div>
+      <div style="font-size:0.92rem; line-height:1.55; color:var(--text); margin-bottom:10px;">
+        {{ r.session_summary or 'No deterministic summary yet. Review the transcript and tighten the task boundary.' }}
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
+        <span class="badge-source" style="background:var(--amber-glow);color:var(--amber);border:1px solid rgba(245,158,11,0.25);">{{ "{:,}".format(r.tool_call_count or 0) }} tools</span>
+        <span class="badge-source" style="{% if r.error_count %}background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.25);{% else %}background:rgba(23,32,42,0.8);color:var(--text-dim);border:1px solid var(--border-dim);{% endif %}">{{ "{:,}".format(r.error_count or 0) }} errors</span>
+        <span class="badge-source" style="background:rgba(23,32,42,0.8);color:var(--text-dim);border:1px solid var(--border-dim);">{{ fmt_dur(r.duration_seconds) }}</span>
+      </div>
+      <a href="{{ url_for('session_detail', session_id=r.session_id) }}" class="ghost-link">Inspect session</a>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-cell" style="text-align:left;">
+    No runaway sessions under this workflow lens.
+  </div>
+  {% endif %}
+</div>
+
+<div class="card-section" style="margin-bottom:20px;">
+  <div class="section-title">Repeated objective relaunches
+    <span class="section-subtitle">&mdash; objective families launched multiple times in the last 30 days</span>
+  </div>
+  {% if objective_rows %}
+  <div style="display:grid; grid-template-columns:1fr; gap:12px;">
+    {% for r in objective_rows %}
+    <div style="border:1px solid var(--border); border-radius:12px; padding:14px; background:rgba(12,18,24,0.55);">
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+        <span class="badge-source" style="background:var(--amber-glow);color:var(--amber);border:1px solid rgba(245,158,11,0.25);">{{ "{:,}".format(r.launches) }} launches</span>
+        <span class="badge-source" style="background:rgba(23,32,42,0.8);color:var(--text-dim);border:1px solid var(--border-dim);">{{ "{:,}".format(r.operator_count) }} operators</span>
+        <span class="badge-source" style="
+          {% if r.latest_status == 'failed' %}
+          background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.25);
+          {% elif r.latest_status == 'partial' %}
+          background:rgba(245,158,11,0.1);color:var(--amber);border:1px solid rgba(245,158,11,0.25);
+          {% elif r.latest_status == 'success' %}
+          background:rgba(34,197,94,0.1);color:var(--green);border:1px solid rgba(34,197,94,0.25);
+          {% else %}
+          background:rgba(59,130,246,0.1);color:var(--blue);border:1px solid rgba(59,130,246,0.25);
+          {% endif %}
+        ">{{ r.latest_status }}</span>
+        <span class="ts">{{ fmt_ts(r.latest_timestamp) }}</span>
+      </div>
+      <div style="font-size:0.95rem; font-weight:600; color:var(--text); margin-bottom:8px;">
+        {{ r.display_label }}
+      </div>
+      <div style="font-size:0.92rem; line-height:1.55; color:var(--text-dim); margin-bottom:10px;">
+        {{ r.latest_summary or 'No deterministic summary yet. Open the latest session and tighten the task boundary before relaunching.' }}
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px;">
+        <span class="badge-source" style="background:var(--amber-glow);color:var(--amber);border:1px solid rgba(245,158,11,0.25);">{{ "{:,}".format(r.total_tool_calls or 0) }} total tools</span>
+        <span class="badge-source" style="{% if r.total_errors %}background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.25);{% else %}background:rgba(23,32,42,0.8);color:var(--text-dim);border:1px solid var(--border-dim);{% endif %}">{{ "{:,}".format(r.total_errors or 0) }} total errors</span>
+        <span class="badge-source" style="background:rgba(23,32,42,0.8);color:var(--text-dim);border:1px solid var(--border-dim);">{{ display_project(r.latest_repo_name) if r.latest_repo_name else 'unknown repo' }}</span>
+      </div>
+      <a href="{{ url_for('sessions', origin=(None if current_origin == 'all' else current_origin), objective=r.objective_key, objectiveLabel=r.display_label, page=1) }}" class="ghost-link">View matching sessions</a>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-cell" style="text-align:left;">
+    No repeated objective families under this workflow lens.
+  </div>
+  {% endif %}
 </div>
 
 <div class="card-section">

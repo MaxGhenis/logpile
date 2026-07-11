@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from .origins import SESSION_ORIGINS
+
 
 SESSION_VISIBILITIES = ("private", "unlisted", "public")
 PROFILE_VISIBILITIES = ("private", "unlisted", "public")
@@ -22,20 +24,19 @@ RULE_SOURCE_SCOPES = ("claudecode", "codex")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    slug TEXT PRIMARY KEY,
-    username TEXT NOT NULL UNIQUE,
+    username TEXT PRIMARY KEY,
     display_name TEXT,
     bio TEXT,
     avatar_url TEXT,
     profile_visibility TEXT NOT NULL DEFAULT 'public',
-    default_session_visibility TEXT NOT NULL DEFAULT 'public',
+    default_session_visibility TEXT NOT NULL DEFAULT 'unlisted',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS session_visibility_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_slug TEXT NOT NULL,
+    username TEXT NOT NULL,
     source_scope TEXT,
     field TEXT NOT NULL,
     match_mode TEXT NOT NULL,
@@ -52,7 +53,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id     TEXT PRIMARY KEY,
     source         TEXT NOT NULL,
     username       TEXT NOT NULL,
-    user_slug      TEXT,
     machine        TEXT,
     project        TEXT,
     workspace_root TEXT,
@@ -91,9 +91,20 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_outcome       TEXT,
     session_status        TEXT,
     narrative_version     INTEGER DEFAULT 0,
+    objective_family      TEXT,
+    objective_label       TEXT,
+    objective_version     INTEGER DEFAULT 0,
+    session_origin        TEXT,
+    origin_version        INTEGER DEFAULT 0,
     total_input_tokens    INTEGER DEFAULT 0,
     total_output_tokens   INTEGER DEFAULT 0,
+    fresh_input_tokens    INTEGER DEFAULT 0,
+    cached_input_tokens   INTEGER DEFAULT 0,
+    reasoning_output_tokens INTEGER DEFAULT 0,
+    token_version        INTEGER DEFAULT 0,
     first_user_message    TEXT,
+    parent_session_id    TEXT,
+    spawn_depth          INTEGER DEFAULT 0,
     visibility     TEXT NOT NULL DEFAULT 'public',
     visibility_source TEXT NOT NULL DEFAULT 'default',
     visibility_rule_id INTEGER,
@@ -132,11 +143,9 @@ CREATE TABLE IF NOT EXISTS session_paths (
 """
 
 INDEXES = """
-CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username        ON users(username);
 CREATE INDEX IF NOT EXISTS idx_users_profile_visibility     ON users(profile_visibility);
 CREATE INDEX IF NOT EXISTS idx_sessions_source              ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_username            ON sessions(username);
-CREATE INDEX IF NOT EXISTS idx_sessions_user_slug           ON sessions(user_slug);
 CREATE INDEX IF NOT EXISTS idx_sessions_ts                  ON sessions(first_timestamp);
 CREATE INDEX IF NOT EXISTS idx_sessions_project             ON sessions(project);
 CREATE INDEX IF NOT EXISTS idx_sessions_workspace_root      ON sessions(workspace_root);
@@ -147,6 +156,9 @@ CREATE INDEX IF NOT EXISTS idx_sessions_git_branch          ON sessions(git_bran
 CREATE INDEX IF NOT EXISTS idx_sessions_visibility          ON sessions(visibility);
 CREATE INDEX IF NOT EXISTS idx_sessions_visibility_source   ON sessions(visibility_source);
 CREATE INDEX IF NOT EXISTS idx_sessions_status              ON sessions(session_status);
+CREATE INDEX IF NOT EXISTS idx_sessions_objective_family    ON sessions(objective_family);
+CREATE INDEX IF NOT EXISTS idx_sessions_origin              ON sessions(session_origin);
+CREATE INDEX IF NOT EXISTS idx_sessions_parent_session      ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session           ON tool_calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_name              ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_session_paths_session        ON session_paths(session_id);
@@ -154,8 +166,8 @@ CREATE INDEX IF NOT EXISTS idx_session_paths_display        ON session_paths(dis
 CREATE INDEX IF NOT EXISTS idx_session_paths_relative       ON session_paths(relative_path);
 CREATE INDEX IF NOT EXISTS idx_session_paths_repo_relative  ON session_paths(repo_relative_path);
 CREATE INDEX IF NOT EXISTS idx_session_paths_normalized     ON session_paths(normalized_path);
-CREATE INDEX IF NOT EXISTS idx_rules_user_slug              ON session_visibility_rules(user_slug);
-CREATE INDEX IF NOT EXISTS idx_rules_priority               ON session_visibility_rules(user_slug, enabled, priority, id);
+CREATE INDEX IF NOT EXISTS idx_rules_username               ON session_visibility_rules(username);
+CREATE INDEX IF NOT EXISTS idx_rules_priority               ON session_visibility_rules(username, enabled, priority, id);
 """
 
 VIEWS = """
@@ -165,7 +177,7 @@ SELECT
     s.*,
     COALESCE(u.display_name, s.username) AS user_display_name,
     COALESCE(u.profile_visibility, 'public') AS user_profile_visibility,
-    COALESCE(u.default_session_visibility, 'public') AS user_default_session_visibility,
+    COALESCE(u.default_session_visibility, 'unlisted') AS user_default_session_visibility,
     CASE
         WHEN s.visibility = 'public' AND COALESCE(u.profile_visibility, 'public') = 'public'
         THEN 1 ELSE 0
@@ -184,18 +196,17 @@ SELECT
         THEN 1 ELSE 0
     END AS direct_private
 FROM sessions s
-LEFT JOIN users u ON u.slug = s.user_slug;
+LEFT JOIN users u ON u.username = s.username;
 
 DROP VIEW IF EXISTS user_catalog;
 CREATE VIEW user_catalog AS
 SELECT
-    u.slug,
     u.username,
     COALESCE(u.display_name, u.username) AS display_name,
     u.bio,
     u.avatar_url,
     COALESCE(u.profile_visibility, 'public') AS profile_visibility,
-    COALESCE(u.default_session_visibility, 'public') AS default_session_visibility,
+    COALESCE(u.default_session_visibility, 'unlisted') AS default_session_visibility,
     u.created_at,
     u.updated_at,
     CASE
@@ -216,9 +227,9 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def slugify(value: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
-    return slug or "user"
+def normalize_username(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
+    return normalized or "user"
 
 
 def _normalize_visibility(value: str | None, allowed: tuple[str, ...], default: str) -> str:
@@ -340,64 +351,65 @@ def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, 
     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {spec}")
 
 
-def _next_available_slug(conn: sqlite3.Connection, base_slug: str) -> str:
-    slug = base_slug
+def _next_available_username(conn: sqlite3.Connection, base_username: str) -> str:
+    username = base_username
     suffix = 2
-    while conn.execute("SELECT 1 FROM users WHERE slug = ?", (slug,)).fetchone():
-        slug = f"{base_slug}-{suffix}"
+    while conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+        username = f"{base_username}-{suffix}"
         suffix += 1
-    return slug
+    return username
 
 
 def ensure_user(conn: sqlite3.Connection, username: str, display_name: str | None = None) -> str:
+    canonical_username = normalize_username(username)
     row = conn.execute(
-        "SELECT slug, display_name FROM users WHERE username = ?",
-        (username,),
+        "SELECT username, display_name FROM users WHERE username = ? LIMIT 1",
+        (canonical_username,),
     ).fetchone()
     now = _now_iso()
     if row:
         if display_name and not row["display_name"]:
             conn.execute(
-                "UPDATE users SET display_name = ?, updated_at = ? WHERE slug = ?",
-                (display_name, now, row["slug"]),
+                "UPDATE users SET display_name = ?, updated_at = ? WHERE username = ?",
+                (display_name, now, row["username"]),
             )
-        return row["slug"]
+        return row["username"]
 
-    base_slug = slugify(username)
-    slug = _next_available_slug(conn, base_slug)
+    base_username = normalize_username(username)
+    canonical_username = _next_available_username(conn, base_username)
     conn.execute(
         """
         INSERT INTO users (
-            slug, username, display_name, bio, avatar_url,
+            username, display_name, bio, avatar_url,
             profile_visibility, default_session_visibility,
             created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            slug,
-            username,
+            canonical_username,
             display_name or username,
             None,
             None,
             "public",
-            "public",
+            "unlisted",
             now,
             now,
         ),
     )
-    return slug
+    return canonical_username
 
 
 def get_user_by_identifier(conn: sqlite3.Connection, identifier: str):
+    normalized = normalize_username(identifier)
     return conn.execute(
         """
         SELECT *
         FROM users
-        WHERE slug = ? OR username = ?
-        ORDER BY CASE WHEN slug = ? THEN 0 ELSE 1 END
+        WHERE username IN (?, ?)
+        ORDER BY CASE WHEN username = ? THEN 0 ELSE 1 END
         LIMIT 1
         """,
-        (identifier, identifier, identifier),
+        (identifier, normalized, identifier),
     ).fetchone()
 
 
@@ -405,7 +417,6 @@ def list_users(conn: sqlite3.Connection):
     return conn.execute(
         """
         SELECT
-            slug,
             username,
             COALESCE(display_name, username) AS display_name,
             profile_visibility,
@@ -413,7 +424,7 @@ def list_users(conn: sqlite3.Connection):
             created_at,
             updated_at
         FROM users
-        ORDER BY updated_at DESC, slug
+        ORDER BY updated_at DESC, username
         """
     ).fetchall()
 
@@ -427,6 +438,7 @@ def update_user(
     avatar_url: str | None = None,
     profile_visibility: str | None = None,
     default_session_visibility: str | None = None,
+    github_username: str | None = None,
 ):
     user = get_user_by_identifier(conn, identifier)
     if not user:
@@ -439,6 +451,8 @@ def update_user(
         updates["bio"] = bio
     if avatar_url is not None:
         updates["avatar_url"] = avatar_url
+    if github_username is not None:
+        updates["github_username"] = github_username.strip() or None
     if profile_visibility is not None:
         updates["profile_visibility"] = _normalize_visibility(
             profile_visibility, PROFILE_VISIBILITIES, user["profile_visibility"]
@@ -451,9 +465,9 @@ def update_user(
         )
 
     assignments = ", ".join(f"{column} = :{column}" for column in updates)
-    updates["slug"] = user["slug"]
-    conn.execute(f"UPDATE users SET {assignments} WHERE slug = :slug", updates)
-    return get_user_by_identifier(conn, user["slug"])
+    updates["username"] = user["username"]
+    conn.execute(f"UPDATE users SET {assignments} WHERE username = :username", updates)
+    return get_user_by_identifier(conn, user["username"])
 
 
 def resolve_session_id(conn: sqlite3.Connection, session_id_prefix: str) -> str | None:
@@ -544,7 +558,7 @@ def create_visibility_rule(
     cur = conn.execute(
         """
         INSERT INTO session_visibility_rules (
-            user_slug,
+            username,
             source_scope,
             field,
             match_mode,
@@ -558,7 +572,7 @@ def create_visibility_rule(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            user["slug"],
+            user["username"],
             normalized_source_scope,
             normalized_field,
             normalized_mode,
@@ -575,7 +589,7 @@ def create_visibility_rule(
         """
         SELECT r.*, u.username, COALESCE(u.display_name, u.username) AS user_display_name
         FROM session_visibility_rules r
-        JOIN users u ON u.slug = r.user_slug
+        JOIN users u ON u.username = r.username
         WHERE r.id = ?
         """,
         (cur.lastrowid,),
@@ -589,8 +603,8 @@ def list_visibility_rules(conn: sqlite3.Connection, identifier: str | None = Non
         user = get_user_by_identifier(conn, identifier)
         if not user:
             return []
-        where = "WHERE r.user_slug = ?"
-        params.append(user["slug"])
+        where = "WHERE r.username = ?"
+        params.append(user["username"])
 
     return conn.execute(
         f"""
@@ -599,9 +613,9 @@ def list_visibility_rules(conn: sqlite3.Connection, identifier: str | None = Non
             u.username,
             COALESCE(u.display_name, u.username) AS user_display_name
         FROM session_visibility_rules r
-        JOIN users u ON u.slug = r.user_slug
+        JOIN users u ON u.username = r.username
         {where}
-        ORDER BY r.user_slug, r.enabled DESC, r.priority ASC, r.id ASC
+        ORDER BY r.username, r.enabled DESC, r.priority ASC, r.id ASC
         """,
         params,
     ).fetchall()
@@ -614,7 +628,7 @@ def delete_visibility_rule(
     shared_dir: Path,
 ) -> tuple[int, int]:
     row = conn.execute(
-        "SELECT user_slug FROM session_visibility_rules WHERE id = ?",
+        "SELECT username FROM session_visibility_rules WHERE id = ?",
         (rule_id,),
     ).fetchone()
     cur = conn.execute("DELETE FROM session_visibility_rules WHERE id = ?", (rule_id,))
@@ -622,7 +636,7 @@ def delete_visibility_rule(
         return cur.rowcount, 0
     updated = recompute_session_visibility(
         conn,
-        identifier=row["user_slug"],
+        identifier=row["username"],
         shared_dir=Path(shared_dir),
     )
     return cur.rowcount, updated
@@ -642,7 +656,7 @@ def _session_rule_context(data: dict) -> dict[str, str]:
 def resolve_session_visibility(
     conn: sqlite3.Connection,
     *,
-    user_slug: str,
+    username: str,
     source: str,
     default_visibility: str,
     session_data: dict,
@@ -651,10 +665,10 @@ def resolve_session_visibility(
         """
         SELECT *
         FROM session_visibility_rules
-        WHERE user_slug = ? AND enabled = 1
+        WHERE username = ? AND enabled = 1
         ORDER BY priority ASC, id ASC
         """,
-        (user_slug,),
+        (username,),
     ).fetchall()
     context = _session_rule_context(session_data)
 
@@ -683,7 +697,7 @@ def resolve_session_visibility(
             "visibility_reason": reason,
         }
 
-    normalized_default = _normalize_visibility(default_visibility, SESSION_VISIBILITIES, "public")
+    normalized_default = _normalize_visibility(default_visibility, SESSION_VISIBILITIES, "unlisted")
     return {
         "visibility": normalized_default,
         "visibility_source": "default",
@@ -707,8 +721,8 @@ def recompute_session_visibility(
         user = get_user_by_identifier(conn, identifier)
         if not user:
             return 0
-        clauses.append("s.user_slug = ?")
-        params.append(user["slug"])
+        clauses.append("s.username = ?")
+        params.append(user["username"])
     if session_id_prefix:
         clauses.append("s.session_id LIKE ?")
         params.append(f"{session_id_prefix}%")
@@ -718,9 +732,9 @@ def recompute_session_visibility(
         f"""
         SELECT
             s.*,
-            COALESCE(u.default_session_visibility, 'public') AS default_session_visibility
+            COALESCE(u.default_session_visibility, 'unlisted') AS default_session_visibility
         FROM sessions s
-        LEFT JOIN users u ON u.slug = s.user_slug
+        LEFT JOIN users u ON u.username = s.username
         WHERE {where}
         ORDER BY s.first_timestamp, s.session_id
         """,
@@ -734,7 +748,7 @@ def recompute_session_visibility(
 
         decision = resolve_session_visibility(
             conn,
-            user_slug=row["user_slug"],
+            username=row["username"],
             source=row["source"],
             default_visibility=row["default_session_visibility"],
             session_data=dict(row),
@@ -767,7 +781,7 @@ def recompute_session_visibility(
             conn,
             shared_dir=Path(shared_dir),
             session_id_prefix=session_id_prefix,
-            user_slug=user["slug"] if identifier else None,
+            username=user["username"] if identifier else None,
         )
 
     return updated
@@ -778,10 +792,10 @@ def preview_session_visibility(conn: sqlite3.Connection, session_id_prefix: str)
         """
         SELECT
             s.*,
-            COALESCE(u.default_session_visibility, 'public') AS default_session_visibility,
+            COALESCE(u.default_session_visibility, 'unlisted') AS default_session_visibility,
             u.username AS canonical_username
         FROM sessions s
-        LEFT JOIN users u ON u.slug = s.user_slug
+        LEFT JOIN users u ON u.username = s.username
         WHERE s.session_id LIKE ?
         ORDER BY LENGTH(s.session_id), s.session_id
         LIMIT 1
@@ -793,7 +807,7 @@ def preview_session_visibility(conn: sqlite3.Connection, session_id_prefix: str)
 
     decision = resolve_session_visibility(
         conn,
-        user_slug=row["user_slug"],
+        username=row["username"],
         source=row["source"],
         default_visibility=row["default_session_visibility"],
         session_data=dict(row),
@@ -812,7 +826,353 @@ def _backfill_users(conn: sqlite3.Connection) -> None:
         ensure_user(conn, username)
 
 
+def _rebuild_identity_schema(conn: sqlite3.Connection) -> None:
+    user_columns = _table_columns(conn, "users")
+    session_columns = _table_columns(conn, "sessions")
+    rule_columns = _table_columns(conn, "session_visibility_rules")
+    needs_rebuild = (
+        "slug" in user_columns
+        or "user_slug" in session_columns
+        or "user_slug" in rule_columns
+    )
+    if not needs_rebuild:
+        return
+
+    now = _now_iso()
+    conn.execute("DROP VIEW IF EXISTS session_catalog")
+    conn.execute("DROP VIEW IF EXISTS user_catalog")
+
+    conn.execute(
+        """
+        CREATE TABLE users__new (
+            username TEXT PRIMARY KEY,
+            display_name TEXT,
+            bio TEXT,
+            avatar_url TEXT,
+            profile_visibility TEXT NOT NULL DEFAULT 'public',
+            default_session_visibility TEXT NOT NULL DEFAULT 'unlisted',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    if "slug" in user_columns:
+        conn.execute(
+            """
+            INSERT INTO users__new (
+                username, display_name, bio, avatar_url,
+                profile_visibility, default_session_visibility,
+                created_at, updated_at
+            )
+            SELECT
+                normalize_username_py(COALESCE(NULLIF(username, ''), slug)) AS username,
+                display_name,
+                bio,
+                avatar_url,
+                COALESCE(NULLIF(profile_visibility, ''), 'public') AS profile_visibility,
+                CASE
+                    WHEN default_session_visibility IN ('private', 'unlisted', 'public')
+                    THEN default_session_visibility
+                    ELSE 'unlisted'
+                END AS default_session_visibility,
+                COALESCE(NULLIF(created_at, ''), ?) AS created_at,
+                COALESCE(NULLIF(updated_at, ''), ?) AS updated_at
+            FROM users
+            """,
+            (now, now),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO users__new (
+                username, display_name, bio, avatar_url,
+                profile_visibility, default_session_visibility,
+                created_at, updated_at
+            )
+            SELECT
+                normalize_username_py(username) AS username,
+                display_name,
+                bio,
+                avatar_url,
+                COALESCE(NULLIF(profile_visibility, ''), 'public') AS profile_visibility,
+                CASE
+                    WHEN default_session_visibility IN ('private', 'unlisted', 'public')
+                    THEN default_session_visibility
+                    ELSE 'unlisted'
+                END AS default_session_visibility,
+                COALESCE(NULLIF(created_at, ''), ?) AS created_at,
+                COALESCE(NULLIF(updated_at, ''), ?) AS updated_at
+            FROM users
+            """,
+            (now, now),
+        )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO users__new (
+            username, display_name, bio, avatar_url,
+            profile_visibility, default_session_visibility,
+            created_at, updated_at
+        )
+        SELECT DISTINCT
+            normalize_username_py(username) AS username,
+            normalize_username_py(username) AS display_name,
+            NULL,
+            NULL,
+            'public',
+            'unlisted',
+            ?,
+            ?
+        FROM sessions
+        WHERE username IS NOT NULL AND username != ''
+        """,
+        (now, now),
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE session_visibility_rules__new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            source_scope TEXT,
+            field TEXT NOT NULL,
+            match_mode TEXT NOT NULL,
+            pattern TEXT NOT NULL,
+            visibility TEXT NOT NULL DEFAULT 'public',
+            priority INTEGER NOT NULL DEFAULT 100,
+            threshold REAL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    if "user_slug" in rule_columns:
+        conn.execute(
+            """
+            INSERT INTO session_visibility_rules__new (
+                id, username, source_scope, field, match_mode, pattern,
+                visibility, priority, threshold, enabled, created_at, updated_at
+            )
+            SELECT
+                r.id,
+                COALESCE(
+                    (SELECT u.username FROM users__new u WHERE u.username = normalize_username_py(r.user_slug)),
+                    normalize_username_py(r.user_slug)
+                ) AS username,
+                r.source_scope,
+                r.field,
+                r.match_mode,
+                r.pattern,
+                r.visibility,
+                r.priority,
+                r.threshold,
+                r.enabled,
+                COALESCE(NULLIF(r.created_at, ''), ?),
+                COALESCE(NULLIF(r.updated_at, ''), ?)
+            FROM session_visibility_rules r
+            """,
+            (now, now),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO session_visibility_rules__new (
+                id, username, source_scope, field, match_mode, pattern,
+                visibility, priority, threshold, enabled, created_at, updated_at
+            )
+            SELECT
+                id,
+                normalize_username_py(username) AS username,
+                source_scope,
+                field,
+                match_mode,
+                pattern,
+                visibility,
+                priority,
+                threshold,
+                enabled,
+                COALESCE(NULLIF(created_at, ''), ?),
+                COALESCE(NULLIF(updated_at, ''), ?)
+            FROM session_visibility_rules
+            """,
+            (now, now),
+        )
+
+    conn.execute(
+        """
+        CREATE TABLE sessions__new (
+            session_id     TEXT PRIMARY KEY,
+            source         TEXT NOT NULL,
+            username       TEXT NOT NULL,
+            machine        TEXT,
+            project        TEXT,
+            workspace_root TEXT,
+            worktree_root  TEXT,
+            repo_root      TEXT,
+            repo_name      TEXT,
+            git_branch     TEXT,
+            git_commit     TEXT,
+            git_dirty      INTEGER DEFAULT 0,
+            source_path    TEXT NOT NULL,
+            shared_path    TEXT NOT NULL,
+            first_timestamp TEXT,
+            last_timestamp  TEXT,
+            duration_seconds REAL,
+            user_message_count    INTEGER DEFAULT 0,
+            assistant_message_count INTEGER DEFAULT 0,
+            tool_call_count       INTEGER DEFAULT 0,
+            error_count           INTEGER DEFAULT 0,
+            write_path_count      INTEGER,
+            read_path_count       INTEGER,
+            search_path_count     INTEGER,
+            test_run_count        INTEGER,
+            test_failure_count    INTEGER,
+            lint_run_count        INTEGER,
+            lint_failure_count    INTEGER,
+            build_run_count       INTEGER,
+            build_failure_count   INTEGER,
+            format_run_count      INTEGER,
+            format_failure_count  INTEGER,
+            git_status_count      INTEGER,
+            git_diff_count        INTEGER,
+            git_commit_count      INTEGER,
+            activity_version      INTEGER DEFAULT 0,
+            session_goal          TEXT,
+            session_summary       TEXT,
+            session_outcome       TEXT,
+            session_status        TEXT,
+            narrative_version     INTEGER DEFAULT 0,
+            objective_family      TEXT,
+            objective_label       TEXT,
+            objective_version     INTEGER DEFAULT 0,
+            session_origin        TEXT,
+            origin_version        INTEGER DEFAULT 0,
+            total_input_tokens    INTEGER DEFAULT 0,
+            total_output_tokens   INTEGER DEFAULT 0,
+            fresh_input_tokens    INTEGER DEFAULT 0,
+            cached_input_tokens   INTEGER DEFAULT 0,
+            reasoning_output_tokens INTEGER DEFAULT 0,
+            token_version        INTEGER DEFAULT 0,
+            first_user_message    TEXT,
+            parent_session_id    TEXT,
+            spawn_depth          INTEGER DEFAULT 0,
+            visibility     TEXT NOT NULL DEFAULT 'public',
+            visibility_source TEXT NOT NULL DEFAULT 'default',
+            visibility_rule_id INTEGER,
+            visibility_reason TEXT,
+            is_private     INTEGER DEFAULT 0,
+            file_hash      TEXT,
+            synced_at      TEXT,
+            model          TEXT
+        )
+        """
+    )
+    username_expr = (
+        "COALESCE(NULLIF(user_slug, ''), NULLIF(username, ''))"
+        if "user_slug" in session_columns
+        else "NULLIF(username, '')"
+    )
+    conn.execute(
+        f"""
+        INSERT INTO sessions__new (
+            session_id, source, username, machine, project, workspace_root,
+            worktree_root, repo_root, repo_name, git_branch, git_commit, git_dirty,
+            source_path, shared_path, first_timestamp, last_timestamp, duration_seconds,
+            user_message_count, assistant_message_count, tool_call_count, error_count,
+            write_path_count, read_path_count, search_path_count,
+            test_run_count, test_failure_count, lint_run_count, lint_failure_count,
+            build_run_count, build_failure_count, format_run_count, format_failure_count,
+            git_status_count, git_diff_count, git_commit_count, activity_version,
+            session_goal, session_summary, session_outcome, session_status, narrative_version,
+            objective_family, objective_label, objective_version,
+            session_origin, origin_version,
+            total_input_tokens, total_output_tokens, fresh_input_tokens, cached_input_tokens,
+            reasoning_output_tokens, token_version, first_user_message, parent_session_id, spawn_depth, visibility,
+            visibility_source, visibility_rule_id, visibility_reason,
+            is_private, file_hash, synced_at, model
+        )
+        SELECT
+            session_id,
+            source,
+            COALESCE(
+                (SELECT u.username FROM users__new u WHERE u.username = normalize_username_py({username_expr})),
+                normalize_username_py({username_expr}),
+                'user'
+            ) AS username,
+            machine,
+            project,
+            workspace_root,
+            worktree_root,
+            repo_root,
+            repo_name,
+            git_branch,
+            git_commit,
+            COALESCE(git_dirty, 0),
+            source_path,
+            shared_path,
+            first_timestamp,
+            last_timestamp,
+            duration_seconds,
+            COALESCE(user_message_count, 0),
+            COALESCE(assistant_message_count, 0),
+            COALESCE(tool_call_count, 0),
+            COALESCE(error_count, 0),
+            write_path_count,
+            read_path_count,
+            search_path_count,
+            test_run_count,
+            test_failure_count,
+            lint_run_count,
+            lint_failure_count,
+            build_run_count,
+            build_failure_count,
+            format_run_count,
+            format_failure_count,
+            git_status_count,
+            git_diff_count,
+            git_commit_count,
+            COALESCE(activity_version, 0),
+            session_goal,
+            session_summary,
+            session_outcome,
+            session_status,
+            COALESCE(narrative_version, 0),
+            objective_family,
+            objective_label,
+            COALESCE(objective_version, 0),
+            session_origin,
+            COALESCE(origin_version, 0),
+            COALESCE(total_input_tokens, 0),
+            COALESCE(total_output_tokens, 0),
+            COALESCE(fresh_input_tokens, 0),
+            COALESCE(cached_input_tokens, 0),
+            COALESCE(reasoning_output_tokens, 0),
+            COALESCE(token_version, 0),
+            first_user_message,
+            parent_session_id,
+            COALESCE(spawn_depth, 0),
+            COALESCE(NULLIF(visibility, ''), 'public'),
+            COALESCE(NULLIF(visibility_source, ''), 'default'),
+            visibility_rule_id,
+            visibility_reason,
+            COALESCE(is_private, 0),
+            file_hash,
+            synced_at,
+            model
+        FROM sessions
+        """
+    )
+
+    conn.execute("DROP TABLE session_visibility_rules")
+    conn.execute("ALTER TABLE session_visibility_rules__new RENAME TO session_visibility_rules")
+    conn.execute("DROP TABLE sessions")
+    conn.execute("ALTER TABLE sessions__new RENAME TO sessions")
+    conn.execute("DROP TABLE users")
+    conn.execute("ALTER TABLE users__new RENAME TO users")
+
+
 def migrate_db(conn: sqlite3.Connection) -> None:
+    conn.create_function("normalize_username_py", 1, lambda value: normalize_username(value or ""))
     conn.executescript(SCHEMA)
 
     _ensure_column(conn, "sessions", "workspace_root", "TEXT")
@@ -842,7 +1202,17 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "sessions", "session_outcome", "TEXT")
     _ensure_column(conn, "sessions", "session_status", "TEXT")
     _ensure_column(conn, "sessions", "narrative_version", "INTEGER DEFAULT 0")
-    _ensure_column(conn, "sessions", "user_slug", "TEXT")
+    _ensure_column(conn, "sessions", "objective_family", "TEXT")
+    _ensure_column(conn, "sessions", "objective_label", "TEXT")
+    _ensure_column(conn, "sessions", "objective_version", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "sessions", "session_origin", "TEXT")
+    _ensure_column(conn, "sessions", "origin_version", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "sessions", "fresh_input_tokens", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "sessions", "cached_input_tokens", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "sessions", "reasoning_output_tokens", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "sessions", "token_version", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "sessions", "parent_session_id", "TEXT")
+    _ensure_column(conn, "sessions", "spawn_depth", "INTEGER DEFAULT 0")
     _ensure_column(conn, "sessions", "visibility", "TEXT NOT NULL DEFAULT 'public'")
     _ensure_column(conn, "sessions", "visibility_source", "TEXT NOT NULL DEFAULT 'default'")
     _ensure_column(conn, "sessions", "visibility_rule_id", "INTEGER")
@@ -856,21 +1226,33 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         conn,
         "users",
         "default_session_visibility",
-        "TEXT NOT NULL DEFAULT 'public'",
+        "TEXT NOT NULL DEFAULT 'unlisted'",
     )
     _ensure_column(conn, "users", "created_at", "TEXT")
     _ensure_column(conn, "users", "updated_at", "TEXT")
+    _ensure_column(conn, "users", "github_username", "TEXT")
 
-    _backfill_users(conn)
-    conn.execute(
+    conn.executescript(
         """
-        UPDATE sessions
-        SET user_slug = (
-            SELECT users.slug FROM users WHERE users.username = sessions.username
-        )
-        WHERE user_slug IS NULL OR user_slug = ''
+        CREATE TABLE IF NOT EXISTS user_github_daily (
+            username TEXT NOT NULL,
+            day TEXT NOT NULL,
+            contributions INTEGER DEFAULT 0,
+            commits INTEGER DEFAULT 0,
+            prs_opened INTEGER DEFAULT 0,
+            prs_reviewed INTEGER DEFAULT 0,
+            issues_opened INTEGER DEFAULT 0,
+            synced_at TEXT NOT NULL,
+            PRIMARY KEY (username, day)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_github_day ON user_github_daily(day);
+        CREATE INDEX IF NOT EXISTS idx_user_github_username ON user_github_daily(username);
         """
     )
+
+    _backfill_users(conn)
+    _rebuild_identity_schema(conn)
+    _backfill_users(conn)
     conn.execute(
         """
         UPDATE sessions
@@ -921,10 +1303,38 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         UPDATE sessions
+        SET objective_version = CASE
+            WHEN objective_version IS NULL THEN 0
+            ELSE objective_version
+        END
+        """
+    )
+    conn.execute(
+        """
+        UPDATE sessions
+        SET origin_version = CASE
+            WHEN origin_version IS NULL THEN 0
+            ELSE origin_version
+        END
+        """
+    )
+    conn.execute(
+        """
+        UPDATE sessions
         SET session_status = CASE
             WHEN session_status IN ('exploration', 'success', 'partial', 'failed')
             THEN session_status
             ELSE 'exploration'
+        END
+        """
+    )
+    conn.execute(
+        f"""
+        UPDATE sessions
+        SET session_origin = CASE
+            WHEN session_origin IN ({", ".join(repr(origin) for origin in SESSION_ORIGINS)})
+            THEN session_origin
+            ELSE 'human_direct'
         END
         """
     )
@@ -974,12 +1384,18 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             default_session_visibility = CASE
                 WHEN default_session_visibility IN ('private', 'unlisted', 'public')
                 THEN default_session_visibility
-                ELSE 'public'
+                ELSE 'unlisted'
             END,
             created_at = COALESCE(NULLIF(created_at, ''), ?),
             updated_at = COALESCE(NULLIF(updated_at, ''), ?)
         """,
         (_now_iso(), _now_iso()),
+    )
+    conn.execute(
+        """
+        UPDATE sessions
+        SET username = normalize_username_py(username)
+        """
     )
     conn.executescript(INDEXES)
     conn.executescript(VIEWS)
@@ -1011,12 +1427,25 @@ def upsert_session(conn, data: dict):
         "session_outcome": None,
         "session_status": "exploration",
         "narrative_version": 0,
+        "objective_family": None,
+        "objective_label": None,
+        "objective_version": 0,
+        "session_origin": "human_direct",
+        "origin_version": 0,
+        "fresh_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "token_version": 0,
+        "parent_session_id": None,
+        "spawn_depth": 0,
         **data,
     }
+    if payload.get("username"):
+        payload["username"] = normalize_username(str(payload["username"]))
     conn.execute(
         """
         INSERT INTO sessions
-            (session_id, source, username, user_slug, machine, project, workspace_root,
+            (session_id, source, username, machine, project, workspace_root,
              worktree_root, repo_root, repo_name, git_branch, git_commit, git_dirty,
              source_path, shared_path, first_timestamp, last_timestamp,
              duration_seconds, user_message_count, assistant_message_count,
@@ -1025,11 +1454,14 @@ def upsert_session(conn, data: dict):
              build_run_count, build_failure_count, format_run_count, format_failure_count,
              git_status_count, git_diff_count, git_commit_count, activity_version,
              session_goal, session_summary, session_outcome, session_status, narrative_version,
-             total_input_tokens, total_output_tokens, first_user_message, visibility,
+             objective_family, objective_label, objective_version,
+             session_origin, origin_version,
+             total_input_tokens, total_output_tokens, fresh_input_tokens, cached_input_tokens,
+             reasoning_output_tokens, token_version, first_user_message, parent_session_id, spawn_depth, visibility,
              visibility_source, visibility_rule_id, visibility_reason,
              is_private, file_hash, synced_at, model)
         VALUES
-            (:session_id, :source, :username, :user_slug, :machine, :project, :workspace_root,
+            (:session_id, :source, :username, :machine, :project, :workspace_root,
              :worktree_root, :repo_root, :repo_name, :git_branch, :git_commit, :git_dirty,
              :source_path, :shared_path, :first_timestamp, :last_timestamp,
              :duration_seconds, :user_message_count, :assistant_message_count,
@@ -1038,13 +1470,15 @@ def upsert_session(conn, data: dict):
              :build_run_count, :build_failure_count, :format_run_count, :format_failure_count,
              :git_status_count, :git_diff_count, :git_commit_count, :activity_version,
              :session_goal, :session_summary, :session_outcome, :session_status, :narrative_version,
-             :total_input_tokens, :total_output_tokens, :first_user_message, :visibility,
+             :objective_family, :objective_label, :objective_version,
+             :session_origin, :origin_version,
+             :total_input_tokens, :total_output_tokens, :fresh_input_tokens, :cached_input_tokens,
+             :reasoning_output_tokens, :token_version, :first_user_message, :parent_session_id, :spawn_depth, :visibility,
              :visibility_source, :visibility_rule_id, :visibility_reason,
              :is_private, :file_hash, :synced_at, :model)
         ON CONFLICT(session_id) DO UPDATE SET
             source = excluded.source,
             username = excluded.username,
-            user_slug = excluded.user_slug,
             machine = excluded.machine,
             project = excluded.project,
             workspace_root = excluded.workspace_root,
@@ -1083,9 +1517,20 @@ def upsert_session(conn, data: dict):
             session_outcome = excluded.session_outcome,
             session_status = excluded.session_status,
             narrative_version = excluded.narrative_version,
+            objective_family = excluded.objective_family,
+            objective_label = excluded.objective_label,
+            objective_version = excluded.objective_version,
+            session_origin = excluded.session_origin,
+            origin_version = excluded.origin_version,
             total_input_tokens = excluded.total_input_tokens,
             total_output_tokens = excluded.total_output_tokens,
+            fresh_input_tokens = excluded.fresh_input_tokens,
+            cached_input_tokens = excluded.cached_input_tokens,
+            reasoning_output_tokens = excluded.reasoning_output_tokens,
+            token_version = excluded.token_version,
             first_user_message = excluded.first_user_message,
+            parent_session_id = excluded.parent_session_id,
+            spawn_depth = excluded.spawn_depth,
             visibility = CASE
                 WHEN COALESCE(NULLIF(sessions.visibility_source, ''), 'default') = 'manual'
                 THEN COALESCE(NULLIF(sessions.visibility, ''), excluded.visibility)

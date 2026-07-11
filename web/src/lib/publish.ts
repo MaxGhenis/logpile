@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 
 import { config } from "./config";
-import type { PublishQueueResponse, PublishReview, SessionStatus } from "./types";
+import type { PublishQueueResponse, PublishReview, SessionOrigin, SessionStatus } from "./types";
 
 const execFileAsync = promisify(execFile);
 
@@ -14,8 +14,22 @@ type PublishReviewErrorPayload = {
   code?: string;
 };
 
-const PUBLISH_VISIBILITIES = new Set(["pending", "all", "private", "unlisted", "public"]);
+const PUBLISH_VISIBILITIES = new Set([
+  "pending",
+  "needs_changes",
+  "all",
+  "private",
+  "unlisted",
+  "public",
+]);
 const PUBLISH_STATUSES = new Set(["exploration", "success", "partial", "failed"]);
+const PUBLISH_ORIGINS = new Set([
+  "human_direct",
+  "human_delegated",
+  "pipeline_eval",
+  "meta_scaffolding",
+  "system_generated",
+]);
 
 export class PublishReviewCommandError extends Error {
   status: number;
@@ -128,9 +142,21 @@ function normalizeQueueStatus(status?: string): SessionStatus | undefined {
   return normalized as SessionStatus;
 }
 
+function normalizeQueueOrigin(origin?: string): SessionOrigin | undefined {
+  if (!origin) {
+    return undefined;
+  }
+  const normalized = origin.trim().toLowerCase();
+  if (!PUBLISH_ORIGINS.has(normalized)) {
+    throw new RangeError(`Invalid publish queue origin: ${origin}`);
+  }
+  return normalized as SessionOrigin;
+}
+
 export async function getPublishQueueResponse(opts?: {
   visibility?: string;
   status?: string;
+  origin?: string;
   user?: string;
   limit?: number;
   reviews?: boolean;
@@ -141,6 +167,7 @@ export async function getPublishQueueResponse(opts?: {
 
   const visibility = normalizeQueueVisibility(opts?.visibility);
   const status = normalizeQueueStatus(opts?.status);
+  const origin = normalizeQueueOrigin(opts?.origin);
   const user = opts?.user?.trim();
   const limit = Math.min(Math.max(opts?.limit ?? 25, 1), 200);
   const reviews = opts?.reviews ?? false;
@@ -161,6 +188,9 @@ export async function getPublishQueueResponse(opts?: {
   ];
   if (status) {
     args.push("--status", status);
+  }
+  if (origin) {
+    args.push("--origin", origin);
   }
   if (user) {
     args.push("--user", user);

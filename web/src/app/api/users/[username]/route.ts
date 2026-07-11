@@ -1,18 +1,26 @@
 import { getApiUserProfile } from "@/lib/db";
 
 export async function GET(
-  _req: Request,
-  { params }: { params: Promise<{ slug: string }> }
+  req: Request,
+  { params }: { params: Promise<{ username: string }> }
 ) {
-  const { slug } = await params;
-  const profile = getApiUserProfile(slug);
+  const { username } = await params;
+  const { searchParams } = new URL(req.url);
+  let profile;
+  try {
+    profile = getApiUserProfile(username, searchParams.get("origin") || "human_direct");
+  } catch (error) {
+    if (error instanceof RangeError) {
+      return Response.json({ error: error.message }, { status: 400 });
+    }
+    throw error;
+  }
   if (!profile || !profile.user) {
     return Response.json({ error: "not found" }, { status: 404 });
   }
 
   return Response.json({
     user: {
-      slug: profile.user.slug,
       username: profile.user.username,
       display_name: profile.user.display_name ?? profile.user.username,
       bio: profile.user.bio,

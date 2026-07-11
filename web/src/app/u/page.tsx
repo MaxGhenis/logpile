@@ -14,17 +14,17 @@ export default function PeoplePage() {
       <div className="p-7 max-w-[1400px] animate-fade-up">
         <div className="grid grid-cols-[repeat(auto-fill,minmax(280px,1fr))] gap-4">
           {users.map((u) => {
-            const displayName = u.display_name || u.username || u.slug;
+            const displayName = u.display_name || u.username;
             return (
             <Link
-              key={u.slug}
-              href={`/u/${u.slug}`}
+              key={u.username}
+              href={`/u/${u.username}`}
               className="bg-lp-surface border border-lp-border-dim rounded-lg p-5 flex flex-col gap-3 no-underline text-inherit hover-glow"
             >
               <div className="font-brand text-xl font-bold text-lp-text">
-                @{u.slug}
+                @{u.username}
               </div>
-              {displayName !== u.slug && (
+              {displayName !== u.username && (
                 <div className="text-sm text-lp-text-dim">{displayName}</div>
               )}
               <div className="flex gap-4 flex-wrap">

@@ -19,6 +19,7 @@ interface ActivityData {
   labels: string[];
   messages: number[];
   tool_calls: number[];
+  github_contributions?: number[];
 }
 
 interface SourceData {
@@ -28,11 +29,25 @@ interface SourceData {
 }
 
 export function UserActivityChart({ data }: { data: ActivityData }) {
-  const points = data.labels.map((day, i) => ({
-    day,
-    Messages: data.messages[i] ?? 0,
-    "Tool calls": data.tool_calls[i] ?? 0,
-  }));
+  const hasGithub = !!data.github_contributions && data.github_contributions.some((v) => v > 0);
+
+  const points = data.labels.map((day, i) => {
+    const row: Record<string, string | number> = {
+      day,
+      Messages: data.messages[i] ?? 0,
+      "Tool calls": data.tool_calls[i] ?? 0,
+    };
+    if (hasGithub) {
+      row["GitHub"] = data.github_contributions?.[i] ?? 0;
+    }
+    return row;
+  });
+
+  const yValues = [
+    ...data.messages,
+    ...data.tool_calls,
+    ...(hasGithub ? (data.github_contributions ?? []) : []),
+  ];
 
   return (
     <ResponsiveContainer width="100%" height={180}>
@@ -47,7 +62,7 @@ export function UserActivityChart({ data }: { data: ActivityData }) {
         <YAxis
           tick={{ fill: "#78716c", fontSize: 10 }}
           width={55}
-          ticks={niceTicks(Math.max(...data.messages, ...data.tool_calls))}
+          ticks={niceTicks(Math.max(...yValues))}
           tickFormatter={formatAxisValue}
         />
         <Tooltip
@@ -75,6 +90,16 @@ export function UserActivityChart({ data }: { data: ActivityData }) {
           strokeWidth={2}
           dot={false}
         />
+        {hasGithub && (
+          <Line
+            type="monotone"
+            dataKey="GitHub"
+            stroke="#84cc16"
+            strokeWidth={2}
+            strokeDasharray="4 3"
+            dot={false}
+          />
+        )}
       </LineChart>
     </ResponsiveContainer>
   );

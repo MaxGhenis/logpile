@@ -9,7 +9,8 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from logpile.cli import cli
-from logpile.db import init_db, set_session_visibility, update_user
+from logpile.db import ensure_user, init_db, set_session_visibility, update_user
+from logpile.origins import derive_session_origin
 from logpile.sync import sync_sessions
 from logpile.web.app import create_app
 
@@ -105,6 +106,115 @@ class SyncTests(unittest.TestCase):
             text=True,
         ).stdout.strip()
         return repo, branch, commit
+
+    def _write_codex_session(
+        self,
+        home: Path,
+        *,
+        session_id: str = "rollout-1",
+        message: str = "Fix the parser",
+        cwd: str = "/tmp/demo",
+        total_input_tokens: int = 1200,
+        cached_input_tokens: int = 300,
+        total_output_tokens: int = 45,
+    ) -> Path:
+        session_path = (
+            home
+            / ".codex"
+            / "sessions"
+            / "2026"
+            / "04"
+            / "10"
+            / f"{session_id}.jsonl"
+        )
+        write_jsonl(
+            session_path,
+            [
+                {
+                    "timestamp": "2026-04-10T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": session_id,
+                        "timestamp": "2026-04-10T10:00:00Z",
+                        "cwd": cwd,
+                    },
+                },
+                {
+                    "timestamp": "2026-04-10T10:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": message}],
+                    },
+                },
+                {
+                    "timestamp": "2026-04-10T10:00:02Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": total_input_tokens,
+                                "cached_input_tokens": cached_input_tokens,
+                                "output_tokens": total_output_tokens,
+                                "total_tokens": total_input_tokens + total_output_tokens,
+                            }
+                        },
+                    },
+                },
+            ],
+        )
+        return session_path
+
+    def test_derive_session_origin_classifies_common_workflow_types(self) -> None:
+        self.assertEqual(
+            derive_session_origin(
+                source="codex",
+                session_id="rollout-1",
+                first_user_message="make more progress on the cosilico microplex repo (local)",
+            )["session_origin"],
+            "human_direct",
+        )
+        self.assertEqual(
+            derive_session_origin(
+                source="claudecode",
+                session_id="00413d2f",
+                first_user_message=(
+                    "You are a senior statutory-fidelity reviewer for RAC (Rules as Code) "
+                    "encodings.\n\nReview the file holistically for citation fidelity."
+                ),
+                source_path="/private/tmp/autorac-0.2.13-eval/file.jsonl",
+            )["session_origin"],
+            "pipeline_eval",
+        )
+        self.assertEqual(
+            derive_session_origin(
+                source="claudecode",
+                session_id="agent-a123456",
+                first_user_message=(
+                    '<teammate-message teammate_id="team-lead">'
+                    '{"type":"task_assignment","subject":"Fix CI"}'
+                ),
+            )["session_origin"],
+            "human_delegated",
+        )
+        self.assertEqual(
+            derive_session_origin(
+                source="claudecode",
+                session_id="agent-a39249b",
+                first_user_message="Warmup",
+            )["session_origin"],
+            "meta_scaffolding",
+        )
+        self.assertEqual(
+            derive_session_origin(
+                source="codex",
+                session_id="rollout-2",
+                first_user_message="# AGENTS.md instructions for /Users/maxghenis/policyengine-uk",
+            )["session_origin"],
+            "system_generated",
+        )
 
     def test_sync_copies_files_and_preserves_privacy_on_resync(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -345,6 +455,62 @@ class SyncTests(unittest.TestCase):
                     ("tests/test_sync.py", "search", "command", 1),
                 ],
             )
+
+    def test_sync_backfills_codex_tokens_on_unchanged_session(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._write_codex_session(home, session_id="rollout-token")
+
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            with open_sqlite(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET total_input_tokens = 0,
+                        total_output_tokens = 0,
+                        fresh_input_tokens = 0,
+                        cached_input_tokens = 0,
+                        token_version = 0
+                    WHERE session_id = 'rollout-token'
+                    """
+                )
+                conn.commit()
+
+            new_count, updated_count, skipped_count = sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            self.assertEqual((new_count, updated_count, skipped_count), (0, 1, 0))
+
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT total_input_tokens, total_output_tokens,
+                           fresh_input_tokens, cached_input_tokens, token_version
+                    FROM sessions
+                    WHERE session_id = 'rollout-token'
+                    """
+                ).fetchone()
+
+            self.assertEqual(row["total_input_tokens"], 1200)
+            self.assertEqual(row["total_output_tokens"], 45)
+            self.assertEqual(row["fresh_input_tokens"], 900)
+            self.assertEqual(row["cached_input_tokens"], 300)
+            self.assertEqual(row["token_version"], 3)
 
     def test_sync_populates_git_repo_metadata_and_root_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -656,6 +822,61 @@ class SyncTests(unittest.TestCase):
             self.assertIn("Ran tests 1 time", row["session_summary"])
             self.assertEqual(row["session_status"], "success")
 
+    def test_sync_backfills_origin_for_unchanged_session(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._write_claude_session(
+                home,
+                message=(
+                    "You are a senior statutory-fidelity reviewer for RAC (Rules as Code) encodings.\n\n"
+                    "Review the file holistically for citation fidelity."
+                ),
+            )
+
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            with open_sqlite(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET origin_version = 0,
+                        session_origin = NULL
+                    WHERE session_id = 'session-1'
+                    """
+                )
+                conn.commit()
+
+            counts = sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            self.assertEqual(counts, (0, 1, 0))
+
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT origin_version, session_origin
+                    FROM sessions
+                    WHERE session_id = 'session-1'
+                    """
+                ).fetchone()
+
+            self.assertEqual(row["origin_version"], 1)
+            self.assertEqual(row["session_origin"], "pipeline_eval")
+
     def test_sync_backfills_missing_session_paths_for_unchanged_session(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -843,15 +1064,14 @@ class SyncTests(unittest.TestCase):
 
             with open_sqlite(db_path) as conn:
                 user = conn.execute(
-                    "SELECT slug, username, display_name FROM users WHERE username = 'Alice Smith'"
+                    "SELECT username, display_name FROM users WHERE username = 'alice-smith'"
                 ).fetchone()
                 session = conn.execute(
-                    "SELECT user_slug, visibility FROM sessions WHERE session_id = 'legacy-session'"
+                    "SELECT username, visibility FROM sessions WHERE session_id = 'legacy-session'"
                 ).fetchone()
 
             self.assertEqual(user[0], "alice-smith")
             self.assertEqual(user[1], "Alice Smith")
-            self.assertEqual(user[2], "Alice Smith")
             self.assertEqual(session[0], "alice-smith")
             self.assertEqual(session[1], "public")
 
@@ -861,6 +1081,11 @@ class SyncTests(unittest.TestCase):
             home = root / "home"
             shared = root / "shared"
             db_path = root / "logpile.db"
+            init_db(db_path)
+            with open_sqlite(db_path) as conn:
+                ensure_user(conn, "alice", display_name="Alice")
+                update_user(conn, "alice", default_session_visibility="public")
+                conn.commit()
 
             self._write_claude_session(home, session_id="session-1", message="first")
             sync_sessions(
@@ -891,6 +1116,104 @@ class SyncTests(unittest.TestCase):
 
             self.assertEqual((rows[0]["session_id"], rows[0]["visibility"]), ("session-1", "public"))
             self.assertEqual((rows[1]["session_id"], rows[1]["visibility"]), ("session-2", "unlisted"))
+
+
+# --- archive-integrity tests -------------------------------------------------
+# Imports are grouped here (not at top of file) so this block stays a single
+# self-contained appended hunk.
+import errno as _errno  # noqa: E402
+import fcntl as _fcntl  # noqa: E402
+import shutil as _shutil  # noqa: E402
+from unittest import mock as _mock  # noqa: E402
+
+from logpile import sync as _sync_module  # noqa: E402
+from logpile.sync import _copy_session  # noqa: E402
+
+
+class CopySessionAtomicityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.src = root / "src" / "session.jsonl"
+        self.src.parent.mkdir(parents=True)
+        self.src.write_text('{"a": 1}\n')
+        self.dst = root / "shared" / "session.jsonl"
+        self.dst.parent.mkdir(parents=True)
+
+    def _tmp_leftovers(self) -> list[Path]:
+        return list(self.dst.parent.glob("*.tmp-sync"))
+
+    def test_copies_new_file_and_leaves_no_temp(self) -> None:
+        self.assertTrue(_copy_session(self.src, self.dst))
+        self.assertEqual(self.dst.read_text(), self.src.read_text())
+        self.assertEqual(self._tmp_leftovers(), [])
+
+    def test_skips_identical_existing_copy(self) -> None:
+        _shutil.copy2(self.src, self.dst)
+        self.assertFalse(_copy_session(self.src, self.dst))
+
+    def test_replaces_stale_copy(self) -> None:
+        self.dst.write_text("stale\n")
+        self.assertTrue(_copy_session(self.src, self.dst))
+        self.assertEqual(self.dst.read_text(), self.src.read_text())
+        self.assertEqual(self._tmp_leftovers(), [])
+
+    def test_upgrades_enospc_symlink_to_real_copy(self) -> None:
+        self.dst.symlink_to(self.src)
+        self.assertTrue(_copy_session(self.src, self.dst))
+        self.assertFalse(self.dst.is_symlink())
+        self.assertEqual(self.dst.read_text(), self.src.read_text())
+
+    def test_generic_error_preserves_existing_copy_and_cleans_temp(self) -> None:
+        self.dst.write_text("previous complete copy\n")
+
+        def boom(src, dst):
+            Path(dst).write_text("partial")
+            raise OSError(_errno.EIO, "boom")
+
+        with _mock.patch.object(_sync_module.shutil, "copy2", side_effect=boom):
+            with self.assertRaises(OSError):
+                _copy_session(self.src, self.dst)
+        self.assertEqual(self.dst.read_text(), "previous complete copy\n")
+        self.assertEqual(self._tmp_leftovers(), [])
+
+    def test_enospc_keeps_existing_complete_copy_over_symlink(self) -> None:
+        self.dst.write_text("previous complete copy\n")
+
+        def full(src, dst):
+            raise OSError(_errno.ENOSPC, "disk full")
+
+        with _mock.patch.object(_sync_module.shutil, "copy2", side_effect=full):
+            self.assertFalse(_copy_session(self.src, self.dst))
+        self.assertFalse(self.dst.is_symlink())
+        self.assertEqual(self.dst.read_text(), "previous complete copy\n")
+
+    def test_enospc_without_existing_copy_falls_back_to_symlink(self) -> None:
+        def full(src, dst):
+            raise OSError(_errno.ENOSPC, "disk full")
+
+        with _mock.patch.object(_sync_module.shutil, "copy2", side_effect=full):
+            self.assertTrue(_copy_session(self.src, self.dst))
+        self.assertTrue(self.dst.is_symlink())
+        self.assertEqual(self.dst.resolve(), self.src.resolve())
+
+
+class SyncLockTests(unittest.TestCase):
+    def test_concurrent_sync_skips_instead_of_interleaving(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            db_path = root / "logpile.db"
+            shared = root / "shared"
+            lock_path = Path(f"{db_path}.sync.lock")
+            with open(lock_path, "w") as holder:
+                _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                result = sync_sessions(shared, db_path, "alice", "test-machine", home)
+            self.assertEqual(result, (0, 0, 0))
+            # Skipped before init_db: no database was created.
+            self.assertFalse(db_path.exists())
 
 
 if __name__ == "__main__":

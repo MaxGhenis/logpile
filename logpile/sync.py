@@ -1,20 +1,27 @@
 """Sync JSONL sessions to a shared directory and update the SQLite index."""
 import errno
+import fcntl
 import fnmatch
+import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .parsers import parse_claudecode_session, parse_codex_session, file_hash
+from .objectives import SESSION_OBJECTIVE_VERSION, derive_session_objective
+from .origins import SESSION_ORIGIN_VERSION, derive_session_origin
 from .db import (
     ensure_user,
+    get_user_by_identifier,
     get_db,
     init_db,
     insert_session_paths,
     insert_tool_calls,
+    normalize_username,
     resolve_session_visibility,
     upsert_session,
 )
@@ -22,6 +29,7 @@ from .db import (
 
 SESSION_ACTIVITY_VERSION = 1
 SESSION_NARRATIVE_VERSION = 1
+SESSION_TOKEN_VERSION = 3
 _TEST_PATTERNS = (
     re.compile(r"\b(pytest|py\.test|vitest|jest|nosetests|rspec)\b"),
     re.compile(r"\bpython(?:\d+(?:\.\d+)?)?\s+-m\s+(pytest|unittest)\b"),
@@ -52,26 +60,66 @@ _FORMAT_PATTERNS = (
     re.compile(r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?format\b"),
 )
 
+
+def _safe_expanduser(path: Path) -> Path:
+    try:
+        return path.expanduser()
+    except RuntimeError:
+        return path
+
+
+def _resolve_sync_username(conn, requested_username: str) -> str:
+    direct = get_user_by_identifier(conn, requested_username)
+    if direct:
+        return direct["username"]
+
+    normalized = normalize_username(requested_username)
+    direct = get_user_by_identifier(conn, normalized)
+    if direct:
+        return direct["username"]
+
+    rows = conn.execute("SELECT username FROM users ORDER BY updated_at DESC, username").fetchall()
+    if len(rows) == 1:
+        return rows[0]["username"]
+    return normalized
+
+
 def _copy_session(src: Path, dst: Path) -> bool:
-    """Copy a session file into the shared directory."""
-    if dst.is_symlink():
+    """Copy a session file into the shared directory.
+
+    Atomic: writes to a temp file beside dst, then os.replace()s it into
+    place, so the shared copy is always a complete file (old or new) even if
+    sync dies mid-copy. A symlink dst (from an earlier ENOSPC fallback) is
+    upgraded to a real copy once a copy succeeds, and an existing complete
+    copy is never removed in favor of a failed one.
+    """
+    was_symlink = dst.is_symlink()
+    if not was_symlink and dst.exists() and file_hash(dst) == file_hash(src):
+        return False
+    # Per-writer tmp name: reconcile_session_storage (publish/visibility paths)
+    # copies without holding the sync lock, so a shared tmp name would let one
+    # writer os.replace() another's half-written file into place.
+    tmp = dst.with_name(f"{dst.name}.{os.getpid()}.tmp-sync")
+    try:
+        shutil.copy2(src, tmp)
+        tmp.replace(dst)
+    except OSError as exc:
         try:
-            if dst.resolve() == src.resolve():
-                return False
+            tmp.unlink(missing_ok=True)
         except OSError:
             pass
-        dst.unlink()
-    elif dst.exists():
-        if file_hash(dst) == file_hash(src):
-            return False
-        dst.unlink()
-    try:
-        shutil.copy2(src, dst)
-    except OSError as exc:
-        if dst.exists() or dst.is_symlink():
-            dst.unlink()
         if exc.errno != errno.ENOSPC:
             raise
+        if was_symlink:
+            try:
+                if dst.resolve() == src.resolve():
+                    return False
+            except OSError:
+                pass
+        elif dst.exists():
+            return False
+        if dst.is_symlink():
+            dst.unlink()
         dst.symlink_to(src.resolve())
     return True
 
@@ -152,7 +200,7 @@ def reconcile_session_storage(
     shared_dir: Path,
     session_id: str | None = None,
     session_id_prefix: str | None = None,
-    user_slug: str | None = None,
+    username: str | None = None,
 ) -> int:
     clauses: list[str] = []
     params: list[str] = []
@@ -162,9 +210,9 @@ def reconcile_session_storage(
     if session_id_prefix:
         clauses.append("session_id LIKE ?")
         params.append(f"{session_id_prefix}%")
-    if user_slug:
-        clauses.append("user_slug = ?")
-        params.append(user_slug)
+    if username:
+        clauses.append("username = ?")
+        params.append(username)
     where = " AND ".join(clauses) if clauses else "1 = 1"
 
     rows = conn.execute(
@@ -296,7 +344,7 @@ def _resolve_repo_metadata(
         }
         return cache[key]
 
-    workspace = Path(key).expanduser()
+    workspace = _safe_expanduser(Path(key))
     if workspace.exists():
         try:
             workspace = workspace.resolve()
@@ -358,7 +406,7 @@ def _normalize_workspace_root(workspace_root: str | None) -> str | None:
     value = (workspace_root or "").strip()
     if not value or value == "unknown":
         return None
-    path = Path(value).expanduser()
+    path = _safe_expanduser(Path(value))
     if path.exists():
         try:
             path = path.resolve()
@@ -370,15 +418,20 @@ def _normalize_workspace_root(workspace_root: str | None) -> str | None:
 def _repo_relative_path(normalized_path: str | None, root: str | None) -> str | None:
     if not normalized_path or not root:
         return None
-    path = Path(normalized_path).expanduser()
-    root_path = Path(root).expanduser()
+    # A path captured from tool-call args can contain a null byte (or other
+    # garbage); such a string can't be a real repo-relative path, and
+    # Path.resolve() raises ValueError on it. Skip it rather than crash sync.
+    if "\x00" in normalized_path or "\x00" in root:
+        return None
+    path = _safe_expanduser(Path(normalized_path))
+    root_path = _safe_expanduser(Path(root))
     try:
         path = path.resolve(strict=False)
-    except OSError:
+    except (OSError, ValueError):
         pass
     try:
         root_path = root_path.resolve(strict=False)
-    except OSError:
+    except (OSError, ValueError):
         pass
     try:
         relative = str(path.relative_to(root_path))
@@ -649,20 +702,47 @@ def sync_sessions(
     """
     Discover, parse, and copy sessions.
     Returns (new, updated, skipped) counts.
+
+    Holds an exclusive lock for the duration: a concurrent sync (e.g. the
+    usage-tracker launchd job overlapping a manual run) returns (0, 0, 0)
+    instead of interleaving copies onto the same shared files.
     """
+    lock_path = Path(f"{db_path}.sync.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_file:
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Always audible: a silent (0, 0, 0) reads as "synced, all quiet"
+            # to humans and scripts checking the summary line.
+            print("Skipped: another logpile sync holds the lock.", file=sys.stderr)
+            return (0, 0, 0)
+        return _sync_sessions(shared_dir, db_path, username, machine, home, verbose)
+
+
+def _sync_sessions(
+    shared_dir: Path,
+    db_path: Path,
+    username: str,
+    machine: str,
+    home: Path,
+    verbose: bool = False,
+) -> tuple[int, int, int]:
+    """Locked body of sync_sessions."""
     init_db(db_path)
     patterns = load_ignore_patterns(home)
     now = datetime.now(timezone.utc).isoformat()
     new_count = updated_count = skipped_count = 0
 
     with get_db(db_path) as conn:
-        user_slug = ensure_user(conn, username, display_name=username)
+        canonical_username = _resolve_sync_username(conn, username)
+        canonical_username = ensure_user(conn, canonical_username, display_name=canonical_username)
         user_row = conn.execute(
-            "SELECT default_session_visibility FROM users WHERE slug = ?",
-            (user_slug,),
+            "SELECT default_session_visibility FROM users WHERE username = ?",
+            (canonical_username,),
         ).fetchone()
         default_visibility = (
-            user_row["default_session_visibility"] if user_row else "public"
+            user_row["default_session_visibility"] if user_row else "unlisted"
         )
         existing = {
             row["session_id"]: row
@@ -678,6 +758,11 @@ def sync_sessions(
                     narrative_version,
                     session_status,
                     session_summary,
+                    objective_family,
+                    objective_version,
+                    session_origin,
+                    origin_version,
+                    token_version,
                     workspace_root,
                     worktree_root,
                     repo_name,
@@ -723,6 +808,10 @@ def sync_sessions(
                         or (existing_row["narrative_version"] or 0) < SESSION_NARRATIVE_VERSION
                         or (existing_row["session_status"] or "") == ""
                         or (existing_row["session_summary"] or "") == ""
+                        or (existing_row["objective_version"] or 0) < SESSION_OBJECTIVE_VERSION
+                        or (existing_row["origin_version"] or 0) < SESSION_ORIGIN_VERSION
+                        or (existing_row["token_version"] or 0) < SESSION_TOKEN_VERSION
+                        or (existing_row["session_origin"] or "") == ""
                         or (
                             (existing_row["tool_call_count"] or 0) > 0
                             and not existing_row["path_count"]
@@ -734,7 +823,7 @@ def sync_sessions(
                     shared_path, storage_changed = _sync_shared_copy(
                         src=jsonl_path,
                         shared_dir=shared_dir,
-                        username=username,
+                        username=canonical_username,
                         source=existing_row["source"],
                         project=existing_row["project"] or project_from_claude_path(jsonl_path),
                         filename=jsonl_path.name,
@@ -782,9 +871,22 @@ def sync_sessions(
                     activity=activity,
                     session_paths=session_paths,
                 )
+                origin = derive_session_origin(
+                    source="claudecode",
+                    session_id=info.session_id,
+                    first_user_message=info.first_user_message,
+                    project=project,
+                    workspace_root=workspace_root,
+                    source_path=str(jsonl_path),
+                )
+                objective = derive_session_objective(
+                    narrative["session_goal"],
+                    info.first_user_message,
+                    narrative["session_summary"],
+                )
                 visibility = resolve_session_visibility(
                     conn,
-                    user_slug=user_slug,
+                    username=canonical_username,
                     source="claudecode",
                     default_visibility=default_visibility,
                     session_data={
@@ -793,14 +895,14 @@ def sync_sessions(
                         "first_user_message": info.first_user_message,
                         "model": info.model,
                         "machine": machine,
-                        "username": username,
+                        "username": canonical_username,
                     },
                 )
                 storage_visibility = _effective_storage_visibility(existing_row, visibility)
                 shared_path, _ = _sync_shared_copy(
                     src=jsonl_path,
                     shared_dir=shared_dir,
-                    username=username,
+                    username=canonical_username,
                     source="claudecode",
                     project=project,
                     filename=jsonl_path.name,
@@ -811,8 +913,7 @@ def sync_sessions(
                 upsert_session(conn, {
                     "session_id": info.session_id,
                     "source": "claudecode",
-                    "username": username,
-                    "user_slug": user_slug,
+                    "username": canonical_username,
                     "machine": machine,
                     "project": project,
                     "workspace_root": workspace_root,
@@ -833,7 +934,13 @@ def sync_sessions(
                     "error_count": info.error_count,
                     "total_input_tokens": info.total_input_tokens,
                     "total_output_tokens": info.total_output_tokens,
+                    "fresh_input_tokens": info.fresh_input_tokens,
+                    "cached_input_tokens": info.cached_input_tokens,
+                    "reasoning_output_tokens": info.reasoning_output_tokens,
+                    "token_version": SESSION_TOKEN_VERSION,
                     "first_user_message": info.first_user_message,
+                    "parent_session_id": info.parent_session_id,
+                    "spawn_depth": info.spawn_depth,
                     "visibility": visibility["visibility"],
                     "visibility_source": visibility["visibility_source"],
                     "visibility_rule_id": visibility["visibility_rule_id"],
@@ -844,6 +951,8 @@ def sync_sessions(
                     "model": info.model,
                     **activity,
                     **narrative,
+                    **objective,
+                    **origin,
                 })
                 insert_tool_calls(conn, info.session_id, info.tool_calls)
                 insert_session_paths(conn, info.session_id, session_paths)
@@ -878,6 +987,10 @@ def sync_sessions(
                         or (existing_row["narrative_version"] or 0) < SESSION_NARRATIVE_VERSION
                         or (existing_row["session_status"] or "") == ""
                         or (existing_row["session_summary"] or "") == ""
+                        or (existing_row["objective_version"] or 0) < SESSION_OBJECTIVE_VERSION
+                        or (existing_row["origin_version"] or 0) < SESSION_ORIGIN_VERSION
+                        or (existing_row["token_version"] or 0) < SESSION_TOKEN_VERSION
+                        or (existing_row["session_origin"] or "") == ""
                         or (
                             (existing_row["tool_call_count"] or 0) > 0
                             and not existing_row["path_count"]
@@ -889,7 +1002,7 @@ def sync_sessions(
                     shared_path, storage_changed = _sync_shared_copy(
                         src=jsonl_path,
                         shared_dir=shared_dir,
-                        username=username,
+                        username=canonical_username,
                         source=existing_row["source"],
                         project=existing_row["project"] or "unknown",
                         filename=jsonl_path.name,
@@ -938,9 +1051,22 @@ def sync_sessions(
                     activity=activity,
                     session_paths=session_paths,
                 )
+                origin = derive_session_origin(
+                    source="codex",
+                    session_id=session_id,
+                    first_user_message=info.first_user_message,
+                    project=project,
+                    workspace_root=workspace_root,
+                    source_path=str(jsonl_path),
+                )
+                objective = derive_session_objective(
+                    narrative["session_goal"],
+                    info.first_user_message,
+                    narrative["session_summary"],
+                )
                 visibility = resolve_session_visibility(
                     conn,
-                    user_slug=user_slug,
+                    username=canonical_username,
                     source="codex",
                     default_visibility=default_visibility,
                     session_data={
@@ -949,14 +1075,14 @@ def sync_sessions(
                         "first_user_message": info.first_user_message,
                         "model": info.model,
                         "machine": machine,
-                        "username": username,
+                        "username": canonical_username,
                     },
                 )
                 storage_visibility = _effective_storage_visibility(existing_row, visibility)
                 shared_path, _ = _sync_shared_copy(
                     src=jsonl_path,
                     shared_dir=shared_dir,
-                    username=username,
+                    username=canonical_username,
                     source="codex",
                     project=project,
                     filename=jsonl_path.name,
@@ -968,8 +1094,7 @@ def sync_sessions(
                 upsert_session(conn, {
                     "session_id": session_id,
                     "source": "codex",
-                    "username": username,
-                    "user_slug": user_slug,
+                    "username": canonical_username,
                     "machine": machine,
                     "project": project,
                     "workspace_root": workspace_root,
@@ -988,9 +1113,15 @@ def sync_sessions(
                     "assistant_message_count": info.assistant_message_count,
                     "tool_call_count": info.tool_call_count,
                     "error_count": info.error_count,
-                    "total_input_tokens": 0,
-                    "total_output_tokens": 0,
+                    "total_input_tokens": info.total_input_tokens,
+                    "total_output_tokens": info.total_output_tokens,
+                    "fresh_input_tokens": info.fresh_input_tokens,
+                    "cached_input_tokens": info.cached_input_tokens,
+                    "reasoning_output_tokens": info.reasoning_output_tokens,
+                    "token_version": SESSION_TOKEN_VERSION,
                     "first_user_message": info.first_user_message,
+                    "parent_session_id": info.parent_session_id,
+                    "spawn_depth": info.spawn_depth,
                     "visibility": visibility["visibility"],
                     "visibility_source": visibility["visibility_source"],
                     "visibility_rule_id": visibility["visibility_rule_id"],
@@ -1001,6 +1132,8 @@ def sync_sessions(
                     "model": info.model,
                     **activity,
                     **narrative,
+                    **objective,
+                    **origin,
                 })
                 insert_tool_calls(conn, session_id, info.tool_calls)
                 insert_session_paths(conn, session_id, session_paths)

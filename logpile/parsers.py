@@ -46,9 +46,14 @@ class SessionInfo:
     error_count: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    fresh_input_tokens: int = 0
+    cached_input_tokens: int = 0
+    reasoning_output_tokens: int = 0
     first_user_message: str = ""
     model: Optional[str] = None
     workspace_root: Optional[str] = None
+    parent_session_id: Optional[str] = None
+    spawn_depth: int = 0
     tool_calls: list = field(default_factory=list)
     session_paths: list = field(default_factory=list)
 
@@ -166,6 +171,24 @@ def _load_tool_args(arguments: Any) -> dict:
     except json.JSONDecodeError:
         return {}
     return loaded if isinstance(loaded, dict) else {}
+
+
+def _extract_codex_token_totals(record_type: str, payload: dict) -> tuple[int, int, int, int] | None:
+    if record_type != "event_msg":
+        return None
+    if payload.get("type") != "token_count":
+        return None
+    info = payload.get("info", {})
+    if not isinstance(info, dict):
+        return None
+    totals = info.get("total_token_usage", {})
+    if not isinstance(totals, dict):
+        return None
+    input_tokens = int(totals.get("input_tokens", 0) or 0)
+    cached_input_tokens = int(totals.get("cached_input_tokens", 0) or 0)
+    output_tokens = int(totals.get("output_tokens", 0) or 0)
+    reasoning_output_tokens = int(totals.get("reasoning_output_tokens", 0) or 0)
+    return input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens
 
 
 def _extract_command(arguments: dict) -> Optional[str]:
@@ -318,13 +341,20 @@ def _display_path(path: Path) -> str:
     return str(path)
 
 
+def _safe_expanduser(path: Path) -> Path:
+    try:
+        return path.expanduser()
+    except RuntimeError:
+        return path
+
+
 def _normalize_session_path(candidate: str, workspace_root: str | None) -> tuple[str, str | None, str] | None:
     raw_path = _clean_path_candidate(candidate)
     if not _looks_like_path(raw_path):
         return None
 
-    root = Path(workspace_root).expanduser() if workspace_root and workspace_root != "unknown" else None
-    path = Path(raw_path).expanduser()
+    root = _safe_expanduser(Path(workspace_root)) if workspace_root and workspace_root != "unknown" else None
+    path = _safe_expanduser(Path(raw_path))
     if not path.is_absolute() and root is not None:
         path = root / raw_path
 
@@ -468,7 +498,7 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
     workspace_root = project
 
     # Deduplicate assistant messages by message.id, keep last (highest tokens)
-    seen_msg: dict = {}  # message_id -> {"input": int, "output": int, "model": str}
+    seen_msg: dict = {}  # message_id -> {"fresh_input": int, "cached_input": int, "output": int, "model": str}
     first_timestamp = None
     last_timestamp = None
     user_message_count = 0
@@ -477,6 +507,8 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
     first_user_message = ""
     error_count = 0
     model = None
+    parent_session_id = None
+    spawn_depth = 0
 
     for r in records:
         rtype = r.get("type", "")
@@ -518,14 +550,20 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
             msg = r.get("message", {})
             msg_id = msg.get("id")
             usage = msg.get("usage", {})
-            inp = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
+            fresh_inp = int(usage.get("input_tokens", 0) or 0)
+            cached_inp = int(usage.get("cache_read_input_tokens", 0) or 0)
             out = usage.get("output_tokens", 0)
             mdl = msg.get("model")
 
             if msg_id:
                 prev = seen_msg.get(msg_id)
                 if prev is None or out > prev["output"]:
-                    seen_msg[msg_id] = {"input": inp, "output": out, "model": mdl}
+                    seen_msg[msg_id] = {
+                        "fresh_input": fresh_inp,
+                        "cached_input": cached_inp,
+                        "output": out,
+                        "model": mdl,
+                    }
                 if mdl and not model:
                     model = mdl
 
@@ -559,7 +597,9 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
                             tool_call_index_by_id[tool_use_id] = len(tool_calls) - 1
 
     assistant_message_count = len(seen_msg)
-    total_input = sum(v["input"] for v in seen_msg.values())
+    fresh_input = sum(v["fresh_input"] for v in seen_msg.values())
+    cached_input = sum(v["cached_input"] for v in seen_msg.values())
+    total_input = fresh_input + cached_input
     total_output = sum(v["output"] for v in seen_msg.values())
 
     return SessionInfo(
@@ -574,9 +614,13 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
         error_count=error_count,
         total_input_tokens=total_input,
         total_output_tokens=total_output,
+        fresh_input_tokens=fresh_input,
+        cached_input_tokens=cached_input,
         first_user_message=first_user_message,
         model=model,
         workspace_root=workspace_root,
+        parent_session_id=parent_session_id,
+        spawn_depth=spawn_depth,
         tool_calls=tool_calls,
         session_paths=_build_session_paths(tool_calls, workspace_root),
     )
@@ -596,12 +640,22 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo]:
     project = _extract_codex_project(records)
     workspace_root = project
     model = None
+    parent_session_id = None
+    spawn_depth = 0
 
     for record in records:
         record_type, payload, timestamp = _normalize_codex_record(record)
         if record_type == "session_meta":
             session_id = payload.get("id") or session_id
             first_timestamp = payload.get("timestamp") or timestamp or first_timestamp
+            source = payload.get("source")
+            if isinstance(source, dict):
+                subagent = source.get("subagent", {})
+                if isinstance(subagent, dict):
+                    thread_spawn = subagent.get("thread_spawn", {})
+                    if isinstance(thread_spawn, dict):
+                        parent_session_id = thread_spawn.get("parent_thread_id")
+                        spawn_depth = int(thread_spawn.get("depth", 0) or 0)
         elif record_type == "turn_context" and payload.get("model") and not model:
             model = payload["model"]
 
@@ -612,6 +666,11 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo]:
     first_user_message = ""
     error_count = 0
     last_timestamp = first_timestamp
+    total_input_tokens = 0
+    total_output_tokens = 0
+    fresh_input_tokens = 0
+    cached_input_tokens = 0
+    reasoning_output_tokens = 0
 
     for record in records:
         record_type, payload, timestamp = _normalize_codex_record(record)
@@ -619,6 +678,19 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo]:
             if not first_timestamp:
                 first_timestamp = timestamp
             last_timestamp = timestamp
+
+        token_totals = _extract_codex_token_totals(record_type, payload)
+        if token_totals is not None:
+            input_tokens, cached_tokens, output_tokens, reasoning_tokens = token_totals
+            # Codex reports cumulative usage where input_tokens ALREADY includes
+            # the cached (inherited) portion and total = input + output. So the
+            # uncached/fresh input is input - cached, and total input is
+            # input_tokens itself — adding cached again would double-count it.
+            fresh_input_tokens = max(fresh_input_tokens, max(0, input_tokens - cached_tokens))
+            cached_input_tokens = max(cached_input_tokens, cached_tokens)
+            total_input_tokens = max(total_input_tokens, input_tokens)
+            total_output_tokens = max(total_output_tokens, output_tokens)
+            reasoning_output_tokens = max(reasoning_output_tokens, reasoning_tokens)
 
         if record_type == "message":
             role = payload.get("role", "")
@@ -673,11 +745,16 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo]:
         assistant_message_count=assistant_message_count,
         tool_call_count=len(tool_calls),
         error_count=error_count,
-        total_input_tokens=0,
-        total_output_tokens=0,
+        total_input_tokens=total_input_tokens,
+        total_output_tokens=total_output_tokens,
+        fresh_input_tokens=fresh_input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        reasoning_output_tokens=reasoning_output_tokens,
         first_user_message=first_user_message,
         model=model,
         workspace_root=workspace_root,
+        parent_session_id=parent_session_id,
+        spawn_depth=spawn_depth,
         tool_calls=tool_calls,
         session_paths=_build_session_paths(tool_calls, workspace_root),
     )

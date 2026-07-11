@@ -1,7 +1,6 @@
 /* ── Database row types (match SQLite schema from db.py) ─────────── */
 
 export interface User {
-  slug: string;
   username: string;
   display_name: string | null;
   bio: string | null;
@@ -16,7 +15,6 @@ export interface Session {
   session_id: string;
   source: "claudecode" | "codex";
   username: string;
-  user_slug: string | null;
   machine: string | null;
   project: string | null;
   /* repo metadata */
@@ -58,6 +56,9 @@ export interface Session {
   session_summary: string | null;
   session_outcome: string | null;
   session_status: "exploration" | "success" | "partial" | "failed" | null;
+  objective_family: string | null;
+  objective_label: string | null;
+  session_origin: "human_direct" | "human_delegated" | "system_generated" | "pipeline_eval" | "meta_scaffolding" | null;
   /* tokens */
   total_input_tokens: number;
   total_output_tokens: number;
@@ -97,7 +98,6 @@ export interface SessionRow extends Session {
 }
 
 export interface UserListRow {
-  slug: string;
   username: string;
   display_name: string;
   bio: string | null;
@@ -143,6 +143,74 @@ export interface RepoRow {
   last_seen: string | null;
 }
 
+export interface RunawaySessionRow {
+  session_id: string;
+  source: "claudecode" | "codex";
+  username: string;
+  user_display_name: string;
+  project: string | null;
+  repo_name: string | null;
+  session_status: SessionStatus | null;
+  session_summary: string | null;
+  first_timestamp: string | null;
+  duration_seconds: number | null;
+  tool_call_count: number;
+  error_count: number;
+}
+
+export interface ObjectiveRelaunchRow {
+  objective_key: string;
+  display_label: string;
+  launches: number;
+  operator_count: number;
+  total_tool_calls: number;
+  total_errors: number;
+  latest_timestamp: string | null;
+  latest_status: SessionStatus | null;
+  latest_session_id: string;
+  latest_repo_name: string | null;
+  latest_summary: string | null;
+}
+
+export interface ContextExplosionChildRow {
+  session_id: string;
+  agent_name: string | null;
+  agent_role: string | null;
+  total_tokens: number;
+  total_input_tokens: number;
+  cached_input_tokens: number;
+  total_output_tokens: number;
+  tool_call_count: number;
+  error_count: number;
+  spawn_depth: number;
+  first_timestamp: string | null;
+  is_root: boolean;
+}
+
+export interface ContextExplosionWorkstreamRow {
+  root_session_id: string;
+  username: string;
+  user_display_name: string;
+  repo_name: string | null;
+  project: string | null;
+  display_label: string;
+  root_summary: string | null;
+  root_first_timestamp: string | null;
+  total_tokens: number;
+  total_input_tokens: number;
+  fresh_input_tokens: number;
+  cached_input_tokens: number;
+  total_output_tokens: number;
+  session_count: number;
+  child_session_count: number;
+  max_spawn_depth: number;
+  top_child_tokens: number;
+  child_token_share: number;
+  cached_input_share: number;
+  warnings: string[];
+  top_children: ContextExplosionChildRow[];
+}
+
 export interface ChartDataset {
   label: string;
   data: number[];
@@ -177,9 +245,23 @@ export type ActivityFilter = typeof ACTIVITY_FILTERS[number];
 /* ── Session status ──────────────────────────────────────────────── */
 
 export type SessionStatus = "exploration" | "success" | "partial" | "failed";
+export type SessionOrigin =
+  | "human_direct"
+  | "human_delegated"
+  | "system_generated"
+  | "pipeline_eval"
+  | "meta_scaffolding";
 
 export const SESSION_STATUSES: SessionStatus[] = [
   "exploration", "success", "partial", "failed",
+];
+
+export const SESSION_ORIGINS: SessionOrigin[] = [
+  "human_direct",
+  "human_delegated",
+  "pipeline_eval",
+  "meta_scaffolding",
+  "system_generated",
 ];
 
 /* ── Publish types ───────────────────────────────────────────────── */
@@ -188,8 +270,8 @@ export interface PublishCandidate {
   session_id: string;
   source: string;
   username: string;
-  user_slug: string | null;
   display_name: string;
+  session_origin?: SessionOrigin | null;
   project: string | null;
   repo_name: string | null;
   visibility: "private" | "unlisted" | "public";
@@ -201,6 +283,7 @@ export interface PublishCandidate {
   session_outcome: string | null;
   review_recommendation?: "private" | "unlisted" | "public";
   review_rationale?: string;
+  needs_visibility_change?: boolean;
   finding_count: number;
   high_findings: number;
   medium_findings: number;
@@ -232,6 +315,7 @@ export interface PublishQueueResponse {
   limit: number;
   visibility: string;
   status: string | null;
+  origin?: SessionOrigin | null;
   reviews: boolean;
   candidates: PublishCandidate[];
 }

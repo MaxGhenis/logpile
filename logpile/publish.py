@@ -45,8 +45,8 @@ class PublishCandidate:
     session_id: str
     source: str
     username: str
-    user_slug: str | None
     display_name: str
+    session_origin: str | None
     project: str | None
     repo_name: str | None
     visibility: str
@@ -122,6 +122,14 @@ _PATTERN_RULES = (
 _VISIBILITY_ORDER = {"private": 0, "unlisted": 1, "public": 2}
 
 
+def _needs_visibility_tightening(current_visibility: str, recommendation: str | None) -> bool:
+    if recommendation not in _VISIBILITY_ORDER:
+        return False
+    current_rank = _VISIBILITY_ORDER.get(current_visibility, max(_VISIBILITY_ORDER.values()))
+    recommended_rank = _VISIBILITY_ORDER[recommendation]
+    return recommended_rank < current_rank
+
+
 def _clip(value: str, limit: int = 180) -> str:
     text = " ".join((value or "").split())
     return text if len(text) <= limit else f"{text[: limit - 1]}…"
@@ -147,11 +155,11 @@ def _load_session_row(conn: sqlite3.Connection, session_id_prefix: str):
         """
         SELECT
             s.*,
-            COALESCE(u.default_session_visibility, 'public') AS default_session_visibility,
+            COALESCE(u.default_session_visibility, 'unlisted') AS default_session_visibility,
             COALESCE(u.profile_visibility, 'public') AS user_profile_visibility,
             COALESCE(u.display_name, u.username, s.username) AS display_name
         FROM sessions s
-        LEFT JOIN users u ON u.slug = s.user_slug
+        LEFT JOIN users u ON u.username = s.username
         WHERE s.session_id = ?
         LIMIT 1
         """,
@@ -164,11 +172,11 @@ def _load_session_row(conn: sqlite3.Connection, session_id_prefix: str):
         """
         SELECT
             s.*,
-            COALESCE(u.default_session_visibility, 'public') AS default_session_visibility,
+            COALESCE(u.default_session_visibility, 'unlisted') AS default_session_visibility,
             COALESCE(u.profile_visibility, 'public') AS user_profile_visibility,
             COALESCE(u.display_name, u.username, s.username) AS display_name
         FROM sessions s
-        LEFT JOIN users u ON u.slug = s.user_slug
+        LEFT JOIN users u ON u.username = s.username
         WHERE s.session_id LIKE ?
         ORDER BY LENGTH(s.session_id), s.session_id
         LIMIT 2
@@ -309,7 +317,6 @@ def review_publish_session(
         metadata={
             "display_name": row["display_name"],
             "username": row["username"],
-            "user_slug": row["user_slug"],
             "default_session_visibility": row["default_session_visibility"],
             "user_profile_visibility": row["user_profile_visibility"],
             "project": row["project"],
@@ -378,6 +385,7 @@ def list_publish_candidates(
     user_identifier: str | None = None,
     visibility: str = "pending",
     status: str | None = None,
+    origin: str | None = None,
     limit: int = 25,
     include_reviews: bool = False,
 ) -> list[PublishCandidate]:
@@ -385,16 +393,18 @@ def list_publish_candidates(
         user_identifier=user_identifier,
         visibility=visibility,
         status=status,
+        origin=origin,
     )
+    normalized_visibility = (visibility or "pending").strip().lower()
+    fetch_limit = None if normalized_visibility == "needs_changes" else max(1, min(limit, 200))
 
-    rows = conn.execute(
-        f"""
+    query = f"""
         SELECT
             s.session_id,
             s.source,
             s.username,
-            s.user_slug,
             COALESCE(u.display_name, s.username) AS display_name,
+            s.session_origin,
             s.project,
             s.repo_name,
             s.visibility,
@@ -405,16 +415,18 @@ def list_publish_candidates(
             s.session_summary,
             s.session_outcome
         FROM sessions s
-        LEFT JOIN users u ON u.slug = s.user_slug
+        LEFT JOIN users u ON u.username = s.username
         WHERE {where_sql}
         ORDER BY
             CASE s.visibility WHEN 'unlisted' THEN 0 WHEN 'private' THEN 1 ELSE 2 END,
             s.first_timestamp DESC,
             s.session_id DESC
-        LIMIT ?
-        """,
-        params + [max(1, min(limit, 200))],
-    ).fetchall()
+    """
+    if fetch_limit is not None:
+        query += "\n        LIMIT ?"
+        rows = conn.execute(query, params + [fetch_limit]).fetchall()
+    else:
+        rows = conn.execute(query, params).fetchall()
 
     candidates: list[PublishCandidate] = []
     for row in rows:
@@ -422,8 +434,8 @@ def list_publish_candidates(
             session_id=row["session_id"],
             source=row["source"],
             username=row["username"],
-            user_slug=row["user_slug"],
             display_name=row["display_name"],
+            session_origin=row["session_origin"],
             project=row["project"],
             repo_name=row["repo_name"],
             visibility=row["visibility"],
@@ -434,7 +446,7 @@ def list_publish_candidates(
             session_summary=row["session_summary"],
             session_outcome=row["session_outcome"],
         )
-        if include_reviews:
+        if include_reviews or normalized_visibility == "needs_changes":
             review = review_publish_session(conn, candidate.session_id)
             if review:
                 candidate.review_recommendation = review.recommendation
@@ -442,7 +454,16 @@ def list_publish_candidates(
                 candidate.finding_count = len(review.findings)
                 candidate.high_findings = sum(1 for finding in review.findings if finding.severity == "high")
                 candidate.medium_findings = sum(1 for finding in review.findings if finding.severity == "medium")
+                if normalized_visibility == "needs_changes" and not _needs_visibility_tightening(
+                    candidate.visibility,
+                    review.recommendation,
+                ):
+                    continue
+        elif normalized_visibility == "needs_changes":
+            continue
         candidates.append(candidate)
+        if normalized_visibility == "needs_changes" and len(candidates) >= max(1, min(limit, 200)):
+            break
     return candidates
 
 
@@ -452,12 +473,34 @@ def count_publish_candidates(
     user_identifier: str | None = None,
     visibility: str = "pending",
     status: str | None = None,
+    origin: str | None = None,
 ) -> int:
     where_sql, params = _publish_queue_filter_sql(
         user_identifier=user_identifier,
         visibility=visibility,
         status=status,
+        origin=origin,
     )
+    normalized_visibility = (visibility or "pending").strip().lower()
+    if normalized_visibility == "needs_changes":
+        rows = conn.execute(
+            f"""
+            SELECT session_id, visibility
+            FROM sessions s
+            WHERE {where_sql}
+            ORDER BY
+                CASE s.visibility WHEN 'unlisted' THEN 0 WHEN 'private' THEN 1 ELSE 2 END,
+                s.first_timestamp DESC,
+                s.session_id DESC
+            """,
+            params,
+        ).fetchall()
+        count = 0
+        for row in rows:
+            review = review_publish_session(conn, row["session_id"])
+            if review and _needs_visibility_tightening(row["visibility"], review.recommendation):
+                count += 1
+        return count
     row = conn.execute(
         f"SELECT COUNT(*) AS count FROM sessions s WHERE {where_sql}",
         params,
@@ -470,17 +513,20 @@ def _publish_queue_filter_sql(
     user_identifier: str | None = None,
     visibility: str = "pending",
     status: str | None = None,
+    origin: str | None = None,
 ) -> tuple[str, list[object]]:
     clauses = ["1 = 1"]
     params: list[object] = []
 
     if user_identifier:
-        clauses.append("(s.user_slug = ? OR s.username = ?)")
-        params.extend([user_identifier, user_identifier])
+        clauses.append("s.username = ?")
+        params.append(user_identifier)
 
     normalized_visibility = (visibility or "pending").strip().lower()
     if normalized_visibility == "pending":
         clauses.append("s.visibility IN ('private', 'unlisted')")
+    elif normalized_visibility == "needs_changes":
+        clauses.append("s.visibility IN ('public', 'unlisted')")
     elif normalized_visibility in {"private", "unlisted", "public"}:
         clauses.append("s.visibility = ?")
         params.append(normalized_visibility)
@@ -494,6 +540,19 @@ def _publish_queue_filter_sql(
         clauses.append("COALESCE(s.session_status, 'exploration') = ?")
         params.append(normalized_status)
 
+    normalized_origin = (origin or "").strip().lower()
+    if normalized_origin:
+        if normalized_origin not in {
+            "human_direct",
+            "human_delegated",
+            "system_generated",
+            "pipeline_eval",
+            "meta_scaffolding",
+        }:
+            raise ValueError(f"Unsupported publish queue origin filter: {origin}")
+        clauses.append("COALESCE(s.session_origin, 'human_direct') = ?")
+        params.append(normalized_origin)
+
     return " AND ".join(clauses), params
 
 
@@ -502,8 +561,8 @@ def serialize_publish_candidate(candidate: PublishCandidate) -> dict:
         "session_id": candidate.session_id,
         "source": candidate.source,
         "username": candidate.username,
-        "user_slug": candidate.user_slug,
         "display_name": candidate.display_name,
+        "session_origin": candidate.session_origin,
         "project": candidate.project,
         "repo_name": candidate.repo_name,
         "visibility": candidate.visibility,
@@ -515,6 +574,10 @@ def serialize_publish_candidate(candidate: PublishCandidate) -> dict:
         "session_outcome": candidate.session_outcome,
         "review_recommendation": candidate.review_recommendation,
         "review_rationale": candidate.review_rationale,
+        "needs_visibility_change": _needs_visibility_tightening(
+            candidate.visibility,
+            candidate.review_recommendation,
+        ),
         "finding_count": candidate.finding_count,
         "high_findings": candidate.high_findings,
         "medium_findings": candidate.medium_findings,
@@ -534,7 +597,6 @@ def format_publish_review(review: PublishReview) -> list[str]:
     metadata_order = (
         "display_name",
         "username",
-        "user_slug",
         "project",
         "repo_name",
         "git_branch",

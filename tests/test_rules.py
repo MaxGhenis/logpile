@@ -425,7 +425,7 @@ class SessionRuleTests(unittest.TestCase):
                     """
                 ).fetchone()
 
-            self.assertEqual(row["visibility"], "public")
+            self.assertEqual(row["visibility"], "unlisted")
             self.assertEqual(row["visibility_source"], "default")
             self.assertEqual(row["shared_path"], str(copied_path))
 

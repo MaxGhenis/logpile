@@ -5,8 +5,17 @@ const PALETTE = [
   "#a78bfa", "#fb923c", "#22d3ee", "#f472b6",
 ];
 
-export async function GET() {
-  const rows = getMessagesPerDay(30);
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url);
+  let rows;
+  try {
+    rows = getMessagesPerDay(30, searchParams.get("origin") ?? undefined);
+  } catch (error) {
+    if (error instanceof RangeError) {
+      return Response.json({ error: error.message }, { status: 400 });
+    }
+    throw error;
+  }
   const daysSet = [...new Set(rows.map((r) => r.day))].sort();
   const displayCounts = new Map<string, number>();
   for (const row of rows) {

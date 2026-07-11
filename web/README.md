@@ -1,44 +1,38 @@
 # Logpile Web
 
-This is the Next.js product surface for Logpile.
+Next.js 16 + Tailwind 4 + better-sqlite3. This is the product surface for Logpile, not a standalone app — it reads the sibling SQLite database populated by the Python `logpile sync` CLI.
 
-It is not a standalone app. By default it reads the SQLite database and shared
-session directory from the parent checkout:
+## Running
 
-- `../logpile.db`
-- `../shared/`
-
-Override those paths with:
-
-- `LOGPILE_DB_PATH`
-- `LOGPILE_SHARED_DIR`
-- `LOGPILE_PYTHON_BIN`
-- `LOGPILE_PUBLIC_MODE=true`
-
-## Local development
-
-From the product root:
+The canonical way is from the product root, which handles the `bun install` bootstrap and env-var wiring:
 
 ```bash
-logpile serve --dev
+logpile serve             # production build, port 5002
+logpile serve --dev       # Next.js dev server with HMR
+logpile serve --public    # public read-only mode
 ```
 
-Or run the app directly:
+Direct `bun dev` works too if the env vars are set:
 
 ```bash
-cd web
+LOGPILE_DB_PATH=../logpile.db \
+LOGPILE_SHARED_DIR=../shared \
 bun dev
 ```
 
+## Env vars
+
+| Var | Default | Purpose |
+|---|---|---|
+| `LOGPILE_DB_PATH` | `../logpile.db` | SQLite database path |
+| `LOGPILE_SHARED_DIR` | `../shared` | Shared JSONL transcripts directory |
+| `LOGPILE_PUBLIC_MODE` | `false` | `true` enables hosted read-only mode |
+| `LOGPILE_PYTHON_BIN` | auto-detect from `../.venv` | Python used for publish review scanning |
+
 ## Scope
 
-The Next app owns the main product UI:
+This app owns dashboard, sessions, repos, people, profiles, publish queue, and review UX. The Python package (`../logpile/`) owns ingestion, parsing, deterministic enrichment, visibility rules, and the publish-review secret/PII scanner.
 
-- dashboard
-- sessions
-- repos
-- people and profiles
-- publish queue and review UX
+## This is NOT the Next.js you know
 
-The Python package still owns ingestion, parsing, sync, deterministic
-enrichment, redaction, and publish review logic.
+Next 16 has breaking changes from earlier versions. When writing code here, consult `node_modules/next/dist/docs/` rather than older training data. See `AGENTS.md`.

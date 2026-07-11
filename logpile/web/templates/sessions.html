@@ -4,6 +4,12 @@
 
 {% block content %}
 <form method="get" action="{{ url_for('sessions') }}" class="filter-bar" style="margin-bottom:20px;">
+  {% if objective_filter %}
+  <input type="hidden" name="objective" value="{{ objective_filter }}">
+  {% endif %}
+  {% if objective_label %}
+  <input type="hidden" name="objectiveLabel" value="{{ objective_label }}">
+  {% endif %}
   <input type="text" name="q" value="{{ q }}" placeholder="Search first message..." class="filter-input">
   <select name="source" class="filter-select">
     <option value="">All tools</option>
@@ -13,18 +19,40 @@
   <select name="user" class="filter-select">
     <option value="">All operators</option>
     {% for u in users %}
-    <option value="{{ u.slug }}" {% if username == u.slug %}selected{% endif %}>{{ u.display_name }}</option>
+    <option value="{{ u.username }}" {% if username == u.username %}selected{% endif %}>{{ u.display_name }}</option>
     {% endfor %}
   </select>
+  <select name="origin" class="filter-select">
+    <option value="">All origins</option>
+    <option value="human_direct" {% if origin == 'human_direct' %}selected{% endif %}>Human direct</option>
+    <option value="human_delegated" {% if origin == 'human_delegated' %}selected{% endif %}>Human delegated</option>
+    <option value="pipeline_eval" {% if origin == 'pipeline_eval' %}selected{% endif %}>Pipeline eval</option>
+    <option value="meta_scaffolding" {% if origin == 'meta_scaffolding' %}selected{% endif %}>Meta scaffolding</option>
+    <option value="system_generated" {% if origin == 'system_generated' %}selected{% endif %}>System generated</option>
+  </select>
   <button type="submit" class="filter-btn">Filter</button>
-  {% if q or source or username %}
+  {% if q or source or username or origin or objective_filter %}
   <a href="{{ url_for('sessions') }}" class="filter-clear">Clear</a>
   {% endif %}
 </form>
 
+{% if objective_filter %}
+<div class="card-section" style="margin-bottom:16px; padding:12px 14px; display:flex; justify-content:space-between; gap:10px; align-items:center; flex-wrap:wrap;">
+  <div>
+    <div class="section-title" style="margin-bottom:4px;">Objective family</div>
+    <div style="color:#a8a29e; font-size:0.9rem;">{{ objective_label or objective_filter }}</div>
+  </div>
+  <a href="{{ url_for('sessions', q=q, source=source, user=username, project=project, repo=repo, branch=branch, activity=activity, status=status_filter, origin=origin, path=path_query, page=1) }}" class="ghost-link">Clear objective filter</a>
+</div>
+{% endif %}
+
 <div class="result-count" style="margin-bottom:14px;">
   {% if invalid_activity %}
   Invalid activity filter
+  {% elif invalid_origin %}
+  Invalid origin filter
+  {% elif invalid_objective %}
+  Invalid objective filter
   {% else %}
   {{ "{:,}".format(total) }} session{{ 's' if total != 1 }}
   {% endif %}
@@ -33,6 +61,16 @@
 {% if invalid_activity %}
 <div class="empty-cell" style="margin-bottom:16px; text-align:left;">
   Unknown activity filter: <code>{{ activity }}</code>. Clear the filter or pick a supported activity.
+</div>
+{% endif %}
+{% if invalid_origin %}
+<div class="empty-cell" style="margin-bottom:16px; text-align:left;">
+  Unknown origin filter: <code>{{ origin }}</code>. Clear the filter or pick a supported origin.
+</div>
+{% endif %}
+{% if invalid_objective %}
+<div class="empty-cell" style="margin-bottom:16px; text-align:left;">
+  Unknown objective filter: <code>{{ objective_filter }}</code>. Clear the filter or reopen the drill-down from analysis.
 </div>
 {% endif %}
 
@@ -56,7 +94,7 @@
     {% for r in rows %}
     <tr>
       <td class="ts">{{ fmt_ts(r.first_timestamp) }}</td>
-      <td><a href="{{ url_for('user_profile', slug=r.user_slug or r.username) }}" class="badge-user-link"><span class="badge-user">{{ r.user_display_name }}</span></a></td>
+      <td><a href="{{ url_for('user_profile', username=r.username) }}" class="badge-user-link"><span class="badge-user">{{ r.user_display_name }}</span></a></td>
       <td><span class="badge-source badge-source-{{ r.source }}">{{ 'CC' if r.source == 'claudecode' else 'Codex' }}</span></td>
       <td class="project-cell">{{ display_project(r.project) | truncate(25, True, '\u2026') }}</td>
       <td class="mono">{{ fmt_dur(r.duration_seconds) }}</td>
@@ -72,8 +110,8 @@
     {% else %}
     <tr>
       <td colspan="9" class="empty-cell">
-        {% if invalid_activity %}
-        Select a valid activity filter to load sessions.
+        {% if invalid_activity or invalid_origin or invalid_objective %}
+        Select valid filters to load sessions.
         {% else %}
         No sessions match your filters.
         {% endif %}
@@ -89,11 +127,11 @@
 <div class="pagination-bar" style="margin-top:16px;">
   {% set total_pages = ((total - 1) // per_page) + 1 %}
   {% if page > 1 %}
-  <a href="?q={{ q }}&source={{ source }}&user={{ username }}&page={{ page - 1 }}" class="page-link">&larr; prev</a>
+  <a href="{{ url_for('sessions', q=q, source=source, user=username, project=project, repo=repo, branch=branch, activity=activity, status=status_filter, origin=origin, path=path_query, objective=objective_filter, objectiveLabel=objective_label, page=page - 1) }}" class="page-link">&larr; prev</a>
   {% endif %}
   <span class="page-info">page {{ page }} / {{ total_pages }}</span>
   {% if page < total_pages %}
-  <a href="?q={{ q }}&source={{ source }}&user={{ username }}&page={{ page + 1 }}" class="page-link">next &rarr;</a>
+  <a href="{{ url_for('sessions', q=q, source=source, user=username, project=project, repo=repo, branch=branch, activity=activity, status=status_filter, origin=origin, path=path_query, objective=objective_filter, objectiveLabel=objective_label, page=page + 1) }}" class="page-link">next &rarr;</a>
   {% endif %}
 </div>
 {% endif %}

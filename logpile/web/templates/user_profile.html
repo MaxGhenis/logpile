@@ -1,15 +1,38 @@
 {% extends "base.html" %}
-{% block title %}@{{ user.slug }} — Logpile{% endblock %}
+{% block title %}@{{ user.username }} — Logpile{% endblock %}
 {% block page_title %}Profile{% endblock %}
 
 {% block content %}
+{% set current_origin = origin or 'human_direct' %}
+<div class="card-section" style="margin-bottom:16px; display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;">
+  <div>
+    <div class="section-title" style="margin-bottom:6px;">Workflow lens</div>
+    <div style="color:#a8a29e; font-size:0.9rem;">Showing
+      {% if current_origin == 'human_direct' %}My work
+      {% elif current_origin == 'human_delegated' %}Delegated
+      {% elif current_origin == 'pipeline_eval' %}Pipeline
+      {% elif current_origin == 'meta_scaffolding' %}Meta
+      {% elif current_origin == 'system_generated' %}System
+      {% else %}All
+      {% endif %}
+    </div>
+  </div>
+  <div class="profile-actions">
+    <a class="ghost-link" href="{{ url_for('user_profile', username=user.username, origin='human_direct') }}">My work</a>
+    <a class="ghost-link" href="{{ url_for('user_profile', username=user.username, origin='human_delegated') }}">Delegated</a>
+    <a class="ghost-link" href="{{ url_for('user_profile', username=user.username, origin='pipeline_eval') }}">Pipeline</a>
+    <a class="ghost-link" href="{{ url_for('user_profile', username=user.username, origin='meta_scaffolding') }}">Meta</a>
+    <a class="ghost-link" href="{{ url_for('user_profile', username=user.username, origin='system_generated') }}">System</a>
+    <a class="ghost-link" href="{{ url_for('user_profile', username=user.username, origin='all') }}">All</a>
+  </div>
+</div>
+
 <div class="profile-hero" style="margin-bottom:20px;">
   <div>
     <div class="profile-kicker">operator profile</div>
-    <h1 class="profile-name">@{{ user.slug }}</h1>
+    <h1 class="profile-name">@{{ user.username }}</h1>
     <div class="profile-meta">
       {{ user.display_name }}
-      {% if user.display_name != user.username %} &middot; {{ user.username }}{% endif %}
       {% if user.bio %} &middot; {{ user.bio }}{% endif %}
       <br>
       active since {{ fmt_ts(summary.first_seen) }}
@@ -19,9 +42,9 @@
   </div>
   <div class="profile-actions">
     {% if not public_mode or user.profile_visibility == 'public' %}
-    <a class="ghost-link" href="{{ url_for('sessions', user=user.slug) }}">View sessions</a>
+    <a class="ghost-link" href="{{ url_for('sessions', user=user.username) if current_origin == 'all' else url_for('sessions', user=user.username, origin=current_origin) }}">View sessions</a>
     {% endif %}
-    <a class="ghost-link" href="{{ url_for('api_user_stats', slug=user.slug) }}">JSON</a>
+    <a class="ghost-link" href="{{ url_for('api_user_stats', username=user.username) if current_origin == 'all' else url_for('api_user_stats', username=user.username, origin=current_origin) }}">JSON</a>
   </div>
 </div>
 

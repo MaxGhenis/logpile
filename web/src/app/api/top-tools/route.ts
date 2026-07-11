@@ -1,7 +1,16 @@
 import { getTopTools } from "@/lib/db";
 
-export async function GET() {
-  const rows = getTopTools(20);
+export async function GET(req: Request) {
+  const { searchParams } = new URL(req.url);
+  let rows;
+  try {
+    rows = getTopTools(20, searchParams.get("origin") ?? undefined);
+  } catch (error) {
+    if (error instanceof RangeError) {
+      return Response.json({ error: error.message }, { status: 400 });
+    }
+    throw error;
+  }
   return Response.json({
     labels: rows.map((r) => r.tool_name),
     datasets: [

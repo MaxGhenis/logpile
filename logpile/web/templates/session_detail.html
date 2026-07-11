@@ -12,7 +12,7 @@
     </div>
     <div class="meta-item">
       <span class="meta-label">User</span>
-      <span class="meta-value"><a href="{{ url_for('user_profile', slug=session.user_slug or session.username) }}" class="badge-user-link"><span class="badge-user">{{ session.user_display_name }}</span></a></span>
+      <span class="meta-value"><a href="{{ url_for('user_profile', username=session.username) }}" class="badge-user-link"><span class="badge-user">{{ session.user_display_name }}</span></a></span>
     </div>
     <div class="meta-item">
       <span class="meta-label">Tool</span>

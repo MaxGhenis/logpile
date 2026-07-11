@@ -13,12 +13,11 @@ def open_sqlite(path: Path):
     return closing(conn)
 
 
-def make_session(session_id: str, *, slug: str, visibility: str) -> dict:
+def make_session(session_id: str, *, username: str, visibility: str) -> dict:
     return {
         "session_id": session_id,
         "source": "claudecode",
-        "username": slug,
-        "user_slug": slug,
+        "username": username,
         "machine": "machine-1",
         "project": "demo",
         "workspace_root": "/tmp/demo",
@@ -73,11 +72,11 @@ class ContractViewTests(unittest.TestCase):
             init_db(db_path)
 
             with get_db(db_path) as conn:
-                slug = ensure_user(conn, "alice")
-                update_user(conn, slug, profile_visibility="unlisted")
-                upsert_session(conn, make_session("public-1", slug=slug, visibility="public"))
-                upsert_session(conn, make_session("unlisted-1", slug=slug, visibility="unlisted"))
-                upsert_session(conn, make_session("private-1", slug=slug, visibility="private"))
+                username = ensure_user(conn, "alice")
+                update_user(conn, username, profile_visibility="unlisted")
+                upsert_session(conn, make_session("public-1", username=username, visibility="public"))
+                upsert_session(conn, make_session("unlisted-1", username=username, visibility="unlisted"))
+                upsert_session(conn, make_session("private-1", username=username, visibility="private"))
 
             with open_sqlite(db_path) as conn:
                 rows = conn.execute(
@@ -103,26 +102,26 @@ class ContractViewTests(unittest.TestCase):
             init_db(db_path)
 
             with get_db(db_path) as conn:
-                public_slug = ensure_user(conn, "alice")
-                unlisted_slug = ensure_user(conn, "bob")
-                private_slug = ensure_user(conn, "carol")
-                update_user(conn, unlisted_slug, profile_visibility="unlisted")
-                update_user(conn, private_slug, profile_visibility="private")
+                public_username = ensure_user(conn, "alice")
+                unlisted_username = ensure_user(conn, "bob")
+                private_username = ensure_user(conn, "carol")
+                update_user(conn, unlisted_username, profile_visibility="unlisted")
+                update_user(conn, private_username, profile_visibility="private")
 
             with open_sqlite(db_path) as conn:
                 rows = conn.execute(
                     """
-                    SELECT slug, listed_public, listed_private, direct_public, direct_private
+                    SELECT username, listed_public, listed_private, direct_public, direct_private
                     FROM user_catalog
-                    ORDER BY slug
+                    ORDER BY username
                     """
                 ).fetchall()
 
             self.assertEqual(
                 [tuple(row) for row in rows],
                 [
-                    (public_slug, 1, 1, 1, 1),
-                    (unlisted_slug, 0, 1, 1, 1),
-                    (private_slug, 0, 1, 0, 1),
+                    (public_username, 1, 1, 1, 1),
+                    (unlisted_username, 0, 1, 1, 1),
+                    (private_username, 0, 1, 0, 1),
                 ],
             )

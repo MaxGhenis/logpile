@@ -137,6 +137,35 @@ class PublishTests(unittest.TestCase):
             self.assertIn("outcome:", result.output)
             self.assertIn("review: public", result.output)
 
+    def test_new_users_default_sessions_to_unlisted(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            init_db(db_path)
+            self._write_session(home, body="Polish the session index.")
+
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            with open_sqlite(db_path) as conn:
+                user = conn.execute(
+                    "SELECT default_session_visibility FROM users WHERE username = 'alice'"
+                ).fetchone()
+                session = conn.execute(
+                    "SELECT visibility, visibility_source FROM sessions WHERE session_id = 'session-1'"
+                ).fetchone()
+
+            self.assertEqual(user["default_session_visibility"], "unlisted")
+            self.assertEqual(session["visibility"], "unlisted")
+            self.assertEqual(session["visibility_source"], "default")
+
     def test_publish_queue_json_outputs_structured_payload(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -175,6 +204,95 @@ class PublishTests(unittest.TestCase):
             self.assertEqual(payload["total"], 1)
             self.assertEqual(payload["candidates"][0]["session_id"], "session-1")
             self.assertEqual(payload["candidates"][0]["review_recommendation"], "public")
+
+    def test_publish_queue_json_can_filter_by_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+            self._write_session(home, session_id="direct-1", body="make more progress on logpile")
+            self._write_session(
+                home,
+                session_id="eval-1",
+                body=(
+                    "You are a senior statutory-fidelity reviewer for RAC (Rules as Code) encodings.\n\n"
+                    "Review the file holistically for citation fidelity."
+                ),
+            )
+
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "publish",
+                    "queue",
+                    "--db",
+                    str(db_path),
+                    "--json",
+                    "--origin",
+                    "pipeline_eval",
+                ],
+            )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            payload = json.loads(result.output)
+            self.assertEqual(payload["origin"], "pipeline_eval")
+            self.assertEqual(payload["total"], 1)
+            self.assertEqual(payload["candidates"][0]["session_id"], "eval-1")
+            self.assertEqual(payload["candidates"][0]["session_origin"], "pipeline_eval")
+
+    def test_publish_queue_needs_changes_surfaces_public_sessions_with_tighter_recommendation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+            self._write_session(home, body="Please follow up with alice@example.com about the release.")
+
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            with open_sqlite(db_path) as conn:
+                set_session_visibility(conn, "session-1", "public", shared_dir=shared)
+                conn.commit()
+
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "publish",
+                    "queue",
+                    "--db",
+                    str(db_path),
+                    "--visibility",
+                    "needs_changes",
+                    "--json",
+                    "--reviews",
+                ],
+            )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            payload = json.loads(result.output)
+            self.assertEqual(payload["visibility"], "needs_changes")
+            self.assertEqual(payload["total"], 1)
+            self.assertEqual(payload["candidates"][0]["session_id"], "session-1")
+            self.assertEqual(payload["candidates"][0]["visibility"], "public")
+            self.assertEqual(payload["candidates"][0]["review_recommendation"], "unlisted")
+            self.assertTrue(payload["candidates"][0]["needs_visibility_change"])
 
     def test_publish_queue_json_total_is_not_truncated_by_limit(self) -> None:
         with tempfile.TemporaryDirectory() as td:
