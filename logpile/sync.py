@@ -741,6 +741,75 @@ def _compute_duration(t1: str, t2: str) -> float | None:
         return None
 
 
+def _backfill_tokens_from_shared(conn, verbose: bool = False) -> int:
+    """Re-parse sessions whose source file is gone but whose shared copy
+    survives, refreshing token columns and per-day usage rows.
+
+    Claude Code rotates transcripts after ~30 days and Codex sessions can be
+    deleted outright; the ledger keeps their rows. Without this, those rows
+    could never pick up accounting fixes (SESSION_TOKEN_VERSION bumps) —
+    they'd keep whatever numbers the buggy parser wrote. Only token fields
+    and daily usage are refreshed; identity, narrative, and path data from
+    the original parse stay untouched.
+    """
+    rows = conn.execute(
+        """
+        SELECT session_id, source, source_path, shared_path
+        FROM sessions
+        WHERE COALESCE(token_version, 0) < ?
+          AND shared_path IS NOT NULL AND shared_path != ''
+        """,
+        (SESSION_TOKEN_VERSION,),
+    ).fetchall()
+    backfilled = 0
+    for row in rows:
+        if Path(row["source_path"]).exists():
+            continue  # live files belong to the main scan loops
+        shared_file = Path(row["shared_path"])
+        if not shared_file.exists():
+            continue
+        parser = (
+            parse_claudecode_session
+            if row["source"] == "claudecode"
+            else parse_codex_session
+        )
+        info = parser(shared_file)
+        if info is None:
+            continue
+        conn.execute(
+            """
+            UPDATE sessions
+            SET total_input_tokens = ?,
+                total_output_tokens = ?,
+                fresh_input_tokens = ?,
+                cached_input_tokens = ?,
+                cache_creation_input_tokens = ?,
+                cache_creation_5m_input_tokens = ?,
+                cache_creation_1h_input_tokens = ?,
+                reasoning_output_tokens = ?,
+                token_version = ?
+            WHERE session_id = ?
+            """,
+            (
+                info.total_input_tokens,
+                info.total_output_tokens,
+                info.fresh_input_tokens,
+                info.cached_input_tokens,
+                info.cache_creation_input_tokens,
+                info.cache_creation_5m_input_tokens,
+                info.cache_creation_1h_input_tokens,
+                info.reasoning_output_tokens,
+                SESSION_TOKEN_VERSION,
+                row["session_id"],
+            ),
+        )
+        insert_session_daily_usage(conn, row["session_id"], info.daily_usage)
+        backfilled += 1
+        if verbose:
+            print(f"  Backfilled tokens from shared copy: {row['session_id'][:20]}…")
+    return backfilled
+
+
 def sync_sessions(
     shared_dir: Path,
     db_path: Path,
@@ -1257,5 +1326,7 @@ def _sync_sessions(
                 if verbose:
                     short = session_id[-20:] if len(session_id) > 20 else session_id
                     print(f"  {action}: …{short} ({project})")
+
+        updated_count += _backfill_tokens_from_shared(conn, verbose=verbose)
 
     return new_count, updated_count, skipped_count

@@ -1411,6 +1411,47 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             self.assertEqual((new, updated), (0, 0))
             self.assertEqual(skipped, 2)
 
+    def test_rotated_source_backfills_tokens_from_shared_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            live = self._write_codex_session(home, session_id="rollout-rotated")
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+
+            sync_sessions(shared, db_path, "alice", "m1", home)
+
+            # Transcript rotates away; only the shared copy survives. A later
+            # accounting fix (token_version bump, simulated by resetting) must
+            # still reach this session.
+            live.unlink()
+            with open_sqlite(db_path) as conn:
+                conn.execute(
+                    "UPDATE sessions SET token_version = 0, total_input_tokens = 0 "
+                    "WHERE session_id = 'rollout-rotated'"
+                )
+                conn.execute(
+                    "DELETE FROM session_daily_usage WHERE session_id = 'rollout-rotated'"
+                )
+                conn.commit()
+
+            _, updated, _ = sync_sessions(shared, db_path, "alice", "m1", home)
+            self.assertGreaterEqual(updated, 1)
+
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    "SELECT total_input_tokens, cached_input_tokens, token_version "
+                    "FROM sessions WHERE session_id = 'rollout-rotated'"
+                ).fetchone()
+                daily = conn.execute(
+                    "SELECT COUNT(*) AS n FROM session_daily_usage "
+                    "WHERE session_id = 'rollout-rotated'"
+                ).fetchone()
+            self.assertEqual(row["total_input_tokens"], 1200)
+            self.assertEqual(row["cached_input_tokens"], 300)
+            self.assertEqual(row["token_version"], SESSION_TOKEN_VERSION)
+            self.assertEqual(daily["n"], 1)
+
     def test_moved_rollout_updates_source_path_without_reparse(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
