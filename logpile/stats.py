@@ -1,4 +1,13 @@
-"""Token usage statistics and session analysis."""
+"""Token usage statistics and session analysis.
+
+Unbounded reports retain whole-session semantics.  When ``since`` or
+``until`` is supplied, the report instead has inclusive UTC event-period
+semantics: tokens come from ``session_daily_effective`` rows whose day is in
+the requested range, and a session is active when it has at least one such
+row.  Pattern and repository labels remain properties of the whole session,
+while subagent command breakdowns include only tool calls whose own timestamp
+falls in the period.
+"""
 
 from __future__ import annotations
 
@@ -29,13 +38,33 @@ _SUBAGENT_COMMAND_CATEGORIES = {
     "file-read": ("cat", "head", "tail", "nl", "sed"),
 }
 
+# ``spawn_depth`` is the canonical classification input.  The remaining
+# predicates are defensive evidence for Claude Code rows written before the
+# sidechain backfill: real subagent logs live under /subagents/ and sync maps
+# their root sessionId to the canonical parent_session_id.
+_SUBAGENT_SQL = """(
+    COALESCE(s.spawn_depth, 0) > 0
+    OR (
+        s.source = 'claudecode'
+        AND (
+            NULLIF(TRIM(s.parent_session_id), '') IS NOT NULL
+            OR INSTR(
+                '/' || REPLACE(COALESCE(s.source_path, ''), CHAR(92), '/') || '/',
+                '/subagents/'
+            ) > 0
+        )
+    )
+)"""
+
 
 def classify_session(
     spawn_depth: int,
     user_message_count: int,
     tool_call_count: int,
+    *,
+    subagent_evidence: bool = False,
 ) -> str:
-    if spawn_depth > 0:
+    if spawn_depth > 0 or subagent_evidence:
         return "subagent"
     if user_message_count > 100:
         return "marathon"
@@ -85,6 +114,52 @@ def _build_where(
     return where, params
 
 
+def _has_period_bounds(since: str | None, until: str | None) -> bool:
+    return since is not None or until is not None
+
+
+def _build_daily_where(
+    username: str | None,
+    since: str | None,
+    until: str | None,
+) -> tuple[str, list[str]]:
+    """Build inclusive UTC-day predicates for session_daily_effective."""
+    clauses = ["d.day IS NOT NULL", "d.day != ''"]
+    params: list[str] = []
+    if username:
+        clauses.append("s.username = ?")
+        params.append(username)
+    if since:
+        clauses.append("d.day >= ?")
+        params.append(since[:10])
+    if until:
+        clauses.append("d.day <= ?")
+        params.append(until[:10])
+    return " AND ".join(clauses), params
+
+
+def _build_tool_where(
+    username: str | None,
+    since: str | None,
+    until: str | None,
+) -> tuple[str, list[str]]:
+    """Build predicates using each tool call's timestamp, converted to UTC."""
+    clauses: list[str] = []
+    params: list[str] = []
+    if username:
+        clauses.append("s.username = ?")
+        params.append(username)
+    if since:
+        # SQLite date() normalizes ISO-8601 offsets to UTC and returns NULL
+        # for missing or malformed timestamps, which excludes those rows.
+        clauses.append("date(tc.timestamp) >= ?")
+        params.append(since[:10])
+    if until:
+        clauses.append("date(tc.timestamp) <= ?")
+        params.append(until[:10])
+    return " AND ".join(clauses) if clauses else "1 = 1", params
+
+
 def compute_overview(
     conn: sqlite3.Connection,
     *,
@@ -92,25 +167,45 @@ def compute_overview(
     since: str | None = None,
     until: str | None = None,
 ) -> dict:
-    where, params = _build_where(username, since, until)
     # Cross-session sums use native_* so a Claude Code resume chain's
     # inherited history counts once, not once per transcript.
-    row = conn.execute(
-        f"""
-        SELECT
-            COUNT(*) AS total_sessions,
-            MIN(s.first_timestamp) AS first_date,
-            MAX(s.first_timestamp) AS last_date,
-            COALESCE(SUM(s.native_total_input_tokens), 0) AS total_input_tokens,
-            COALESCE(SUM(s.native_total_output_tokens), 0) AS total_output_tokens,
-            COALESCE(SUM(s.native_cached_input_tokens), 0) AS cached_input_tokens,
-            COALESCE(SUM(s.native_cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
-            COUNT(DISTINCT s.repo_name) AS repos_touched
-        FROM sessions s
-        WHERE {where}
-        """,
-        params,
-    ).fetchone()
+    if _has_period_bounds(since, until):
+        where, params = _build_daily_where(username, since, until)
+        row = conn.execute(
+            f"""
+            SELECT
+                COUNT(DISTINCT d.session_id) AS total_sessions,
+                MIN(d.day) AS first_date,
+                MAX(d.day) AS last_date,
+                COALESCE(SUM(d.native_total_input_tokens), 0) AS total_input_tokens,
+                COALESCE(SUM(d.native_total_output_tokens), 0) AS total_output_tokens,
+                COALESCE(SUM(d.native_cached_input_tokens), 0) AS cached_input_tokens,
+                COALESCE(SUM(d.native_cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
+                COUNT(DISTINCT s.repo_name) AS repos_touched
+            FROM session_daily_effective d
+            JOIN sessions s ON s.session_id = d.session_id
+            WHERE {where}
+            """,
+            params,
+        ).fetchone()
+    else:
+        where, params = _build_where(username, since, until)
+        row = conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total_sessions,
+                MIN(s.first_timestamp) AS first_date,
+                MAX(s.first_timestamp) AS last_date,
+                COALESCE(SUM(s.native_total_input_tokens), 0) AS total_input_tokens,
+                COALESCE(SUM(s.native_total_output_tokens), 0) AS total_output_tokens,
+                COALESCE(SUM(s.native_cached_input_tokens), 0) AS cached_input_tokens,
+                COALESCE(SUM(s.native_cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
+                COUNT(DISTINCT s.repo_name) AS repos_touched
+            FROM sessions s
+            WHERE {where}
+            """,
+            params,
+        ).fetchone()
     return {
         "total_sessions": row["total_sessions"],
         "first_date": row["first_date"],
@@ -130,19 +225,41 @@ def compute_by_pattern(
     since: str | None = None,
     until: str | None = None,
 ) -> list[dict]:
-    where, params = _build_where(username, since, until)
-    rows = conn.execute(
-        f"""
-        SELECT
-            s.spawn_depth,
-            s.user_message_count,
-            s.tool_call_count,
-            s.native_total_output_tokens AS total_output_tokens
-        FROM sessions s
-        WHERE {where}
-        """,
-        params,
-    ).fetchall()
+    if _has_period_bounds(since, until):
+        where, params = _build_daily_where(username, since, until)
+        rows = conn.execute(
+            f"""
+            SELECT
+                s.session_id,
+                s.spawn_depth,
+                s.user_message_count,
+                s.tool_call_count,
+                {_SUBAGENT_SQL} AS subagent_evidence,
+                COALESCE(SUM(d.native_total_output_tokens), 0) AS total_output_tokens
+            FROM session_daily_effective d
+            JOIN sessions s ON s.session_id = d.session_id
+            WHERE {where}
+            GROUP BY
+                s.session_id, s.spawn_depth, s.user_message_count,
+                s.tool_call_count, subagent_evidence
+            """,
+            params,
+        ).fetchall()
+    else:
+        where, params = _build_where(username, since, until)
+        rows = conn.execute(
+            f"""
+            SELECT
+                s.spawn_depth,
+                s.user_message_count,
+                s.tool_call_count,
+                {_SUBAGENT_SQL} AS subagent_evidence,
+                s.native_total_output_tokens AS total_output_tokens
+            FROM sessions s
+            WHERE {where}
+            """,
+            params,
+        ).fetchall()
 
     totals: dict[str, dict] = {}
     for pattern in BEHAVIORAL_PATTERNS:
@@ -158,6 +275,7 @@ def compute_by_pattern(
             row["spawn_depth"] or 0,
             row["user_message_count"] or 0,
             row["tool_call_count"] or 0,
+            subagent_evidence=bool(row["subagent_evidence"]),
         )
         output = row["total_output_tokens"] or 0
         totals[pattern]["session_count"] += 1
@@ -187,13 +305,13 @@ def compute_subagent_breakdown(
     since: str | None = None,
     until: str | None = None,
 ) -> list[dict]:
-    where, params = _build_where(username, since, until)
+    where, params = _build_tool_where(username, since, until)
     rows = conn.execute(
         f"""
         SELECT tc.command
         FROM tool_calls tc
         JOIN sessions s ON s.session_id = tc.session_id
-        WHERE s.spawn_depth > 0
+        WHERE {_SUBAGENT_SQL}
           AND tc.command IS NOT NULL
           AND tc.command != ''
           AND {where}
@@ -231,31 +349,57 @@ def compute_by_repo(
     until: str | None = None,
     limit: int = 10,
 ) -> list[dict]:
-    where, params = _build_where(username, since, until)
-    rows = conn.execute(
-        f"""
-        SELECT
-            COALESCE(s.repo_name, '(no repo)') AS repo_name,
-            COUNT(*) AS session_count,
-            COALESCE(SUM(s.native_total_output_tokens), 0) AS total_output_tokens
-        FROM sessions s
-        WHERE {where}
-        GROUP BY COALESCE(s.repo_name, '(no repo)')
-        ORDER BY total_output_tokens DESC
-        LIMIT ?
-        """,
-        [*params, limit],
-    ).fetchall()
-
-    # Use all-sessions total as denominator, not just top-N
-    grand_total_row = conn.execute(
-        f"""
-        SELECT COALESCE(SUM(s.native_total_output_tokens), 0) AS total
-        FROM sessions s
-        WHERE {where}
-        """,
-        params,
-    ).fetchone()
+    if _has_period_bounds(since, until):
+        where, params = _build_daily_where(username, since, until)
+        rows = conn.execute(
+            f"""
+            SELECT
+                COALESCE(s.repo_name, '(no repo)') AS repo_name,
+                COUNT(DISTINCT d.session_id) AS session_count,
+                COALESCE(SUM(d.native_total_output_tokens), 0) AS total_output_tokens
+            FROM session_daily_effective d
+            JOIN sessions s ON s.session_id = d.session_id
+            WHERE {where}
+            GROUP BY COALESCE(s.repo_name, '(no repo)')
+            ORDER BY total_output_tokens DESC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+        grand_total_row = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(d.native_total_output_tokens), 0) AS total
+            FROM session_daily_effective d
+            JOIN sessions s ON s.session_id = d.session_id
+            WHERE {where}
+            """,
+            params,
+        ).fetchone()
+    else:
+        where, params = _build_where(username, since, until)
+        rows = conn.execute(
+            f"""
+            SELECT
+                COALESCE(s.repo_name, '(no repo)') AS repo_name,
+                COUNT(*) AS session_count,
+                COALESCE(SUM(s.native_total_output_tokens), 0) AS total_output_tokens
+            FROM sessions s
+            WHERE {where}
+            GROUP BY COALESCE(s.repo_name, '(no repo)')
+            ORDER BY total_output_tokens DESC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+        # Use all-sessions total as denominator, not just top-N.
+        grand_total_row = conn.execute(
+            f"""
+            SELECT COALESCE(SUM(s.native_total_output_tokens), 0) AS total
+            FROM sessions s
+            WHERE {where}
+            """,
+            params,
+        ).fetchone()
     grand_total = grand_total_row["total"]
 
     result = []
@@ -292,18 +436,7 @@ def compute_by_period(
     toward each month's session_count. Sums use native_* so Claude Code
     resume chains count their inherited history once.
     """
-    clauses: list[str] = ["d.day IS NOT NULL", "d.day != ''"]
-    params: list[str] = []
-    if username:
-        clauses.append("s.username = ?")
-        params.append(username)
-    if since:
-        clauses.append("d.day >= ?")
-        params.append(since[:10])
-    if until:
-        clauses.append("d.day <= ?")
-        params.append(until[:10])
-    where = " AND ".join(clauses)
+    where, params = _build_daily_where(username, since, until)
 
     overview = conn.execute(
         f"""

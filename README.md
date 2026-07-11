@@ -103,38 +103,45 @@ fast path, so multi-GB immutable archives are hashed once, not every sync.
 
 - **Codex** `token_count` events carry *cumulative* counters, and resuming or
   forking a session writes a new rollout file that replays the whole prior
-  history re-stamped into a single wall-clock second under a fresh session
-  id. Sync detects that leading same-second burst (two `token_count` events
-  can never share a second live), folds it into a delta baseline, and
-  accumulates clamped per-event deltas — so each file contributes only its
-  live continuation, and replayed messages/tool calls are not re-counted
-  either. (`first_user_message` is still taken from the replay so resumed
-  sessions keep their topic.)
+  history under a fresh session id. Sync requires the structural fork prefix
+  (the leaf metadata followed by its exact `forked_from_id`) and finds the
+  first native task from Codex's task clocks; it does not infer replay from
+  same-second timestamps. The terminal inherited counter state becomes the
+  baseline, while explicit all-zero resets start new billing epochs whose
+  deltas are summed. Replayed messages/tool calls are not re-counted, fresh
+  files retain all live work, and multi-second copied prefixes stay inherited.
+  (`first_user_message` is still taken from the replay so resumed sessions
+  keep their topic.)
 - **Claude Code** assistant records are deduplicated by `message.id` within a
-  file, and cache writes (`cache_creation_input_tokens`, split 5m/1h) are
-  captured alongside fresh input and cache reads.
+  file, and cache writes (`cache_creation_input_tokens`, split 5m/1h/unknown)
+  are captured alongside fresh input and cache reads. Fallback records use the
+  usage iteration whose complete token tuple matches the top-level result;
+  contradictory or incomplete subtype data is retained as an explicit unknown
+  remainder, so the subtype sum always equals total cache creation.
   `total_input_tokens = fresh + cache_creation + cache_read`.
 - **Per-day usage** (`session_daily_usage`) buckets tokens, messages, and
   tool calls by the UTC day of the underlying events. Date-bucketed rollups
   (`logpile stats` by-month, the per-day charts in both web UIs) read the
   `session_daily_effective` view, which falls back to start-date attribution
   for sessions not yet re-synced — a session spanning weeks no longer dumps
-  all its usage on its start date.
+  all its usage on its start date. Usage without an attributable timestamp is
+  persisted on a deterministic residual day with `approximated = 1`, and every
+  daily component is required to sum to its session total.
 
 ##### Cross-session dedup (`native_*` columns)
 
 Resuming a *Claude Code* session copies prior history into a new file and
 re-stamps each record's `sessionId`, so replayed Claude messages are locally
 indistinguishable from native ones — but they keep their original
-`message.id`, `requestId`, `uuid`, and timestamps. Sync claims each parsed
-assistant message in the `message_claims` table under the same key the
+`message.id`, `requestId`, `uuid`, and timestamps. Sync stores every parsed
+assistant-message occurrence in `message_claims` under the same key the
 usage-tracker pipeline uses (`message.id:requestId`); among the sessions
 containing a message, the owner is the one with the smallest
 `(last_timestamp, first_timestamp, session_id)` — the earliest-ending
 transcript, i.e. the session where the message actually ran (a resume copy
 always ends at or after its source). That min-rule is order-independent, so
-re-parsing files in any order, or rebuilding the database from scratch,
-converges to the same owners.
+re-parsing files in any order, changing a session's rank, or removing a prior
+winner immediately derives the same owner from all remaining occurrences.
 
 Every token column therefore exists in two flavors:
 

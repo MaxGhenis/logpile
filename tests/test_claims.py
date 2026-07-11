@@ -10,6 +10,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from logpile.db import (
@@ -22,6 +23,9 @@ from logpile.db import (
 )
 from logpile.parsers import parse_claudecode_session
 from logpile.sync import SESSION_TOKEN_VERSION, sync_sessions
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "claudecode"
 
 
 def write_jsonl(path: Path, records: list[dict]) -> None:
@@ -148,7 +152,8 @@ class ParserMessageUsageTests(unittest.TestCase):
         self.assertEqual(m1.fresh_input_tokens, 100)
         self.assertEqual(m1.cached_input_tokens, 50)
         self.assertEqual(m1.cache_creation_input_tokens, 10)
-        self.assertEqual(m1.cache_creation_5m_input_tokens, 10)  # no breakdown -> 5m
+        self.assertEqual(m1.cache_creation_5m_input_tokens, 0)
+        self.assertEqual(m1.cache_creation_unknown_input_tokens, 10)
         self.assertEqual(m1.output_tokens, 20)
 
     def test_claim_key_falls_back_to_uuid_then_message_id(self) -> None:
@@ -205,7 +210,15 @@ class ApplyMessageClaimsTests(unittest.TestCase):
         return {
             row["claim_key"]: row["owner_session_id"]
             for row in conn.execute(
-                "SELECT claim_key, owner_session_id FROM message_claims"
+                "SELECT claim_key, owner_session_id FROM message_claim_owners"
+            )
+        }
+
+    def _occurrences(self, conn) -> set[tuple[str, str]]:
+        return {
+            (row["claim_key"], row["session_id"])
+            for row in conn.execute(
+                "SELECT claim_key, session_id FROM message_claims"
             )
         }
 
@@ -214,6 +227,27 @@ class ApplyMessageClaimsTests(unittest.TestCase):
         "msg-2:req-2": "zzz-parent",
         "msg-3:req-3": "aaa-child",
     }
+
+    def test_real_format_resume_fixtures_retain_both_occurrences(self) -> None:
+        parent = parse_claudecode_session(FIXTURES / "claims" / "claim-parent.jsonl")
+        child = parse_claudecode_session(FIXTURES / "claims" / "claim-child.jsonl")
+        assert parent is not None and child is not None
+        with get_db(self.db_path) as conn:
+            self._register(conn, parent)
+            self._register(conn, child)
+            apply_message_claims(conn, child.session_id, child.message_usage)
+            apply_message_claims(conn, parent.session_id, parent.message_usage)
+
+            self.assertEqual(
+                self._occurrences(conn),
+                {
+                    ("claim-message:claim-request", "claim-parent"),
+                    ("claim-message:claim-request", "claim-child"),
+                },
+            )
+            self.assertEqual(
+                self._owners(conn)["claim-message:claim-request"], "claim-child"
+            )
 
     def test_ownership_is_order_independent(self) -> None:
         for order in ((self.parent, self.child), (self.child, self.parent)):
@@ -226,6 +260,7 @@ class ApplyMessageClaimsTests(unittest.TestCase):
                     for info in order:
                         apply_message_claims(conn, info.session_id, info.message_usage)
                     self.assertEqual(self._owners(conn), self.EXPECTED_OWNERS)
+                    self.assertEqual(len(self._occurrences(conn)), 5)
 
     def test_steal_reports_previous_owner_as_affected(self) -> None:
         with get_db(self.db_path) as conn:
@@ -235,12 +270,12 @@ class ApplyMessageClaimsTests(unittest.TestCase):
             affected = apply_message_claims(conn, "zzz-parent", self.parent.message_usage)
             self.assertEqual(affected, {"zzz-parent", "aaa-child"})
 
-    def test_reparse_is_stable_and_reports_nothing(self) -> None:
+    def test_reparse_is_stable_and_marks_current_claimants_for_rank_refresh(self) -> None:
         with get_db(self.db_path) as conn:
             self._register(conn, self.parent)
             apply_message_claims(conn, "zzz-parent", self.parent.message_usage)
             affected = apply_message_claims(conn, "zzz-parent", self.parent.message_usage)
-            self.assertEqual(affected, set())
+            self.assertEqual(affected, {"zzz-parent"})
 
     def test_reparse_drops_stale_keys_after_retry_flip(self) -> None:
         records = [
@@ -291,6 +326,88 @@ class ApplyMessageClaimsTests(unittest.TestCase):
                 )
                 apply_message_claims(conn, sid, self.parent.message_usage)
             self.assertEqual(set(self._owners(conn).values()), {"twin-a"})
+            self.assertEqual(len(self._occurrences(conn)), 4)
+
+    def test_owner_dropping_key_promotes_unchanged_loser_occurrence(self) -> None:
+        with get_db(self.db_path) as conn:
+            self._register(conn, self.parent)
+            self._register(conn, self.child)
+            child_usage = [
+                replace(message, output_tokens=777)
+                if message.claim_key == "msg-1:req-1"
+                else message
+                for message in self.child.message_usage
+            ]
+            apply_message_claims(conn, self.child.session_id, child_usage)
+            apply_message_claims(conn, self.parent.session_id, self.parent.message_usage)
+            self.assertEqual(self._owners(conn)["msg-1:req-1"], "zzz-parent")
+
+            remaining_parent = [
+                message
+                for message in self.parent.message_usage
+                if message.claim_key != "msg-1:req-1"
+            ]
+            affected = apply_message_claims(
+                conn, self.parent.session_id, remaining_parent
+            )
+
+            self.assertEqual(affected, {"zzz-parent", "aaa-child"})
+            self.assertEqual(self._owners(conn)["msg-1:req-1"], "aaa-child")
+            winner_value = conn.execute(
+                """
+                SELECT c.output_tokens
+                FROM message_claim_owners o
+                JOIN message_claims c
+                  ON c.claim_key = o.claim_key
+                 AND c.session_id = o.owner_session_id
+                WHERE o.claim_key = 'msg-1:req-1'
+                """
+            ).fetchone()[0]
+            self.assertEqual(winner_value, 777)
+
+    def test_rank_change_recomputes_owner_without_loser_reparse(self) -> None:
+        with get_db(self.db_path) as conn:
+            self._register(conn, self.parent)
+            self._register(conn, self.child)
+            apply_message_claims(conn, self.parent.session_id, self.parent.message_usage)
+            apply_message_claims(conn, self.child.session_id, self.child.message_usage)
+            self.assertEqual(self._owners(conn)["msg-1:req-1"], "zzz-parent")
+
+            conn.execute(
+                "UPDATE sessions SET last_timestamp = '2027-01-01T00:00:00Z' "
+                "WHERE session_id = 'zzz-parent'"
+            )
+            affected = apply_message_claims(
+                conn, self.parent.session_id, self.parent.message_usage
+            )
+            self.assertEqual(affected, {"zzz-parent", "aaa-child"})
+            self.assertEqual(self._owners(conn)["msg-1:req-1"], "aaa-child")
+
+            conn.execute(
+                "UPDATE sessions SET last_timestamp = '2026-04-10T10:00:10Z' "
+                "WHERE session_id = 'zzz-parent'"
+            )
+            apply_message_claims(conn, self.parent.session_id, self.parent.message_usage)
+            self.assertEqual(self._owners(conn)["msg-1:req-1"], "zzz-parent")
+
+    def test_stale_losing_occurrence_does_not_delete_winner(self) -> None:
+        with get_db(self.db_path) as conn:
+            self._register(conn, self.parent)
+            self._register(conn, self.child)
+            apply_message_claims(conn, self.parent.session_id, self.parent.message_usage)
+            apply_message_claims(conn, self.child.session_id, self.child.message_usage)
+
+            child_unique = [
+                message
+                for message in self.child.message_usage
+                if message.claim_key == "msg-3:req-3"
+            ]
+            apply_message_claims(conn, self.child.session_id, child_unique)
+
+            owners = self._owners(conn)
+            self.assertEqual(owners["msg-1:req-1"], "zzz-parent")
+            self.assertEqual(owners["msg-2:req-2"], "zzz-parent")
+            self.assertEqual(owners["msg-3:req-3"], "aaa-child")
 
 
 class NativeRefreshTests(unittest.TestCase):
@@ -508,7 +625,7 @@ class SyncClaimsIntegrationTests(unittest.TestCase):
                 owners = {
                     row["claim_key"]: row["owner_session_id"]
                     for row in conn.execute(
-                        "SELECT claim_key, owner_session_id FROM message_claims"
+                        "SELECT claim_key, owner_session_id FROM message_claim_owners"
                     )
                 }
                 self.assertEqual(owners["msg-1:req-1"], "zzz-parent")
@@ -588,7 +705,7 @@ class MigrationTests(unittest.TestCase):
             init_db(db_path)
             with get_db(db_path) as conn:
                 conn.execute(
-                    "INSERT INTO message_claims (claim_key, owner_session_id)"
+                    "INSERT INTO message_claims (claim_key, session_id)"
                     " VALUES ('msg-x:req-x', 'ghost-session')"
                 )
             init_db(db_path)
@@ -597,6 +714,156 @@ class MigrationTests(unittest.TestCase):
                     conn.execute("SELECT COUNT(*) FROM message_claims").fetchone()[0],
                     0,
                 )
+
+    def test_orphan_cleanup_promotes_survivor_and_marks_native_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "logpile.db"
+            init_db(db_path)
+            with get_db(db_path) as conn:
+                _insert_session_row(
+                    conn,
+                    "owner-a",
+                    first_timestamp="2026-03-01T10:00:00Z",
+                    last_timestamp="2026-03-01T11:00:00Z",
+                )
+                _insert_session_row(
+                    conn,
+                    "loser-b",
+                    first_timestamp="2026-03-02T10:00:00Z",
+                    last_timestamp="2026-03-02T11:00:00Z",
+                )
+                conn.executemany(
+                    "INSERT INTO message_claims (claim_key, session_id, output_tokens) "
+                    "VALUES ('shared:key', ?, ?)",
+                    [("owner-a", 10), ("loser-b", 20)],
+                )
+                conn.execute("DELETE FROM sessions WHERE session_id = 'owner-a'")
+                conn.execute(
+                    "INSERT OR REPLACE INTO logpile_meta (key, value) "
+                    "VALUES ('native_refresh_pending', '0')"
+                )
+
+            init_db(db_path)
+            with get_db(db_path) as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT owner_session_id FROM message_claim_owners "
+                        "WHERE claim_key = 'shared:key'"
+                    ).fetchone()[0],
+                    "loser-b",
+                )
+                self.assertEqual(get_meta(conn, "native_refresh_pending"), "1")
+
+    def test_winner_only_ledger_migrates_to_occurrence_and_marks_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "logpile.db"
+            init_db(db_path)
+            with get_db(db_path) as conn:
+                _insert_session_row(
+                    conn,
+                    "legacy-owner",
+                    first_timestamp="2026-03-01T10:00:00Z",
+                    last_timestamp="2026-03-01T11:00:00Z",
+                )
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET token_version = ?,
+                        native_cache_creation_input_tokens = 10,
+                        native_cache_creation_5m_input_tokens = 8,
+                        native_cache_creation_1h_input_tokens = 8
+                    WHERE session_id = 'legacy-owner'
+                    """,
+                    (CLAIMS_TOKEN_VERSION,),
+                )
+                conn.execute("DROP VIEW message_claim_owners")
+                conn.execute("DROP TABLE message_claims")
+                conn.execute(
+                    """
+                    CREATE TABLE message_claims (
+                        claim_key TEXT PRIMARY KEY,
+                        owner_session_id TEXT NOT NULL,
+                        day TEXT,
+                        model TEXT,
+                        fresh_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
+                        output_tokens INTEGER NOT NULL DEFAULT 0
+                    ) WITHOUT ROWID
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO message_claims (
+                        claim_key, owner_session_id, day,
+                        cache_creation_input_tokens,
+                        cache_creation_5m_input_tokens,
+                        cache_creation_1h_input_tokens,
+                        output_tokens
+                    ) VALUES ('legacy:key', 'legacy-owner', '2026-03-01', 10, 2, 3, 7)
+                    """
+                )
+
+            init_db(db_path)
+            with get_db(db_path) as conn:
+                columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(message_claims)")
+                }
+                self.assertIn("session_id", columns)
+                self.assertNotIn("owner_session_id", columns)
+                occurrence = conn.execute(
+                    """
+                    SELECT session_id, cache_creation_5m_input_tokens,
+                           cache_creation_1h_input_tokens,
+                           cache_creation_unknown_input_tokens
+                    FROM message_claims WHERE claim_key = 'legacy:key'
+                    """
+                ).fetchone()
+                self.assertEqual(tuple(occurrence), ("legacy-owner", 2, 3, 5))
+                owner = conn.execute(
+                    "SELECT owner_session_id FROM message_claim_owners "
+                    "WHERE claim_key = 'legacy:key'"
+                ).fetchone()[0]
+                self.assertEqual(owner, "legacy-owner")
+                self.assertEqual(get_meta(conn, "native_refresh_pending"), "1")
+                native_split = conn.execute(
+                    """
+                    SELECT native_cache_creation_input_tokens,
+                           native_cache_creation_5m_input_tokens,
+                           native_cache_creation_1h_input_tokens,
+                           native_cache_creation_unknown_input_tokens
+                    FROM sessions WHERE session_id = 'legacy-owner'
+                    """
+                ).fetchone()
+                self.assertEqual(tuple(native_split), (10, 0, 0, 10))
+
+    def test_legacy_codex_raw_parent_is_preserved_in_parent_thread_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "logpile.db"
+            init_db(db_path)
+            with get_db(db_path) as conn:
+                _insert_session_row(
+                    conn,
+                    "legacy-codex-child",
+                    source="codex",
+                    first_timestamp="2026-03-01T10:00:00Z",
+                    last_timestamp="2026-03-01T11:00:00Z",
+                )
+                conn.execute(
+                    "UPDATE sessions SET parent_session_id = 'raw-parent-thread', "
+                    "parent_thread_id = NULL, identity_version = 0 "
+                    "WHERE session_id = 'legacy-codex-child'"
+                )
+
+            init_db(db_path)
+            with get_db(db_path) as conn:
+                row = conn.execute(
+                    "SELECT parent_session_id, parent_thread_id FROM sessions "
+                    "WHERE session_id = 'legacy-codex-child'"
+                ).fetchone()
+                self.assertEqual(tuple(row), ("raw-parent-thread", "raw-parent-thread"))
 
 
 if __name__ == "__main__":

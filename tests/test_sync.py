@@ -21,7 +21,11 @@ from logpile.db import (
     update_user,
 )
 from logpile.origins import derive_session_origin
-from logpile.sync import SESSION_TOKEN_VERSION, sync_sessions
+from logpile.sync import (
+    SESSION_IDENTITY_VERSION,
+    SESSION_TOKEN_VERSION,
+    sync_sessions,
+)
 from logpile.web.app import create_app
 
 
@@ -31,6 +35,9 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
         for record in records:
             fh.write(json.dumps(record))
             fh.write("\n")
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def open_sqlite(path: Path):
@@ -1980,6 +1987,12 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
     _write_claude_session = SyncTests._write_claude_session
     _write_codex_session = SyncTests._write_codex_session
 
+    @staticmethod
+    def _copy_fixture(relative_path: str, destination: Path) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(FIXTURES / relative_path, destination)
+        return destination
+
     def _write_codex_rollout(
         self,
         home: Path,
@@ -2028,6 +2041,401 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             ],
         )
         return session_path
+
+    def test_fixture_lineage_resolves_to_exact_rollout_keys_child_first(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            child_name = "rollout-2026-06-08T11-39-04-leaf-thread.jsonl"
+            parent_name = "rollout-2026-05-01T00-00-00-parent-thread.jsonl"
+
+            # Directory order deliberately presents the child first. Parent
+            # resolution must happen after the complete scan, not per file.
+            child = self._copy_fixture(
+                f"codex/{child_name}",
+                home / ".codex" / "sessions" / "2026" / "01" / "01" / child_name,
+            )
+            self._copy_fixture(
+                f"codex/{parent_name}",
+                home / ".codex" / "sessions" / "2026" / "12" / "31" / parent_name,
+            )
+
+            result = sync_sessions(shared, db_path, "alice", "m1", home)
+            self.assertEqual(result.new, 2)
+
+            child_id = Path(child_name).stem
+            parent_id = Path(parent_name).stem
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT thread_id, parent_thread_id, parent_session_id,
+                           spawn_depth, first_timestamp, identity_version
+                    FROM sessions WHERE session_id = ?
+                    """,
+                    (child_id,),
+                ).fetchone()
+                orphan_count = conn.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM sessions AS child
+                    LEFT JOIN sessions AS parent
+                      ON parent.session_id = child.parent_session_id
+                     AND parent.username = child.username
+                     AND parent.source = child.source
+                    WHERE child.parent_session_id IS NOT NULL
+                      AND parent.session_id IS NULL
+                    """
+                ).fetchone()["n"]
+
+            self.assertEqual(row["thread_id"], "leaf-thread")
+            self.assertEqual(row["parent_thread_id"], "parent-thread")
+            self.assertEqual(row["parent_session_id"], parent_id)
+            self.assertEqual(row["spawn_depth"], 1)
+            self.assertEqual(row["first_timestamp"], "2026-06-08T11:39:04.000Z")
+            self.assertEqual(row["identity_version"], SESSION_IDENTITY_VERSION)
+            self.assertEqual(orphan_count, 0)
+
+            # Rotate the child away and simulate every parser-derived field
+            # left stale by the old replay heuristic. The durable shared copy
+            # must restore live messages/tools/usage as well as lineage.
+            child.unlink()
+            with open_sqlite(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET token_version = 0,
+                        identity_version = 0,
+                        thread_id = NULL,
+                        parent_thread_id = NULL,
+                        parent_session_id = 'parent-thread',
+                        spawn_depth = 0,
+                        user_message_count = 0,
+                        assistant_message_count = 0,
+                        tool_call_count = 0,
+                        total_input_tokens = 0,
+                        total_output_tokens = 0
+                    WHERE session_id = ?
+                    """,
+                    (child_id,),
+                )
+                conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (child_id,))
+                conn.execute(
+                    "DELETE FROM session_daily_usage WHERE session_id = ?", (child_id,)
+                )
+                conn.commit()
+
+            result = sync_sessions(shared, db_path, "alice", "m1", home)
+            self.assertGreaterEqual(result.updated, 1)
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT thread_id, parent_thread_id, parent_session_id,
+                           spawn_depth, user_message_count, tool_call_count,
+                           total_input_tokens, total_output_tokens,
+                           token_version, identity_version
+                    FROM sessions WHERE session_id = ?
+                    """,
+                    (child_id,),
+                ).fetchone()
+                tools = conn.execute(
+                    "SELECT command FROM tool_calls WHERE session_id = ?", (child_id,)
+                ).fetchall()
+                daily = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(total_input_tokens), 0) AS input_tokens,
+                           COALESCE(SUM(total_output_tokens), 0) AS output_tokens
+                    FROM session_daily_usage WHERE session_id = ?
+                    """,
+                    (child_id,),
+                ).fetchone()
+
+            self.assertEqual(row["thread_id"], "leaf-thread")
+            self.assertEqual(row["parent_thread_id"], "parent-thread")
+            self.assertEqual(row["parent_session_id"], parent_id)
+            self.assertEqual(row["spawn_depth"], 1)
+            self.assertEqual(row["user_message_count"], 1)
+            self.assertEqual(row["tool_call_count"], 1)
+            self.assertEqual([tool["command"] for tool in tools], ["ruff check ."])
+            self.assertEqual(daily["input_tokens"], row["total_input_tokens"])
+            self.assertEqual(daily["output_tokens"], row["total_output_tokens"])
+            self.assertEqual(row["token_version"], SESSION_TOKEN_VERSION)
+            self.assertEqual(row["identity_version"], SESSION_IDENTITY_VERSION)
+
+            # Canonical keys fail closed while raw evidence remains available:
+            # neither an unresolved thread nor a self-thread may become an
+            # orphan/self edge in the stored session graph.
+            with open_sqlite(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET parent_thread_id = 'missing-thread',
+                        parent_session_id = session_id
+                    WHERE session_id = ?
+                    """,
+                    (child_id,),
+                )
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET parent_thread_id = thread_id,
+                        parent_session_id = session_id
+                    WHERE session_id = ?
+                    """,
+                    (parent_id,),
+                )
+                conn.commit()
+
+            sync_sessions(shared, db_path, "alice", "m1", home)
+            with open_sqlite(db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT session_id, parent_thread_id, parent_session_id
+                    FROM sessions WHERE session_id IN (?, ?)
+                    ORDER BY session_id
+                    """,
+                    (child_id, parent_id),
+                ).fetchall()
+            self.assertTrue(all(row["parent_session_id"] is None for row in rows))
+            self.assertEqual(
+                {row["parent_thread_id"] for row in rows},
+                {"missing-thread", "parent-thread"},
+            )
+
+    def test_fixture_claude_subagent_identity_and_rotated_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            project_root = home / ".claude" / "projects" / "-tmp-demo"
+            root_session = self._copy_fixture(
+                "claudecode/-tmp-demo/root-session.jsonl",
+                project_root / "root-session.jsonl",
+            )
+            child = self._copy_fixture(
+                "claudecode/-tmp-demo/root-session/subagents/agent-worker.jsonl",
+                project_root / "root-session" / "subagents" / "agent-worker.jsonl",
+            )
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+
+            result = sync_sessions(shared, db_path, "alice", "m1", home)
+            self.assertEqual(result.new, 2)
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT project, parent_session_id, spawn_depth,
+                           identity_version, native_total_output_tokens
+                    FROM sessions WHERE session_id = 'agent-worker'
+                    """
+                ).fetchone()
+            self.assertEqual(row["project"], "demo")
+            self.assertEqual(row["parent_session_id"], "root-session")
+            self.assertGreaterEqual(row["spawn_depth"], 1)
+            self.assertEqual(row["identity_version"], SESSION_IDENTITY_VERSION)
+            self.assertEqual(row["native_total_output_tokens"], 40)
+
+            child.unlink()
+            self.assertTrue(root_session.exists())
+            with open_sqlite(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET token_version = 0,
+                        identity_version = 0,
+                        parent_session_id = NULL,
+                        spawn_depth = 0,
+                        user_message_count = 0,
+                        assistant_message_count = 0,
+                        total_output_tokens = 0,
+                        native_total_output_tokens = 0
+                    WHERE session_id = 'agent-worker'
+                    """
+                )
+                conn.execute(
+                    "DELETE FROM session_daily_usage WHERE session_id = 'agent-worker'"
+                )
+                conn.commit()
+
+            result = sync_sessions(shared, db_path, "alice", "m1", home)
+            self.assertGreaterEqual(result.updated, 1)
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT project, parent_session_id, spawn_depth,
+                           user_message_count, assistant_message_count,
+                           total_output_tokens, native_total_output_tokens,
+                           token_version, identity_version
+                    FROM sessions WHERE session_id = 'agent-worker'
+                    """
+                ).fetchone()
+                orphan_count = conn.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM sessions AS child
+                    LEFT JOIN sessions AS parent
+                      ON parent.session_id = child.parent_session_id
+                     AND parent.username = child.username
+                     AND parent.source = child.source
+                    WHERE child.parent_session_id IS NOT NULL
+                      AND parent.session_id IS NULL
+                    """
+                ).fetchone()["n"]
+
+            self.assertEqual(row["project"], "demo")
+            self.assertEqual(row["parent_session_id"], "root-session")
+            self.assertGreaterEqual(row["spawn_depth"], 1)
+            self.assertEqual(row["user_message_count"], 1)
+            self.assertEqual(row["assistant_message_count"], 1)
+            self.assertEqual(row["total_output_tokens"], 40)
+            self.assertEqual(row["native_total_output_tokens"], 40)
+            self.assertEqual(row["token_version"], SESSION_TOKEN_VERSION)
+            self.assertEqual(row["identity_version"], SESSION_IDENTITY_VERSION)
+            self.assertEqual(orphan_count, 0)
+
+    def test_workflow_journal_cannot_overwrite_full_agent_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            project_root = home / ".claude" / "projects" / "-tmp-demo"
+            self._copy_fixture(
+                "claudecode/-tmp-demo/root-session.jsonl",
+                project_root / "root-session.jsonl",
+            )
+            self._copy_fixture(
+                "claudecode/-tmp-demo/root-session/subagents/agent-worker.jsonl",
+                project_root / "root-session" / "subagents" / "agent-worker.jsonl",
+            )
+            journal = self._copy_fixture(
+                (
+                    "claudecode/-tmp-demo/root-session/subagents/workflows/"
+                    "wf-fixture/journal.jsonl"
+                ),
+                (
+                    project_root
+                    / "root-session"
+                    / "subagents"
+                    / "workflows"
+                    / "wf-fixture"
+                    / "journal.jsonl"
+                ),
+            )
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+
+            first = sync_sessions(shared, db_path, "alice", "m1", home)
+            self.assertEqual(first.new, 2)
+            with open_sqlite(db_path) as conn:
+                agent = conn.execute(
+                    "SELECT total_output_tokens, source_path FROM sessions "
+                    "WHERE session_id = 'agent-worker'"
+                ).fetchone()
+                self.assertEqual(agent["total_output_tokens"], 40)
+                self.assertTrue(agent["source_path"].endswith("agent-worker.jsonl"))
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT 1 FROM sessions WHERE session_id = 'journal'"
+                    ).fetchone()
+                )
+
+                # Simulate the one stem-keyed zero-usage row written by older
+                # syncs. The exact journal path is enough to retire it safely.
+                conn.execute(
+                    """
+                    INSERT INTO sessions (
+                        session_id, source, username, source_path, shared_path,
+                        token_version, identity_version
+                    ) VALUES ('journal', 'claudecode', 'alice', ?, '', 0, 0)
+                    """,
+                    (str(journal),),
+                )
+                conn.commit()
+
+            second = sync_sessions(shared, db_path, "alice", "m1", home)
+            self.assertEqual(second.new, 0)
+            self.assertGreaterEqual(second.updated, 1)
+            with open_sqlite(db_path) as conn:
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT 1 FROM sessions WHERE session_id = 'journal'"
+                    ).fetchone()
+                )
+                agent = conn.execute(
+                    "SELECT total_output_tokens, source_path FROM sessions "
+                    "WHERE session_id = 'agent-worker'"
+                ).fetchone()
+                self.assertEqual(agent["total_output_tokens"], 40)
+                self.assertTrue(agent["source_path"].endswith("agent-worker.jsonl"))
+
+    def test_fixture_unknown_cache_and_approximated_daily_fields_persist(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            project_root = home / ".claude" / "projects" / "-tmp-demo"
+            self._copy_fixture(
+                "claudecode/cache-unknown-remainder.jsonl",
+                project_root / "cache-unknown-remainder.jsonl",
+            )
+            self._copy_fixture(
+                "claudecode/residual-day.jsonl",
+                project_root / "residual-day.jsonl",
+            )
+
+            result = sync_sessions(
+                root / "shared", root / "logpile.db", "alice", "m1", home
+            )
+            self.assertEqual(result.new, 2)
+            with open_sqlite(root / "logpile.db") as conn:
+                cache_session = conn.execute(
+                    """
+                    SELECT cache_creation_input_tokens,
+                           cache_creation_5m_input_tokens,
+                           cache_creation_1h_input_tokens,
+                           cache_creation_unknown_input_tokens
+                    FROM sessions
+                    WHERE session_id = 'cache-unknown-remainder'
+                    """
+                ).fetchone()
+                cache_day = conn.execute(
+                    """
+                    SELECT cache_creation_input_tokens,
+                           cache_creation_5m_input_tokens,
+                           cache_creation_1h_input_tokens,
+                           cache_creation_unknown_input_tokens
+                    FROM session_daily_usage
+                    WHERE session_id = 'cache-unknown-remainder'
+                    """
+                ).fetchone()
+                residual_session = conn.execute(
+                    """
+                    SELECT total_input_tokens, total_output_tokens,
+                           user_message_count, assistant_message_count
+                    FROM sessions WHERE session_id = 'residual-day'
+                    """
+                ).fetchone()
+                residual_day = conn.execute(
+                    """
+                    SELECT total_input_tokens, total_output_tokens,
+                           user_message_count, assistant_message_count,
+                           approximated
+                    FROM session_daily_usage
+                    WHERE session_id = 'residual-day'
+                    """
+                ).fetchone()
+
+            self.assertEqual(cache_session["cache_creation_input_tokens"], 600)
+            self.assertEqual(cache_session["cache_creation_5m_input_tokens"], 0)
+            self.assertEqual(cache_session["cache_creation_1h_input_tokens"], 0)
+            self.assertEqual(cache_session["cache_creation_unknown_input_tokens"], 600)
+            self.assertEqual(dict(cache_day), dict(cache_session))
+            self.assertEqual(residual_day["approximated"], 1)
+            for field in (
+                "total_input_tokens",
+                "total_output_tokens",
+                "user_message_count",
+                "assistant_message_count",
+            ):
+                self.assertEqual(residual_day[field], residual_session[field])
 
     def test_sync_scans_archived_and_extra_codex_homes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -2153,7 +2561,7 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             db_path = root / "logpile.db"
             sync_sessions(shared, db_path, "alice", "m1", home)
 
-            self.assertEqual(SESSION_TOKEN_VERSION, 6)
+            self.assertEqual(SESSION_TOKEN_VERSION, 7)
             with open_sqlite(db_path) as conn:
                 conn.execute(
                     "UPDATE sessions SET token_version = 5 "
@@ -2165,7 +2573,7 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
                 )
                 conn.execute(
                     "UPDATE message_claims SET day = '2026-04-10' "
-                    "WHERE owner_session_id = 'utc-migration'"
+                    "WHERE session_id = 'utc-migration'"
                 )
                 conn.commit()
 
@@ -2187,7 +2595,7 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
                     row["day"]
                     for row in conn.execute(
                         "SELECT day FROM message_claims "
-                        "WHERE owner_session_id = 'utc-migration' ORDER BY day"
+                        "WHERE session_id = 'utc-migration' ORDER BY day"
                     )
                 ]
 

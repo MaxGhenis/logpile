@@ -30,8 +30,9 @@ class DailyUsage:
     """Per-UTC-day slice of a session's usage, bucketed by event timestamps.
 
     Sessions can span weeks; attributing whole-session totals to the start
-    date distorts any date-bucketed rollup. Records without timestamps are
-    excluded, so daily sums can undercount session totals slightly.
+    date distorts any date-bucketed rollup. Usage without a usable timestamp
+    is reconciled onto a deterministic residual day and marked approximated,
+    so every daily component sums exactly to the session row.
     """
 
     day: str  # YYYY-MM-DD (UTC)
@@ -42,10 +43,12 @@ class DailyUsage:
     cache_creation_input_tokens: int = 0
     cache_creation_5m_input_tokens: int = 0
     cache_creation_1h_input_tokens: int = 0
+    cache_creation_unknown_input_tokens: int = 0
     reasoning_output_tokens: int = 0
     user_message_count: int = 0
     assistant_message_count: int = 0
     tool_call_count: int = 0
+    approximated: bool = False
 
 
 @dataclass
@@ -67,6 +70,7 @@ class MessageUsage:
     cache_creation_input_tokens: int = 0
     cache_creation_5m_input_tokens: int = 0
     cache_creation_1h_input_tokens: int = 0
+    cache_creation_unknown_input_tokens: int = 0
     output_tokens: int = 0
 
 
@@ -101,10 +105,13 @@ class SessionInfo:
     cache_creation_input_tokens: int = 0
     cache_creation_5m_input_tokens: int = 0
     cache_creation_1h_input_tokens: int = 0
+    cache_creation_unknown_input_tokens: int = 0
     reasoning_output_tokens: int = 0
     first_user_message: str = ""
     model: Optional[str] = None
     workspace_root: Optional[str] = None
+    thread_id: Optional[str] = None
+    parent_thread_id: Optional[str] = None
     parent_session_id: Optional[str] = None
     spawn_depth: int = 0
     tool_calls: list = field(default_factory=list)
@@ -511,14 +518,52 @@ def _extract_codex_token_totals(record_type: str, payload: dict) -> tuple[int, i
     info = payload.get("info", {})
     if not isinstance(info, dict):
         return None
-    totals = info.get("total_token_usage", {})
+    # Rate-limit-only token_count events omit total_token_usage. Treating that
+    # absence as an all-zero vector would manufacture a billing-epoch reset.
+    if "total_token_usage" not in info:
+        return None
+    totals = info.get("total_token_usage")
     if not isinstance(totals, dict):
+        return None
+    if not any(
+        key in totals
+        for key in (
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        )
+    ):
         return None
     input_tokens = int(totals.get("input_tokens", 0) or 0)
     cached_input_tokens = int(totals.get("cached_input_tokens", 0) or 0)
     output_tokens = int(totals.get("output_tokens", 0) or 0)
     reasoning_output_tokens = int(totals.get("reasoning_output_tokens", 0) or 0)
     return input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens
+
+
+def _is_explicit_codex_counter_reset(record_type: str, payload: dict) -> bool:
+    """Whether this token event explicitly resets every billed counter."""
+    if record_type != "event_msg" or payload.get("type") != "token_count":
+        return False
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return False
+    totals = info.get("total_token_usage")
+    if not isinstance(totals, dict):
+        return False
+    # Input/cached/output are present in every real cumulative snapshot. The
+    # reasoning component is optional in older records and is zero when absent.
+    required = ("input_tokens", "cached_input_tokens", "output_tokens")
+    if not all(key in totals for key in required):
+        return False
+    try:
+        return all(
+            int(totals.get(key, 0) or 0) == 0
+            for key in (*required, "reasoning_output_tokens")
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _day_of(timestamp: Optional[str]) -> Optional[str]:
@@ -550,56 +595,76 @@ def _sorted_daily(daily: dict) -> list[DailyUsage]:
     return [daily[day] for day in sorted(daily)]
 
 
+def _string_id(value: Any) -> Optional[str]:
+    if isinstance(value, (str, int)) and str(value):
+        return str(value)
+    return None
+
+
+def _timestamp_epoch_second(timestamp: Optional[str]) -> Optional[int]:
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        return None
+    value = timestamp.strip()
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp())
+
+
+def _started_at_epoch_second(value: Any) -> Optional[int]:
+    try:
+        started_at = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    # Codex currently emits integer epoch seconds, but accept epoch
+    # milliseconds as well so a representation change does not revive the
+    # timestamp-burst heuristic.
+    if abs(started_at) >= 100_000_000_000:
+        started_at /= 1000
+    return int(started_at)
+
+
 def _codex_replay_window(records: list) -> tuple[int, int]:
-    """Detect the replay burst a Codex resume/fork snapshot starts with.
+    """Return the structurally copied prefix of a Codex fork snapshot.
 
-    Resuming a session writes a NEW rollout file containing a full copy of
-    the prior history, re-stamped into a single wall-clock second (and given
-    a fresh session id), followed by the live continuation. Counting the
-    replayed records would count the same history once per snapshot.
+    A copied snapshot starts with the new leaf ``session_meta`` followed by
+    the copied parent's ``session_meta``.  The copied meta's id exactly
+    matches the leaf's ``forked_from_id``.  Replayed ``task_started`` records
+    retain their original ``started_at`` value while their outer timestamps
+    are re-stamped; the first task whose two clocks agree is therefore the
+    leaf-native boundary. This remains reliable when serialization of a
+    large prefix spans many wall-clock seconds.
 
-    Live turns never produce two token_count events inside one second, so:
-    the file is a snapshot iff its first two token_count events share a
-    wall-clock second S. The replayed history is then the contiguous run of
-    records stamped S (records without timestamps ride along with the run).
-
-    Returns (start, end) record indices of the replay window, or (0, 0) if
-    the file is not a snapshot.
+    Fork metadata without the matching second meta is not enough: current
+    Codex files can be fresh child threads with no copied prefix.  If a
+    structurally identified snapshot is still being written and has no
+    native task boundary yet, all records after the leaf meta are inherited.
     """
-    first_second = None
-    token_events_in_second = 0
-    for record in records:
-        record_type, payload, timestamp = _normalize_codex_record(record)
-        if _extract_codex_token_totals(record_type, payload) is None:
-            continue
-        second = (timestamp or "")[:19]
-        if first_second is None:
-            if not second:
-                return 0, 0
-            first_second = second
-            token_events_in_second = 1
-            continue
-        if second == first_second:
-            token_events_in_second += 1
-        break
-    if token_events_in_second < 2:
+    if len(records) < 2:
+        return 0, 0
+    first_type, first_payload, _ = _normalize_codex_record(records[0])
+    second_type, second_payload, _ = _normalize_codex_record(records[1])
+    if first_type != "session_meta" or second_type != "session_meta":
+        return 0, 0
+    forked_from_id = _string_id(first_payload.get("forked_from_id"))
+    copied_thread_id = _string_id(second_payload.get("id"))
+    if not forked_from_id or copied_thread_id != forked_from_id:
         return 0, 0
 
-    start = end = None
-    for index, record in enumerate(records):
-        _, _, timestamp = _normalize_codex_record(record)
-        second = (timestamp or "")[:19]
-        if second == first_second:
-            if start is None:
-                start = index
-            end = index + 1
-        elif start is not None:
-            if timestamp:
-                break
-            end = index + 1
-    if start is None:
-        return 0, 0
-    return start, end
+    for index, record in enumerate(records[2:], start=2):
+        record_type, payload, timestamp = _normalize_codex_record(record)
+        if record_type != "event_msg" or payload.get("type") != "task_started":
+            continue
+        started_at = _started_at_epoch_second(payload.get("started_at"))
+        record_second = _timestamp_epoch_second(timestamp)
+        if started_at is not None and started_at == record_second:
+            return 1, index
+    return 1, len(records)
 
 
 def _extract_command(arguments: dict) -> Optional[str]:
@@ -891,6 +956,172 @@ def _private_marker(records: list) -> str | None:
     return None
 
 
+_DAILY_RECONCILE_FIELDS = (
+    "total_input_tokens",
+    "total_output_tokens",
+    "fresh_input_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_creation_5m_input_tokens",
+    "cache_creation_1h_input_tokens",
+    "cache_creation_unknown_input_tokens",
+    "reasoning_output_tokens",
+    "user_message_count",
+    "assistant_message_count",
+    "tool_call_count",
+)
+
+
+def _fallback_usage_day(path: Path, records: list[dict]) -> str:
+    """Choose the deterministic day for usage lacking an event timestamp."""
+    for record in records:
+        day = _day_of(record.get("timestamp"))
+        if day is not None:
+            return day
+    try:
+        modified = path.stat().st_mtime
+    except OSError:
+        # The file was readable moments earlier, so this is only a final
+        # deterministic guard for a concurrent rotation.
+        return "1970-01-01"
+    return datetime.fromtimestamp(modified, tz=timezone.utc).date().isoformat()
+
+
+def _reconcile_daily_usage(
+    daily: dict[str, DailyUsage],
+    fallback_day: str,
+    totals: dict[str, int],
+) -> None:
+    """Make every per-day token/count component equal its session total.
+
+    Normally only positive residuals occur: an otherwise valid usage record
+    had no timestamp.  The defensive negative branch removes excess from the
+    latest buckets without allowing negative rows, preserving the invariant
+    even if a malformed retry produces duplicate attribution.
+    """
+    fallback_bucket: DailyUsage | None = None
+    for field_name in _DAILY_RECONCILE_FIELDS:
+        target = max(0, int(totals.get(field_name, 0) or 0))
+        current = sum(
+            int(getattr(bucket, field_name, 0) or 0)
+            for bucket in daily.values()
+        )
+        delta = target - current
+        if delta > 0:
+            if fallback_bucket is None:
+                fallback_bucket = daily.get(fallback_day)
+                if fallback_bucket is None:
+                    fallback_bucket = daily[fallback_day] = DailyUsage(day=fallback_day)
+            setattr(
+                fallback_bucket,
+                field_name,
+                int(getattr(fallback_bucket, field_name, 0) or 0) + delta,
+            )
+            fallback_bucket.approximated = True
+        elif delta < 0:
+            excess = -delta
+            for day in sorted(daily, reverse=True):
+                bucket = daily[day]
+                value = int(getattr(bucket, field_name, 0) or 0)
+                removed = min(value, excess)
+                if removed:
+                    setattr(bucket, field_name, value - removed)
+                    bucket.approximated = True
+                    excess -= removed
+                if excess == 0:
+                    break
+
+
+_CLAUDE_USAGE_TUPLE_FIELDS = (
+    "input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "output_tokens",
+)
+
+
+def _usage_tuple(usage: Any) -> tuple[int, int, int, int] | None:
+    if not isinstance(usage, dict):
+        return None
+    values: list[int] = []
+    for field_name in _CLAUDE_USAGE_TUPLE_FIELDS:
+        try:
+            values.append(int(usage.get(field_name, 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return values[0], values[1], values[2], values[3]
+
+
+def _claude_cache_creation_split(usage: dict) -> tuple[int, int, int]:
+    """Return a lossless (5m, 1h, unknown) cache-creation split.
+
+    Fallback records can contain several usage iterations.  Only an
+    iteration whose complete usage tuple matches the top-level totals can
+    explain that record; the last exact match is authoritative for its cache
+    lifetime breakdown.  Missing or contradictory breakdowns remain explicit
+    unknown usage instead of being silently labeled 5m.
+    """
+    total = max(0, int(usage.get("cache_creation_input_tokens", 0) or 0))
+    split_source = usage
+    top_level_tuple = _usage_tuple(usage)
+    iterations = usage.get("iterations")
+    if top_level_tuple is not None and isinstance(iterations, list):
+        for iteration in iterations:
+            if _usage_tuple(iteration) == top_level_tuple:
+                split_source = iteration
+
+    breakdown = split_source.get("cache_creation")
+    if not isinstance(breakdown, dict):
+        return 0, 0, total
+    try:
+        five_minute = int(breakdown.get("ephemeral_5m_input_tokens", 0) or 0)
+        one_hour = int(breakdown.get("ephemeral_1h_input_tokens", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0, 0, total
+    if five_minute < 0 or one_hour < 0 or five_minute + one_hour > total:
+        return 0, 0, total
+    return five_minute, one_hour, total - five_minute - one_hour
+
+
+def _claude_session_identity(
+    path: Path,
+    records: list[dict],
+) -> tuple[str, str, Optional[str], Optional[str], int]:
+    """Return canonical id, raw thread id, raw/canonical parent, and depth."""
+    raw_session_id = None
+    agent_id = None
+    sidechain_flag = False
+    for record in records:
+        if raw_session_id is None:
+            raw_session_id = _string_id(record.get("sessionId"))
+        if agent_id is None:
+            agent_id = _string_id(record.get("agentId"))
+        sidechain_flag = sidechain_flag or record.get("isSidechain") is True
+
+    parts = path.parts
+    subagent_indices = [
+        index for index, part in enumerate(parts) if part == "subagents"
+    ]
+    path_is_subagent = bool(subagent_indices)
+    root_from_path = None
+    if subagent_indices and subagent_indices[0] > 0:
+        root_from_path = parts[subagent_indices[0] - 1]
+    if agent_id is None and path.stem.startswith("agent-"):
+        agent_id = path.stem[len("agent-") :]
+
+    if sidechain_flag or path_is_subagent or agent_id is not None:
+        raw_agent_id = agent_id or path.stem
+        canonical_id = (
+            raw_agent_id if raw_agent_id.startswith("agent-") else f"agent-{raw_agent_id}"
+        )
+        parent_thread_id = raw_session_id or root_from_path
+        depth = max(1, len(subagent_indices))
+        return canonical_id, raw_agent_id, parent_thread_id, parent_thread_id, depth
+
+    thread_id = raw_session_id or path.stem
+    return path.stem, thread_id, None, None, 0
+
+
 def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessionMarker]:
     """Parse a Claude Code JSONL file and return a SessionInfo."""
     records = _load_jsonl(path)
@@ -900,7 +1131,14 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
     if private_marker:
         return PrivateSessionMarker(path.stem, "claudecode", private_marker)
 
-    session_id = path.stem
+    (
+        session_id,
+        thread_id,
+        parent_thread_id,
+        parent_session_id,
+        spawn_depth,
+    ) = _claude_session_identity(path, records)
+    fallback_day = _fallback_usage_day(path, records)
 
     # Get project from cwd field
     project = "unknown"
@@ -927,8 +1165,6 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
     first_user_message = ""
     error_count = 0
     model = None
-    parent_session_id = None
-    spawn_depth = 0
     daily: dict[str, DailyUsage] = {}
 
     for r in records:
@@ -980,13 +1216,7 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
             # tokens/month as of Jul 2026 — capture them, split 5m/1h when
             # the breakdown is present (they bill at different rates).
             cache_creation = int(usage.get("cache_creation_input_tokens", 0) or 0)
-            breakdown = usage.get("cache_creation")
-            cw5 = cw1 = 0
-            if isinstance(breakdown, dict):
-                cw5 = int(breakdown.get("ephemeral_5m_input_tokens", 0) or 0)
-                cw1 = int(breakdown.get("ephemeral_1h_input_tokens", 0) or 0)
-            if cw5 + cw1 == 0:
-                cw5 = cache_creation  # no breakdown -> assume 5m
+            cw5, cw1, cw_unknown = _claude_cache_creation_split(usage)
             out = int(usage.get("output_tokens", 0) or 0)
             mdl = msg.get("model")
 
@@ -999,6 +1229,7 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
                         "cache_creation": cache_creation,
                         "cache_creation_5m": cw5,
                         "cache_creation_1h": cw1,
+                        "cache_creation_unknown": cw_unknown,
                         "output": out,
                         "model": mdl,
                         "timestamp": ts,
@@ -1046,6 +1277,9 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
     cache_creation_input = sum(v["cache_creation"] for v in seen_msg.values())
     cache_creation_5m = sum(v["cache_creation_5m"] for v in seen_msg.values())
     cache_creation_1h = sum(v["cache_creation_1h"] for v in seen_msg.values())
+    cache_creation_unknown = sum(
+        v["cache_creation_unknown"] for v in seen_msg.values()
+    )
     # Every prompt token reaches the model exactly one way: uncached (fresh),
     # written to cache, or read from cache.
     total_input = fresh_input + cache_creation_input + cached_input
@@ -1061,8 +1295,28 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
         bucket.cache_creation_input_tokens += v["cache_creation"]
         bucket.cache_creation_5m_input_tokens += v["cache_creation_5m"]
         bucket.cache_creation_1h_input_tokens += v["cache_creation_1h"]
+        bucket.cache_creation_unknown_input_tokens += v["cache_creation_unknown"]
         bucket.total_input_tokens += v["fresh_input"] + v["cache_creation"] + v["cached_input"]
         bucket.total_output_tokens += v["output"]
+
+    _reconcile_daily_usage(
+        daily,
+        fallback_day,
+        {
+            "total_input_tokens": total_input,
+            "total_output_tokens": total_output,
+            "fresh_input_tokens": fresh_input,
+            "cached_input_tokens": cached_input,
+            "cache_creation_input_tokens": cache_creation_input,
+            "cache_creation_5m_input_tokens": cache_creation_5m,
+            "cache_creation_1h_input_tokens": cache_creation_1h,
+            "cache_creation_unknown_input_tokens": cache_creation_unknown,
+            "reasoning_output_tokens": 0,
+            "user_message_count": user_message_count,
+            "assistant_message_count": assistant_message_count,
+            "tool_call_count": len(tool_calls),
+        },
+    )
 
     message_usage = []
     for msg_id, v in seen_msg.items():
@@ -1074,13 +1328,14 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
             claim_key = f"mid:{msg_id}"
         message_usage.append(MessageUsage(
             claim_key=claim_key,
-            day=_day_of(v["timestamp"]),
+            day=_day_of(v["timestamp"]) or fallback_day,
             model=v["model"],
             fresh_input_tokens=v["fresh_input"],
             cached_input_tokens=v["cached_input"],
             cache_creation_input_tokens=v["cache_creation"],
             cache_creation_5m_input_tokens=v["cache_creation_5m"],
             cache_creation_1h_input_tokens=v["cache_creation_1h"],
+            cache_creation_unknown_input_tokens=v["cache_creation_unknown"],
             output_tokens=v["output"],
         ))
 
@@ -1101,9 +1356,12 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
         cache_creation_input_tokens=cache_creation_input,
         cache_creation_5m_input_tokens=cache_creation_5m,
         cache_creation_1h_input_tokens=cache_creation_1h,
+        cache_creation_unknown_input_tokens=cache_creation_unknown,
         first_user_message=first_user_message,
         model=model,
         workspace_root=workspace_root,
+        thread_id=thread_id,
+        parent_thread_id=parent_thread_id,
         parent_session_id=parent_session_id,
         spawn_depth=spawn_depth,
         tool_calls=tool_calls,
@@ -1123,28 +1381,47 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
         return PrivateSessionMarker(path.stem, "codex", private_marker)
 
     first_rec = records[0]
-    session_id = first_rec.get("id") or path.stem
+    session_id = path.stem
+    thread_id = _string_id(first_rec.get("id")) or path.stem
     first_timestamp = first_rec.get("timestamp")
     project = _extract_codex_project(records)
     workspace_root = project
     model = None
+    parent_thread_id = None
     parent_session_id = None
     spawn_depth = 0
+    fallback_day = _fallback_usage_day(path, records)
 
+    # A copied ancestor can contain any number of session_meta records.  Leaf
+    # identity and lineage come exclusively from the first one in this file.
+    leaf_meta_found = False
     for record in records:
         record_type, payload, timestamp = _normalize_codex_record(record)
-        if record_type == "session_meta":
-            session_id = payload.get("id") or session_id
+        if record_type == "session_meta" and not leaf_meta_found:
+            leaf_meta_found = True
+            thread_id = _string_id(payload.get("id")) or thread_id
             first_timestamp = payload.get("timestamp") or timestamp or first_timestamp
+            top_level_parent = _string_id(payload.get("parent_thread_id"))
+            nested_parent = None
             source = payload.get("source")
             if isinstance(source, dict):
                 subagent = source.get("subagent", {})
                 if isinstance(subagent, dict):
                     thread_spawn = subagent.get("thread_spawn", {})
                     if isinstance(thread_spawn, dict):
-                        parent_session_id = thread_spawn.get("parent_thread_id")
+                        nested_parent = _string_id(
+                            thread_spawn.get("parent_thread_id")
+                        )
                         spawn_depth = int(thread_spawn.get("depth", 0) or 0)
-        elif record_type == "turn_context" and payload.get("model") and not model:
+            parent_thread_id = (
+                top_level_parent
+                or nested_parent
+                or _string_id(payload.get("forked_from_id"))
+            )
+            # Sync resolves this raw thread reference to the parent's
+            # canonical rollout filename stem before persistence.
+            parent_session_id = parent_thread_id
+        if record_type == "turn_context" and payload.get("model") and not model:
             model = payload["model"]
 
     user_message_count = 0
@@ -1160,15 +1437,13 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
     reasoning_output_tokens = 0
     daily: dict[str, DailyUsage] = {}
 
-    # Codex token_count events carry CUMULATIVE counters, and resume/fork
-    # snapshot files replay the whole prior history (see
-    # _codex_replay_window). Taking max() of the counter would re-count that
-    # history once per snapshot, so instead: fold the replay window into a
-    # delta baseline and accumulate clamped per-event deltas — each file
-    # contributes only its live continuation. Deltas are clamped at zero per
-    # component so a counter reset can't go negative or double-count.
+    # Codex token_count events carry cumulative counters. A structurally
+    # copied prefix establishes the starting counter state but contributes no
+    # native usage. Explicit all-zero vectors start a new billing epoch;
+    # maxima are retained only inside an epoch so small downward telemetry
+    # wobbles clamp to zero without erasing genuine post-reset usage.
     replay_start, replay_end = _codex_replay_window(records)
-    baseline = [0, 0, 0, 0]  # input, cached_input, output, reasoning (cumulative maxima)
+    baseline = [0, 0, 0, 0]  # current epoch maxima
 
     for index, record in enumerate(records):
         record_type, payload, timestamp = _normalize_codex_record(record)
@@ -1183,6 +1458,12 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
         if token_totals is not None:
             input_tokens, cached_tokens, output_tokens, reasoning_tokens = token_totals
             current = [input_tokens, cached_tokens, output_tokens, reasoning_tokens]
+            if any(baseline) and _is_explicit_codex_counter_reset(
+                record_type, payload
+            ):
+                # Applies while folding replay too: only the terminal
+                # inherited epoch may baseline the leaf-native continuation.
+                baseline = [0, 0, 0, 0]
             if not in_replay:
                 delta_input = max(0, input_tokens - baseline[0])
                 delta_cached = max(0, cached_tokens - baseline[1])
@@ -1196,7 +1477,7 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
                 cached_input_tokens += delta_cached
                 total_output_tokens += delta_output
                 reasoning_output_tokens += delta_reasoning
-                if delta_fresh or delta_cached or delta_output:
+                if delta_fresh or delta_cached or delta_output or delta_reasoning:
                     bucket = _daily_bucket(daily, timestamp)
                     if bucket is not None:
                         bucket.fresh_input_tokens += delta_fresh
@@ -1267,6 +1548,26 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
             if call_id and str(call_id) in tool_call_index_by_id:
                 tool_calls[tool_call_index_by_id[str(call_id)]].is_error = is_error
 
+    total_input_tokens = fresh_input_tokens + cached_input_tokens
+    _reconcile_daily_usage(
+        daily,
+        fallback_day,
+        {
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "fresh_input_tokens": fresh_input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_creation_5m_input_tokens": 0,
+            "cache_creation_1h_input_tokens": 0,
+            "cache_creation_unknown_input_tokens": 0,
+            "reasoning_output_tokens": reasoning_output_tokens,
+            "user_message_count": user_message_count,
+            "assistant_message_count": assistant_message_count,
+            "tool_call_count": len(tool_calls),
+        },
+    )
+
     return SessionInfo(
         session_id=session_id,
         source="codex",
@@ -1277,7 +1578,7 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
         assistant_message_count=assistant_message_count,
         tool_call_count=len(tool_calls),
         error_count=error_count,
-        total_input_tokens=fresh_input_tokens + cached_input_tokens,
+        total_input_tokens=total_input_tokens,
         total_output_tokens=total_output_tokens,
         fresh_input_tokens=fresh_input_tokens,
         cached_input_tokens=cached_input_tokens,
@@ -1285,6 +1586,8 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
         first_user_message=first_user_message,
         model=model,
         workspace_root=workspace_root,
+        thread_id=thread_id,
+        parent_thread_id=parent_thread_id,
         parent_session_id=parent_session_id,
         spawn_depth=spawn_depth,
         tool_calls=tool_calls,

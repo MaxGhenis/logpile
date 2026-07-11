@@ -31,6 +31,7 @@ NATIVE_TOKEN_COLUMNS = (
     ("native_cache_creation_input_tokens", "cache_creation_input_tokens"),
     ("native_cache_creation_5m_input_tokens", "cache_creation_5m_input_tokens"),
     ("native_cache_creation_1h_input_tokens", "cache_creation_1h_input_tokens"),
+    ("native_cache_creation_unknown_input_tokens", "cache_creation_unknown_input_tokens"),
     ("native_reasoning_output_tokens", "reasoning_output_tokens"),
     ("native_assistant_message_count", "assistant_message_count"),
 )
@@ -126,6 +127,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_creation_input_tokens INTEGER DEFAULT 0,
     cache_creation_5m_input_tokens INTEGER DEFAULT 0,
     cache_creation_1h_input_tokens INTEGER DEFAULT 0,
+    cache_creation_unknown_input_tokens INTEGER DEFAULT 0,
     reasoning_output_tokens INTEGER DEFAULT 0,
     native_total_input_tokens    INTEGER DEFAULT 0,
     native_total_output_tokens   INTEGER DEFAULT 0,
@@ -134,12 +136,16 @@ CREATE TABLE IF NOT EXISTS sessions (
     native_cache_creation_input_tokens INTEGER DEFAULT 0,
     native_cache_creation_5m_input_tokens INTEGER DEFAULT 0,
     native_cache_creation_1h_input_tokens INTEGER DEFAULT 0,
+    native_cache_creation_unknown_input_tokens INTEGER DEFAULT 0,
     native_reasoning_output_tokens INTEGER DEFAULT 0,
     native_assistant_message_count INTEGER DEFAULT 0,
     token_version        INTEGER DEFAULT 0,
     first_user_message    TEXT,
+    thread_id             TEXT,
+    parent_thread_id      TEXT,
     parent_session_id    TEXT,
     spawn_depth          INTEGER DEFAULT 0,
+    identity_version     INTEGER DEFAULT 0,
     visibility     TEXT NOT NULL DEFAULT 'public',
     visibility_source TEXT NOT NULL DEFAULT 'default',
     visibility_rule_id INTEGER,
@@ -165,6 +171,7 @@ CREATE TABLE IF NOT EXISTS session_daily_usage (
     cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_unknown_input_tokens INTEGER NOT NULL DEFAULT 0,
     reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
     native_total_input_tokens    INTEGER NOT NULL DEFAULT 0,
     native_total_output_tokens   INTEGER NOT NULL DEFAULT 0,
@@ -173,25 +180,22 @@ CREATE TABLE IF NOT EXISTS session_daily_usage (
     native_cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
     native_cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
     native_cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
+    native_cache_creation_unknown_input_tokens INTEGER NOT NULL DEFAULT 0,
     native_reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
     native_assistant_message_count INTEGER NOT NULL DEFAULT 0,
     user_message_count      INTEGER NOT NULL DEFAULT 0,
     assistant_message_count INTEGER NOT NULL DEFAULT 0,
     tool_call_count         INTEGER NOT NULL DEFAULT 0,
+    approximated            INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, day)
 );
 
--- Cross-session dedup ledger for Claude Code assistant messages. Resuming a
--- CC session copies prior history into a new transcript re-stamped with the
--- new sessionId, so the same (message.id, requestId) appears in every file
--- of a resume chain. Each parsed message claims its key here; the owner is
--- the session with the smallest (last_timestamp, first_timestamp,
--- session_id) among claimants — the earliest-ending transcript containing
--- the message, i.e. the session where it ran live (a resume copy always
--- ends at or after its source). native_* columns aggregate from here.
+-- Every Claude Code transcript occurrence is retained. Ownership is derived
+-- from all current claimants, so an unchanged duplicate can be promoted when
+-- the prior owner drops a claim or its session rank changes.
 CREATE TABLE IF NOT EXISTS message_claims (
-    claim_key TEXT PRIMARY KEY,
-    owner_session_id TEXT NOT NULL,
+    claim_key TEXT NOT NULL,
+    session_id TEXT NOT NULL,
     day TEXT,
     model TEXT,
     fresh_input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -199,7 +203,9 @@ CREATE TABLE IF NOT EXISTS message_claims (
     cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0
+    cache_creation_unknown_input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (claim_key, session_id)
 ) WITHOUT ROWID;
 
 -- Small key/value state for the sync pipeline itself (e.g. whether a
@@ -253,8 +259,10 @@ CREATE INDEX IF NOT EXISTS idx_sessions_status              ON sessions(session_
 CREATE INDEX IF NOT EXISTS idx_sessions_objective_family    ON sessions(objective_family);
 CREATE INDEX IF NOT EXISTS idx_sessions_origin              ON sessions(session_origin);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent_session      ON sessions(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_thread              ON sessions(source, username, thread_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_parent_thread       ON sessions(source, username, parent_thread_id);
 CREATE INDEX IF NOT EXISTS idx_session_daily_day            ON session_daily_usage(day);
-CREATE INDEX IF NOT EXISTS idx_message_claims_owner_day     ON message_claims(owner_session_id, day);
+CREATE INDEX IF NOT EXISTS idx_message_claims_session_day   ON message_claims(session_id, day);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session           ON tool_calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_name              ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_session_paths_session        ON session_paths(session_id);
@@ -310,6 +318,7 @@ SELECT
     d.cache_creation_input_tokens,
     d.cache_creation_5m_input_tokens,
     d.cache_creation_1h_input_tokens,
+    d.cache_creation_unknown_input_tokens,
     d.reasoning_output_tokens,
     d.native_total_input_tokens,
     d.native_total_output_tokens,
@@ -318,12 +327,13 @@ SELECT
     d.native_cache_creation_input_tokens,
     d.native_cache_creation_5m_input_tokens,
     d.native_cache_creation_1h_input_tokens,
+    d.native_cache_creation_unknown_input_tokens,
     d.native_reasoning_output_tokens,
     d.native_assistant_message_count,
     d.user_message_count,
     d.assistant_message_count,
     d.tool_call_count,
-    0 AS approximated
+    d.approximated
 FROM session_daily_usage d
 UNION ALL
 SELECT
@@ -336,6 +346,7 @@ SELECT
     COALESCE(s.cache_creation_input_tokens, 0),
     COALESCE(s.cache_creation_5m_input_tokens, 0),
     COALESCE(s.cache_creation_1h_input_tokens, 0),
+    COALESCE(s.cache_creation_unknown_input_tokens, 0),
     COALESCE(s.reasoning_output_tokens, 0),
     COALESCE(s.native_total_input_tokens, 0),
     COALESCE(s.native_total_output_tokens, 0),
@@ -344,6 +355,7 @@ SELECT
     COALESCE(s.native_cache_creation_input_tokens, 0),
     COALESCE(s.native_cache_creation_5m_input_tokens, 0),
     COALESCE(s.native_cache_creation_1h_input_tokens, 0),
+    COALESCE(s.native_cache_creation_unknown_input_tokens, 0),
     COALESCE(s.native_reasoning_output_tokens, 0),
     COALESCE(s.native_assistant_message_count, 0),
     COALESCE(s.user_message_count, 0),
@@ -355,6 +367,32 @@ WHERE s.first_timestamp IS NOT NULL
   AND NOT EXISTS (
       SELECT 1 FROM session_daily_usage d2 WHERE d2.session_id = s.session_id
   );
+
+-- The minimum-ranked live claimant owns each message. NULL timestamps rank
+-- after dated sessions, and session_id is the deterministic final tie-break.
+DROP VIEW IF EXISTS message_claim_owners;
+CREATE VIEW message_claim_owners AS
+SELECT c.claim_key, c.session_id AS owner_session_id
+FROM message_claims c
+JOIN sessions s ON s.session_id = c.session_id
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM message_claims c2
+    JOIN sessions s2 ON s2.session_id = c2.session_id
+    WHERE c2.claim_key = c.claim_key
+      AND (
+          COALESCE(s2.last_timestamp, '~') < COALESCE(s.last_timestamp, '~')
+          OR (
+              COALESCE(s2.last_timestamp, '~') = COALESCE(s.last_timestamp, '~')
+              AND COALESCE(s2.first_timestamp, '~') < COALESCE(s.first_timestamp, '~')
+          )
+          OR (
+              COALESCE(s2.last_timestamp, '~') = COALESCE(s.last_timestamp, '~')
+              AND COALESCE(s2.first_timestamp, '~') = COALESCE(s.first_timestamp, '~')
+              AND c2.session_id < c.session_id
+          )
+      )
+);
 
 DROP VIEW IF EXISTS user_catalog;
 CREATE VIEW user_catalog AS
@@ -1343,6 +1381,99 @@ def _rebuild_identity_schema(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE users__new RENAME TO users")
 
 
+def _migrate_message_claim_occurrences(conn: sqlite3.Connection) -> None:
+    """Upgrade the winner-only claim ledger to one row per occurrence.
+
+    The legacy winner is retained as an occurrence. A token-version resync
+    subsequently repopulates unchanged losing claimants from available source
+    or shared transcripts. Marking the native refresh pending preserves the
+    interrupted-sync recovery contract across this schema transition.
+    """
+    columns = _table_columns(conn, "message_claims")
+    if "owner_session_id" in columns and "session_id" not in columns:
+        conn.execute("DROP VIEW IF EXISTS message_claim_owners")
+        conn.execute("DROP INDEX IF EXISTS idx_message_claims_owner_day")
+        conn.execute("ALTER TABLE message_claims RENAME TO message_claims__winners")
+        conn.execute(
+            """
+            CREATE TABLE message_claims (
+                claim_key TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                day TEXT,
+                model TEXT,
+                fresh_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_unknown_input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (claim_key, session_id)
+            ) WITHOUT ROWID
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO message_claims (
+                claim_key, session_id, day, model,
+                fresh_input_tokens, cached_input_tokens,
+                cache_creation_input_tokens,
+                cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens,
+                cache_creation_unknown_input_tokens,
+                output_tokens
+            )
+            SELECT
+                claim_key, owner_session_id, day, model,
+                fresh_input_tokens, cached_input_tokens,
+                cache_creation_input_tokens,
+                CASE
+                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
+                         <= cache_creation_input_tokens
+                    THEN cache_creation_5m_input_tokens ELSE 0
+                END,
+                CASE
+                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
+                         <= cache_creation_input_tokens
+                    THEN cache_creation_1h_input_tokens ELSE 0
+                END,
+                CASE
+                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
+                         <= cache_creation_input_tokens
+                    THEN cache_creation_input_tokens
+                         - cache_creation_5m_input_tokens
+                         - cache_creation_1h_input_tokens
+                    ELSE cache_creation_input_tokens
+                END,
+                output_tokens
+            FROM message_claims__winners
+            """
+        )
+        conn.execute("DROP TABLE message_claims__winners")
+        conn.execute(
+            "INSERT OR REPLACE INTO logpile_meta (key, value) "
+            "VALUES ('native_refresh_pending', '1')"
+        )
+    else:
+        _ensure_column(
+            conn,
+            "message_claims",
+            "cache_creation_unknown_input_tokens",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+
+    changes_before_cleanup = conn.total_changes
+    conn.execute(
+        "DELETE FROM message_claims "
+        "WHERE session_id NOT IN (SELECT session_id FROM sessions)"
+    )
+    if conn.total_changes != changes_before_cleanup:
+        conn.execute(
+            "INSERT OR REPLACE INTO logpile_meta (key, value) "
+            "VALUES ('native_refresh_pending', '1')"
+        )
+
+
 def migrate_db(conn: sqlite3.Connection) -> None:
     conn.create_function("normalize_username_py", 1, lambda value: normalize_username(value or ""))
     conn.executescript(SCHEMA)
@@ -1431,17 +1562,104 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "sessions", "cache_creation_input_tokens", "INTEGER DEFAULT 0")
     _ensure_column(conn, "sessions", "cache_creation_5m_input_tokens", "INTEGER DEFAULT 0")
     _ensure_column(conn, "sessions", "cache_creation_1h_input_tokens", "INTEGER DEFAULT 0")
+    _ensure_column(
+        conn, "sessions", "cache_creation_unknown_input_tokens", "INTEGER DEFAULT 0"
+    )
+    _ensure_column(conn, "sessions", "thread_id", "TEXT")
+    _ensure_column(conn, "sessions", "parent_thread_id", "TEXT")
+    _ensure_column(conn, "sessions", "identity_version", "INTEGER DEFAULT 0")
+    # Before explicit raw thread fields existed, Codex stored the thread UUID
+    # in parent_session_id. Preserve that only lineage evidence when it is not
+    # already an exact canonical session key; the sync resolver will either
+    # map it after identity backfill or leave canonical parent_session_id NULL.
+    conn.execute(
+        """
+        UPDATE sessions AS child
+        SET parent_thread_id = child.parent_session_id
+        WHERE child.source = 'codex'
+          AND child.parent_thread_id IS NULL
+          AND child.parent_session_id IS NOT NULL
+          AND child.parent_session_id != ''
+          AND NOT EXISTS (
+              SELECT 1 FROM sessions AS parent
+              WHERE parent.session_id = child.parent_session_id
+          )
+        """
+    )
     _ensure_column(conn, "sessions", "file_size", "INTEGER")
     _ensure_column(conn, "sessions", "file_mtime", "REAL")
+    _ensure_column(
+        conn,
+        "session_daily_usage",
+        "cache_creation_unknown_input_tokens",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _ensure_column(
+        conn, "session_daily_usage", "approximated", "INTEGER NOT NULL DEFAULT 0"
+    )
     for native_column, _transcript_column in NATIVE_TOKEN_COLUMNS:
         _ensure_column(conn, "sessions", native_column, "INTEGER DEFAULT 0")
         _ensure_column(conn, "session_daily_usage", native_column, "INTEGER NOT NULL DEFAULT 0")
-    # Claims whose owning session left the ledger no longer feed any native
-    # aggregate; drop them. (Duplicates in other transcripts re-claim on
-    # their next re-parse, not automatically.)
-    conn.execute(
-        "DELETE FROM message_claims WHERE owner_session_id NOT IN (SELECT session_id FROM sessions)"
-    )
+    _migrate_message_claim_occurrences(conn)
+    for table in ("sessions", "session_daily_usage", "message_claims"):
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET cache_creation_unknown_input_tokens = CASE
+                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
+                         <= cache_creation_input_tokens
+                    THEN cache_creation_input_tokens
+                         - cache_creation_5m_input_tokens
+                         - cache_creation_1h_input_tokens
+                    ELSE cache_creation_input_tokens
+                END,
+                cache_creation_5m_input_tokens = CASE
+                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
+                         <= cache_creation_input_tokens
+                    THEN cache_creation_5m_input_tokens ELSE 0
+                END,
+                cache_creation_1h_input_tokens = CASE
+                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
+                         <= cache_creation_input_tokens
+                    THEN cache_creation_1h_input_tokens ELSE 0
+                END
+            WHERE cache_creation_5m_input_tokens
+                + cache_creation_1h_input_tokens
+                + cache_creation_unknown_input_tokens
+                != cache_creation_input_tokens
+            """
+        )
+    for table in ("sessions", "session_daily_usage"):
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET native_cache_creation_unknown_input_tokens = CASE
+                    WHEN native_cache_creation_5m_input_tokens
+                       + native_cache_creation_1h_input_tokens
+                         <= native_cache_creation_input_tokens
+                    THEN native_cache_creation_input_tokens
+                       - native_cache_creation_5m_input_tokens
+                       - native_cache_creation_1h_input_tokens
+                    ELSE native_cache_creation_input_tokens
+                END,
+                native_cache_creation_5m_input_tokens = CASE
+                    WHEN native_cache_creation_5m_input_tokens
+                       + native_cache_creation_1h_input_tokens
+                         <= native_cache_creation_input_tokens
+                    THEN native_cache_creation_5m_input_tokens ELSE 0
+                END,
+                native_cache_creation_1h_input_tokens = CASE
+                    WHEN native_cache_creation_5m_input_tokens
+                       + native_cache_creation_1h_input_tokens
+                         <= native_cache_creation_input_tokens
+                    THEN native_cache_creation_1h_input_tokens ELSE 0
+                END
+            WHERE native_cache_creation_5m_input_tokens
+                + native_cache_creation_1h_input_tokens
+                + native_cache_creation_unknown_input_tokens
+                != native_cache_creation_input_tokens
+            """
+        )
     # Give pre-claims rows sane native values immediately (mirror transcript
     # totals) so aggregate readers never see zeros between the column
     # migration and the first full re-parse.
@@ -1781,16 +1999,39 @@ def upsert_session(conn, data: dict):
         "cache_creation_input_tokens": 0,
         "cache_creation_5m_input_tokens": 0,
         "cache_creation_1h_input_tokens": 0,
+        "cache_creation_unknown_input_tokens": 0,
         "reasoning_output_tokens": 0,
         "token_version": 0,
+        "thread_id": None,
+        "parent_thread_id": None,
         "parent_session_id": None,
         "spawn_depth": 0,
+        "identity_version": 0,
         "file_size": None,
         "file_mtime": None,
         **data,
     }
     if payload.get("username"):
         payload["username"] = normalize_username(str(payload["username"]))
+    cache_creation = max(0, int(payload.get("cache_creation_input_tokens", 0) or 0))
+    cache_5m = max(0, int(payload.get("cache_creation_5m_input_tokens", 0) or 0))
+    cache_1h = max(0, int(payload.get("cache_creation_1h_input_tokens", 0) or 0))
+    cache_unknown = max(
+        0, int(payload.get("cache_creation_unknown_input_tokens", 0) or 0)
+    )
+    if cache_5m + cache_1h > cache_creation:
+        cache_5m = cache_1h = 0
+        cache_unknown = cache_creation
+    elif cache_5m + cache_1h + cache_unknown != cache_creation:
+        cache_unknown = cache_creation - cache_5m - cache_1h
+    payload.update(
+        {
+            "cache_creation_input_tokens": cache_creation,
+            "cache_creation_5m_input_tokens": cache_5m,
+            "cache_creation_1h_input_tokens": cache_1h,
+            "cache_creation_unknown_input_tokens": cache_unknown,
+        }
+    )
     conn.execute(
         """
         INSERT INTO sessions
@@ -1807,7 +2048,9 @@ def upsert_session(conn, data: dict):
              session_origin, origin_version,
              total_input_tokens, total_output_tokens, fresh_input_tokens, cached_input_tokens,
              cache_creation_input_tokens, cache_creation_5m_input_tokens, cache_creation_1h_input_tokens,
-             reasoning_output_tokens, token_version, first_user_message, parent_session_id, spawn_depth, visibility,
+             cache_creation_unknown_input_tokens,
+             reasoning_output_tokens, token_version, first_user_message, thread_id, parent_thread_id,
+             parent_session_id, spawn_depth, identity_version, visibility,
              visibility_source, visibility_rule_id, visibility_reason,
              is_private, file_hash, file_size, file_mtime, synced_at, model)
         VALUES
@@ -1824,7 +2067,9 @@ def upsert_session(conn, data: dict):
              :session_origin, :origin_version,
              :total_input_tokens, :total_output_tokens, :fresh_input_tokens, :cached_input_tokens,
              :cache_creation_input_tokens, :cache_creation_5m_input_tokens, :cache_creation_1h_input_tokens,
-             :reasoning_output_tokens, :token_version, :first_user_message, :parent_session_id, :spawn_depth, :visibility,
+             :cache_creation_unknown_input_tokens,
+             :reasoning_output_tokens, :token_version, :first_user_message, :thread_id, :parent_thread_id,
+             :parent_session_id, :spawn_depth, :identity_version, :visibility,
              :visibility_source, :visibility_rule_id, :visibility_reason,
              :is_private, :file_hash, :file_size, :file_mtime, :synced_at, :model)
         ON CONFLICT(session_id) DO UPDATE SET
@@ -1880,11 +2125,15 @@ def upsert_session(conn, data: dict):
             cache_creation_input_tokens = excluded.cache_creation_input_tokens,
             cache_creation_5m_input_tokens = excluded.cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens = excluded.cache_creation_1h_input_tokens,
+            cache_creation_unknown_input_tokens = excluded.cache_creation_unknown_input_tokens,
             reasoning_output_tokens = excluded.reasoning_output_tokens,
             token_version = excluded.token_version,
             first_user_message = excluded.first_user_message,
+            thread_id = excluded.thread_id,
+            parent_thread_id = excluded.parent_thread_id,
             parent_session_id = excluded.parent_session_id,
             spawn_depth = excluded.spawn_depth,
+            identity_version = excluded.identity_version,
             visibility = CASE
                 WHEN COALESCE(NULLIF(sessions.visibility_source, ''), 'default') = 'manual'
                 THEN COALESCE(NULLIF(sessions.visibility, ''), excluded.visibility)
@@ -1925,6 +2174,58 @@ def upsert_session(conn, data: dict):
 
 
 def insert_session_daily_usage(conn, session_id: str, daily_usage: list):
+    daily_usage = list(daily_usage)
+    session_row = conn.execute(
+        """
+        SELECT total_input_tokens, total_output_tokens, fresh_input_tokens,
+               cached_input_tokens, cache_creation_input_tokens,
+               cache_creation_5m_input_tokens, cache_creation_1h_input_tokens,
+               cache_creation_unknown_input_tokens, reasoning_output_tokens,
+               user_message_count, assistant_message_count, tool_call_count
+        FROM sessions WHERE session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    component_fields = (
+        "total_input_tokens",
+        "total_output_tokens",
+        "fresh_input_tokens",
+        "cached_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_creation_5m_input_tokens",
+        "cache_creation_1h_input_tokens",
+        "cache_creation_unknown_input_tokens",
+        "reasoning_output_tokens",
+        "user_message_count",
+        "assistant_message_count",
+        "tool_call_count",
+    )
+    if session_row is not None:
+        mismatches = {
+            field: (
+                sum(int(getattr(day, field, 0) or 0) for day in daily_usage),
+                int(session_row[field] or 0),
+            )
+            for field in component_fields
+            if sum(int(getattr(day, field, 0) or 0) for day in daily_usage)
+            != int(session_row[field] or 0)
+        }
+        if mismatches:
+            raise ValueError(
+                f"daily usage does not reconcile for session {session_id}: {mismatches}"
+            )
+    for day in daily_usage:
+        cache_creation = int(day.cache_creation_input_tokens or 0)
+        split = (
+            int(day.cache_creation_5m_input_tokens or 0)
+            + int(day.cache_creation_1h_input_tokens or 0)
+            + int(day.cache_creation_unknown_input_tokens or 0)
+        )
+        if split != cache_creation:
+            raise ValueError(
+                f"cache-creation daily split does not reconcile for {session_id} "
+                f"on {day.day}: {split} != {cache_creation}"
+            )
     conn.execute("DELETE FROM session_daily_usage WHERE session_id = ?", (session_id,))
     if not daily_usage:
         return
@@ -1935,9 +2236,11 @@ def insert_session_daily_usage(conn, session_id: str, daily_usage: list):
             total_input_tokens, total_output_tokens,
             fresh_input_tokens, cached_input_tokens,
             cache_creation_input_tokens, cache_creation_5m_input_tokens,
-            cache_creation_1h_input_tokens, reasoning_output_tokens,
-            user_message_count, assistant_message_count, tool_call_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            cache_creation_1h_input_tokens,
+            cache_creation_unknown_input_tokens, reasoning_output_tokens,
+            user_message_count, assistant_message_count, tool_call_count,
+            approximated
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -1950,10 +2253,12 @@ def insert_session_daily_usage(conn, session_id: str, daily_usage: list):
                 d.cache_creation_input_tokens,
                 d.cache_creation_5m_input_tokens,
                 d.cache_creation_1h_input_tokens,
+                d.cache_creation_unknown_input_tokens,
                 d.reasoning_output_tokens,
                 d.user_message_count,
                 d.assistant_message_count,
                 d.tool_call_count,
+                1 if d.approximated else 0,
             )
             for d in daily_usage
         ],
@@ -1977,123 +2282,109 @@ def _session_rank(last_timestamp, first_timestamp, session_id) -> tuple[str, str
 
 
 def apply_message_claims(conn, session_id: str, message_usage: list) -> set[str]:
-    """Resolve cross-session ownership for one parsed session's messages.
+    """Replace one session's occurrences and return every possibly stale owner.
 
-    Upserts this session's claims into message_claims: new keys are claimed,
-    keys it already owns get refreshed values, keys owned by a higher-ranked
-    session are stolen, and stale keys it owns but no longer emits are
-    deleted. Because ownership is a pure min-rule over current session ranks,
-    the final owner set is the same whatever order files are (re)parsed in.
-
-    The session's own row must already be upserted (rank reads sessions).
-    Returns the set of session ids whose native aggregates are now stale
-    (always includes session_id itself when anything changed).
+    Losing occurrences remain in the ledger. The `message_claim_owners` view
+    derives the minimum-ranked live claimant from all rows, so a reparse that
+    drops a winning key or changes a session rank immediately promotes an
+    unchanged loser. Returning every claimant for touched keys makes the
+    scoped native refresh correct before and after any such ownership change.
     """
-    my_row = conn.execute(
-        "SELECT last_timestamp, first_timestamp FROM sessions WHERE session_id = ?",
-        (session_id,),
-    ).fetchone()
-    my_rank = _session_rank(
-        my_row["last_timestamp"] if my_row else None,
-        my_row["first_timestamp"] if my_row else None,
-        session_id,
-    )
-
-    affected: set[str] = set()
+    message_usage = list(message_usage)
     current_keys = {m.claim_key for m in message_usage}
-
-    existing: dict[str, tuple] = {}
-    keys = sorted(current_keys)
-    for chunk in _chunked(keys):
-        placeholders = ",".join("?" * len(chunk))
-        for row in conn.execute(
-            f"""
-            SELECT c.claim_key, c.owner_session_id,
-                   s.session_id AS owner_in_ledger,
-                   s.last_timestamp, s.first_timestamp,
-                   c.day, c.model,
-                   c.fresh_input_tokens, c.cached_input_tokens,
-                   c.cache_creation_input_tokens, c.cache_creation_5m_input_tokens,
-                   c.cache_creation_1h_input_tokens, c.output_tokens
-            FROM message_claims c
-            LEFT JOIN sessions s ON s.session_id = c.owner_session_id
-            WHERE c.claim_key IN ({placeholders})
-            """,
-            chunk,
-        ):
-            existing[row["claim_key"]] = row
-
-    to_write = []
-    for m in message_usage:
-        values = (
-            m.day, m.model,
-            m.fresh_input_tokens, m.cached_input_tokens,
-            m.cache_creation_input_tokens, m.cache_creation_5m_input_tokens,
-            m.cache_creation_1h_input_tokens, m.output_tokens,
-        )
-        row = existing.get(m.claim_key)
-        if row is None:
-            to_write.append((m.claim_key, session_id) + values)
-            affected.add(session_id)
-            continue
-        owner = row["owner_session_id"]
-        if owner != session_id:
-            if row["owner_in_ledger"] is None:
-                # Owner vanished from the ledger: any live claimant takes over
-                # ("~~" outranks even a timestamp-less session's "~").
-                owner_rank = ("~~", "~~", "~~")
-            else:
-                owner_rank = _session_rank(
-                    row["last_timestamp"], row["first_timestamp"], owner
-                )
-            if my_rank < owner_rank:
-                to_write.append((m.claim_key, session_id) + values)
-                affected.add(session_id)
-                affected.add(owner)
-            continue
-        if (
-            row["day"], row["model"],
-            row["fresh_input_tokens"], row["cached_input_tokens"],
-            row["cache_creation_input_tokens"], row["cache_creation_5m_input_tokens"],
-            row["cache_creation_1h_input_tokens"], row["output_tokens"],
-        ) != values:
-            to_write.append((m.claim_key, session_id) + values)
-            affected.add(session_id)
-
-    if to_write:
-        conn.executemany(
-            """
-            INSERT OR REPLACE INTO message_claims (
-                claim_key, owner_session_id, day, model,
-                fresh_input_tokens, cached_input_tokens,
-                cache_creation_input_tokens, cache_creation_5m_input_tokens,
-                cache_creation_1h_input_tokens, output_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            to_write,
-        )
-
-    # A re-parse can retire keys this session claimed earlier (e.g. the
-    # kept-copy of a retried message.id changed requestId). Every transcript
-    # holding the message keeps the retired key out of its parse for the same
-    # reason, so deleting is safe — no other session is waiting to claim it.
-    owned = [
+    old_keys = {
         row[0]
         for row in conn.execute(
-            "SELECT claim_key FROM message_claims WHERE owner_session_id = ?",
+            "SELECT claim_key FROM message_claims WHERE session_id = ?",
             (session_id,),
         )
-    ]
-    stale = [key for key in owned if key not in current_keys]
-    if stale:
-        for chunk in _chunked(stale):
-            placeholders = ",".join("?" * len(chunk))
-            conn.execute(
-                f"DELETE FROM message_claims WHERE owner_session_id = ? AND claim_key IN ({placeholders})",
-                [session_id, *chunk],
-            )
-        affected.add(session_id)
+    }
+    touched_keys = old_keys | current_keys
+    if not touched_keys:
+        return set()
 
+    affected: set[str] = {session_id}
+
+    def add_current_claimants(keys: set[str]) -> None:
+        for chunk in _chunked(sorted(keys)):
+            placeholders = ",".join("?" * len(chunk))
+            affected.update(
+                row[0]
+                for row in conn.execute(
+                    f"SELECT DISTINCT session_id FROM message_claims "
+                    f"WHERE claim_key IN ({placeholders})",
+                    chunk,
+                )
+            )
+
+    add_current_claimants(touched_keys)
+
+    rows_to_write = []
+    for message in message_usage:
+        total = max(0, int(message.cache_creation_input_tokens or 0))
+        cache_5m = max(0, int(message.cache_creation_5m_input_tokens or 0))
+        cache_1h = max(0, int(message.cache_creation_1h_input_tokens or 0))
+        cache_unknown = max(
+            0,
+            int(
+                getattr(message, "cache_creation_unknown_input_tokens", 0) or 0
+            ),
+        )
+        if cache_5m + cache_1h > total:
+            cache_5m = cache_1h = 0
+            cache_unknown = total
+        elif cache_5m + cache_1h + cache_unknown != total:
+            cache_unknown = total - cache_5m - cache_1h
+        rows_to_write.append(
+            (
+                message.claim_key,
+                session_id,
+                message.day,
+                message.model,
+                message.fresh_input_tokens,
+                message.cached_input_tokens,
+                total,
+                cache_5m,
+                cache_1h,
+                cache_unknown,
+                message.output_tokens,
+            )
+        )
+    if rows_to_write:
+        conn.executemany(
+            """
+            INSERT INTO message_claims (
+                claim_key, session_id, day, model,
+                fresh_input_tokens, cached_input_tokens,
+                cache_creation_input_tokens, cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens,
+                cache_creation_unknown_input_tokens, output_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(claim_key, session_id) DO UPDATE SET
+                day = excluded.day,
+                model = excluded.model,
+                fresh_input_tokens = excluded.fresh_input_tokens,
+                cached_input_tokens = excluded.cached_input_tokens,
+                cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+                cache_creation_5m_input_tokens = excluded.cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens = excluded.cache_creation_1h_input_tokens,
+                cache_creation_unknown_input_tokens =
+                    excluded.cache_creation_unknown_input_tokens,
+                output_tokens = excluded.output_tokens
+            """,
+            rows_to_write,
+        )
+
+    stale_keys = old_keys - current_keys
+    for chunk in _chunked(sorted(stale_keys)):
+        placeholders = ",".join("?" * len(chunk))
+        conn.execute(
+            f"DELETE FROM message_claims WHERE session_id = ? "
+            f"AND claim_key IN ({placeholders})",
+            [session_id, *chunk],
+        )
+
+    add_current_claimants(touched_keys)
     return affected
 
 
@@ -2139,6 +2430,7 @@ def _refresh_native_claims(conn, session_ids=None) -> None:
         COALESCE(SUM(c.cache_creation_input_tokens), 0),
         COALESCE(SUM(c.cache_creation_5m_input_tokens), 0),
         COALESCE(SUM(c.cache_creation_1h_input_tokens), 0),
+        COALESCE(SUM(c.cache_creation_unknown_input_tokens), 0),
         0,
         COUNT(c.claim_key)
     """
@@ -2147,8 +2439,11 @@ def _refresh_native_claims(conn, session_ids=None) -> None:
         f"""
         UPDATE sessions SET ({native_columns}) = (
             SELECT {aggregates}
-            FROM message_claims c
-            WHERE c.owner_session_id = sessions.session_id
+            FROM message_claim_owners o
+            JOIN message_claims c
+              ON c.claim_key = o.claim_key
+             AND c.session_id = o.owner_session_id
+            WHERE o.owner_session_id = sessions.session_id
         )
         WHERE source = 'claudecode' AND COALESCE(token_version, 0) >= ?{scope}
         """,
@@ -2158,8 +2453,11 @@ def _refresh_native_claims(conn, session_ids=None) -> None:
         f"""
         UPDATE session_daily_usage SET ({native_columns}) = (
             SELECT {aggregates}
-            FROM message_claims c
-            WHERE c.owner_session_id = session_daily_usage.session_id
+            FROM message_claim_owners o
+            JOIN message_claims c
+              ON c.claim_key = o.claim_key
+             AND c.session_id = o.owner_session_id
+            WHERE o.owner_session_id = session_daily_usage.session_id
               AND c.day = session_daily_usage.day
         )
         WHERE session_id IN (

@@ -44,12 +44,15 @@ from .db import (
 
 SESSION_ACTIVITY_VERSION = 1
 SESSION_NARRATIVE_VERSION = 1
+SESSION_IDENTITY_VERSION = 1
 # 4: codex replay-burst deltas (resume snapshots no longer re-count history),
 #    Claude cache_creation capture, per-day usage rows, file size/mtime.
 # 5: cross-session Claude dedup — parses emit message_claims and native_*
 #    columns are claims-derived (db.CLAIMS_TOKEN_VERSION).
 # 6: ISO-8601 timestamps are normalized to UTC before daily usage bucketing.
-SESSION_TOKEN_VERSION = 6
+# 7: structural Codex replay/reset accounting, explicit residual daily usage,
+#    and exact Claude cache-creation subtype accounting.
+SESSION_TOKEN_VERSION = 7
 
 
 class SyncStatus(str, Enum):
@@ -983,7 +986,17 @@ def project_from_claude_path(jsonl_path: Path) -> str:
       -Users-maxghenis-PolicyEngine-policyengine-us
     We decode and return the leaf directory name.
     """
-    dir_name = jsonl_path.parent.name  # e.g. -Users-maxghenis-PolicyEngine-policyengine-us
+    # A sidechain lives below
+    #   <encoded-project>/<root-session>/subagents/<agent>.jsonl
+    # (and some workflow journals nest more deeply below ``subagents``).
+    # The immediate parent is therefore not the encoded project directory.
+    parts = jsonl_path.parts
+    if "subagents" in parts:
+        subagents_index = len(parts) - 1 - tuple(reversed(parts)).index("subagents")
+        project_index = subagents_index - 2
+        dir_name = parts[project_index] if project_index >= 0 else jsonl_path.parent.name
+    else:
+        dir_name = jsonl_path.parent.name
     if dir_name.startswith("-"):
         dir_name = dir_name[1:]
     # Claude replaces '/' with '-', but so does '-' in repo names, so just take last segment
@@ -993,6 +1006,21 @@ def project_from_claude_path(jsonl_path: Path) -> str:
         if part and len(part) > 1:
             return part
     return dir_name or "unknown"
+
+
+def _is_claude_workflow_journal(jsonl_path: Path) -> bool:
+    """Claude workflow progress journals are not standalone transcripts.
+
+    They repeat the same agentId as the full ``agent-*.jsonl`` transcript and
+    contain only started/result progress records. Indexing both would make the
+    zero-usage journal overwrite the real agent row; every journal is also
+    literally named ``journal.jsonl``, so archived copies would collide.
+    """
+    return (
+        jsonl_path.name == "journal.jsonl"
+        and "subagents" in jsonl_path.parts
+        and "workflows" in jsonl_path.parts
+    )
 
 
 def _git_output(workspace: Path, *args: str) -> str | None:
@@ -1375,16 +1403,15 @@ def _compute_duration(t1: str, t2: str) -> float | None:
 
 
 def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[str]]:
-    """Re-parse sessions whose source file is gone but whose shared copy
-    survives, refreshing token columns, per-day usage rows, and message
-    claims.
+    """Re-parse stale sessions whose source is gone but shared copy survives.
 
     Claude Code rotates transcripts after ~30 days and Codex sessions can be
     deleted outright; the ledger keeps their rows. Without this, those rows
-    could never pick up accounting fixes (SESSION_TOKEN_VERSION bumps) —
-    they'd keep whatever numbers the buggy parser wrote. Only token fields,
-    daily usage, and claims are refreshed; identity, narrative, and path
-    data from the original parse stay untouched.
+    could never pick up parser fixes. Refresh every parser-derived field that
+    replay detection can suppress: identity/lineage, timestamps, message and
+    tool counts, tool rows, token components, daily usage, and claims. Repo,
+    narrative, visibility, and storage metadata remain untouched because they
+    depend on sync-time context rather than transcript parsing.
 
     Returns (backfilled_count, session ids needing a native_* refresh).
     """
@@ -1392,10 +1419,13 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
         """
         SELECT session_id, source, source_path, shared_path
         FROM sessions
-        WHERE COALESCE(token_version, 0) < ?
+        WHERE (
+                COALESCE(token_version, 0) < ?
+                OR COALESCE(identity_version, 0) < ?
+              )
           AND shared_path IS NOT NULL AND shared_path != ''
         """,
-        (SESSION_TOKEN_VERSION,),
+        (SESSION_TOKEN_VERSION, SESSION_IDENTITY_VERSION),
     ).fetchall()
     backfilled = 0
     affected: set[str] = set()
@@ -1423,18 +1453,40 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
         conn.execute(
             """
             UPDATE sessions
-            SET total_input_tokens = ?,
+            SET first_timestamp = ?,
+                last_timestamp = ?,
+                duration_seconds = ?,
+                user_message_count = ?,
+                assistant_message_count = ?,
+                tool_call_count = ?,
+                error_count = ?,
+                total_input_tokens = ?,
                 total_output_tokens = ?,
                 fresh_input_tokens = ?,
                 cached_input_tokens = ?,
                 cache_creation_input_tokens = ?,
                 cache_creation_5m_input_tokens = ?,
                 cache_creation_1h_input_tokens = ?,
+                cache_creation_unknown_input_tokens = ?,
                 reasoning_output_tokens = ?,
-                token_version = ?
+                token_version = ?,
+                first_user_message = ?,
+                parent_session_id = ?,
+                spawn_depth = ?,
+                thread_id = ?,
+                parent_thread_id = ?,
+                identity_version = ?,
+                model = COALESCE(?, model)
             WHERE session_id = ?
             """,
             (
+                info.first_timestamp,
+                info.last_timestamp,
+                _compute_duration(info.first_timestamp, info.last_timestamp),
+                info.user_message_count,
+                info.assistant_message_count,
+                info.tool_call_count,
+                info.error_count,
                 info.total_input_tokens,
                 info.total_output_tokens,
                 info.fresh_input_tokens,
@@ -1442,11 +1494,20 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
                 info.cache_creation_input_tokens,
                 info.cache_creation_5m_input_tokens,
                 info.cache_creation_1h_input_tokens,
+                info.cache_creation_unknown_input_tokens,
                 info.reasoning_output_tokens,
                 SESSION_TOKEN_VERSION,
+                info.first_user_message,
+                info.parent_session_id if row["source"] == "claudecode" else None,
+                info.spawn_depth,
+                info.thread_id,
+                info.parent_thread_id,
+                SESSION_IDENTITY_VERSION,
+                info.model,
                 row["session_id"],
             ),
         )
+        insert_tool_calls(conn, row["session_id"], info.tool_calls)
         insert_session_daily_usage(conn, row["session_id"], info.daily_usage)
         affected.add(row["session_id"])
         if row["source"] == "claudecode":
@@ -1456,8 +1517,67 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
             conn.commit()
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         if verbose:
-            print(f"  Backfilled tokens from shared copy: {row['session_id'][:20]}…")
+            print(f"  Backfilled parsed state from shared copy: {row['session_id'][:20]}…")
     return backfilled, affected
+
+
+def _resolve_canonical_parents(conn) -> None:
+    """Resolve raw thread parentage to exact, same-owner session keys.
+
+    Codex stores a thread UUID in transcript metadata while the ledger uses
+    the full rollout filename stem as its primary key. Resolution is deferred
+    until every live and rotated transcript has been parsed so a child may be
+    encountered before its parent. Raw ``parent_thread_id`` remains available
+    even when no canonical parent exists; ``parent_session_id`` is NULL unless
+    it joins an actual same-user, same-source row and never points to itself.
+    """
+    conn.execute(
+        """
+        UPDATE sessions AS child
+        SET parent_session_id = (
+            SELECT parent.session_id
+            FROM sessions AS parent
+            WHERE parent.username = child.username
+              AND parent.source = child.source
+              AND parent.thread_id = child.parent_thread_id
+              AND (child.thread_id IS NULL OR parent.thread_id != child.thread_id)
+              AND parent.session_id != child.session_id
+            ORDER BY COALESCE(parent.first_timestamp, ''), parent.session_id
+            LIMIT 1
+        )
+        WHERE child.parent_thread_id IS NOT NULL
+          AND child.parent_thread_id != ''
+        """
+    )
+    # A current Codex row without raw parent evidence is a root. Older raw UUID
+    # values in parent_session_id must not survive as dangling pseudo-keys.
+    conn.execute(
+        """
+        UPDATE sessions
+        SET parent_session_id = NULL
+        WHERE source = 'codex'
+          AND (parent_thread_id IS NULL OR parent_thread_id = '')
+        """
+    )
+    # Claude parents are already canonical session ids, but validate them with
+    # the same graph-integrity rule and clear unresolved/self references.
+    conn.execute(
+        """
+        UPDATE sessions AS child
+        SET parent_session_id = NULL
+        WHERE child.parent_session_id IS NOT NULL
+          AND (
+            child.parent_session_id = child.session_id
+            OR NOT EXISTS (
+                SELECT 1
+                FROM sessions AS parent
+                WHERE parent.session_id = child.parent_session_id
+                  AND parent.username = child.username
+                  AND parent.source = child.source
+            )
+          )
+        """
+    )
 
 
 def _is_rotation_error(exc: OSError) -> bool:
@@ -1617,6 +1737,7 @@ def _sync_sessions(
                     session_origin,
                     origin_version,
                     token_version,
+                    identity_version,
                     workspace_root,
                     worktree_root,
                     repo_name,
@@ -1663,6 +1784,55 @@ def _sync_sessions(
 
                 session_id = jsonl_path.stem
                 existing_row = existing.get(session_id)
+                if _is_claude_workflow_journal(jsonl_path):
+                    # Remove the one legacy stem-keyed progress row when this
+                    # exact journal created it. Full agent transcripts remain
+                    # indexed under agent-{agentId}; other journals with the
+                    # same filename cannot accidentally delete that row.
+                    if (
+                        existing_row
+                        and existing_row["source_path"] == str(jsonl_path)
+                    ):
+                        claim_keys = [
+                            row[0]
+                            for row in conn.execute(
+                                "SELECT claim_key FROM message_claims "
+                                "WHERE session_id = ?",
+                                (session_id,),
+                            )
+                        ]
+                        for chunk in (
+                            claim_keys[start:start + 500]
+                            for start in range(0, len(claim_keys), 500)
+                        ):
+                            placeholders = ",".join("?" * len(chunk))
+                            affected_native.update(
+                                row[0]
+                                for row in conn.execute(
+                                    f"SELECT DISTINCT session_id FROM message_claims "
+                                    f"WHERE claim_key IN ({placeholders})",
+                                    chunk,
+                                )
+                            )
+                        for table in (
+                            "message_claims",
+                            "tool_calls",
+                            "session_paths",
+                            "session_daily_usage",
+                        ):
+                            conn.execute(
+                                f"DELETE FROM {table} WHERE session_id = ?",
+                                (session_id,),
+                            )
+                        conn.execute(
+                            "DELETE FROM sessions WHERE session_id = ?",
+                            (session_id,),
+                        )
+                        updated_count += 1
+                        flush_if_needed()
+                    else:
+                        skipped_count += 1
+                    continue
                 needs_structure_backfill = bool(
                     existing_row and (
                         (existing_row["workspace_root"] or "") == ""
@@ -1675,6 +1845,7 @@ def _sync_sessions(
                         or (existing_row["objective_version"] or 0) < SESSION_OBJECTIVE_VERSION
                         or (existing_row["origin_version"] or 0) < SESSION_ORIGIN_VERSION
                         or (existing_row["token_version"] or 0) < SESSION_TOKEN_VERSION
+                        or (existing_row["identity_version"] or 0) < SESSION_IDENTITY_VERSION
                         or (existing_row["session_origin"] or "") == ""
                         or (
                             (existing_row["tool_call_count"] or 0) > 0
@@ -1879,10 +2050,14 @@ def _sync_sessions(
                     "cache_creation_input_tokens": info.cache_creation_input_tokens,
                     "cache_creation_5m_input_tokens": info.cache_creation_5m_input_tokens,
                     "cache_creation_1h_input_tokens": info.cache_creation_1h_input_tokens,
+                    "cache_creation_unknown_input_tokens": info.cache_creation_unknown_input_tokens,
                     "reasoning_output_tokens": info.reasoning_output_tokens,
                     "token_version": SESSION_TOKEN_VERSION,
+                    "identity_version": SESSION_IDENTITY_VERSION,
                     "first_user_message": info.first_user_message,
                     "parent_session_id": info.parent_session_id,
+                    "thread_id": info.thread_id,
+                    "parent_thread_id": info.parent_thread_id,
                     "spawn_depth": info.spawn_depth,
                     "visibility": visibility["visibility"],
                     "visibility_source": visibility["visibility_source"],
@@ -1943,6 +2118,7 @@ def _sync_sessions(
                         or (existing_row["objective_version"] or 0) < SESSION_OBJECTIVE_VERSION
                         or (existing_row["origin_version"] or 0) < SESSION_ORIGIN_VERSION
                         or (existing_row["token_version"] or 0) < SESSION_TOKEN_VERSION
+                        or (existing_row["identity_version"] or 0) < SESSION_IDENTITY_VERSION
                         or (existing_row["session_origin"] or "") == ""
                         or (
                             (existing_row["tool_call_count"] or 0) > 0
@@ -2159,10 +2335,16 @@ def _sync_sessions(
                     "cache_creation_input_tokens": info.cache_creation_input_tokens,
                     "cache_creation_5m_input_tokens": info.cache_creation_5m_input_tokens,
                     "cache_creation_1h_input_tokens": info.cache_creation_1h_input_tokens,
+                    "cache_creation_unknown_input_tokens": info.cache_creation_unknown_input_tokens,
                     "reasoning_output_tokens": info.reasoning_output_tokens,
                     "token_version": SESSION_TOKEN_VERSION,
+                    "identity_version": SESSION_IDENTITY_VERSION,
                     "first_user_message": info.first_user_message,
-                    "parent_session_id": info.parent_session_id,
+                    # Codex metadata carries a raw thread UUID here; the exact
+                    # rollout-key parent is resolved after the complete scan.
+                    "parent_session_id": None,
+                    "thread_id": info.thread_id,
+                    "parent_thread_id": info.parent_thread_id,
                     "spawn_depth": info.spawn_depth,
                     "visibility": visibility["visibility"],
                     "visibility_source": visibility["visibility_source"],
@@ -2199,6 +2381,7 @@ def _sync_sessions(
         updated_count += backfilled
         affected_native |= backfill_affected
 
+        _resolve_canonical_parents(conn)
         refresh_native_usage(conn, None if force_full_refresh else affected_native)
         set_meta(conn, "native_refresh_pending", "0")
 

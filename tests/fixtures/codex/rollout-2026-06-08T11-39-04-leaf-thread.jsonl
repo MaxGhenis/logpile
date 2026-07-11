@@ -1,0 +1,11 @@
+{"timestamp":"2026-06-08T11:39:04.050Z","type":"session_meta","payload":{"id":"leaf-thread","timestamp":"2026-06-08T11:39:04.000Z","cwd":"/tmp/project","forked_from_id":"parent-thread","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-thread","depth":1,"agent_nickname":"fixture"}}}}}
+{"timestamp":"2026-06-08T11:39:04.051Z","type":"session_meta","payload":{"id":"parent-thread","timestamp":"2026-05-01T00:00:00.000Z","cwd":"/tmp/ancestor","forked_from_id":"grandparent-thread","source":{"subagent":{"thread_spawn":{"parent_thread_id":"grandparent-thread","depth":7,"agent_nickname":"ancestor"}}}}}
+{"timestamp":"2026-06-08T11:39:04.052Z","type":"event_msg","payload":{"type":"task_started","turn_id":"parent-turn","started_at":1777593600}}
+{"timestamp":"2026-06-08T11:39:04.053Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Inherited task"}]}}
+{"timestamp":"2026-06-08T11:39:04.054Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call-inherited","arguments":"{\"command\":[\"bash\",\"-lc\",\"pytest inherited\"]}"}}
+{"timestamp":"2026-06-08T11:39:04.055Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10000,"cached_input_tokens":8000,"output_tokens":500,"reasoning_output_tokens":100}}}}
+{"timestamp":"2026-06-08T11:39:04.056Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20000,"cached_input_tokens":16000,"output_tokens":900,"reasoning_output_tokens":200}}}}
+{"timestamp":"2026-06-08T12:00:00.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"leaf-turn","started_at":1780920000}}
+{"timestamp":"2026-06-08T12:00:00.010Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Live continuation"}]}}
+{"timestamp":"2026-06-08T12:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","call_id":"call-live","arguments":"{\"command\":[\"bash\",\"-lc\",\"ruff check .\"]}"}}
+{"timestamp":"2026-06-08T12:02:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25000,"cached_input_tokens":18000,"output_tokens":1100,"reasoning_output_tokens":250}}}}
