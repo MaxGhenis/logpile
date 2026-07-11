@@ -197,7 +197,7 @@ class SessionRuleTests(unittest.TestCase):
             )
 
             with open_sqlite(db_path) as conn:
-                set_session_visibility(conn, "session-1", "public", shared_dir=shared)
+                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
                 conn.commit()
 
             with session_path.open("a", encoding="utf-8") as fh:
@@ -234,7 +234,7 @@ class SessionRuleTests(unittest.TestCase):
                     """
                 ).fetchone()
 
-            self.assertEqual(row["visibility"], "public")
+            self.assertEqual(row["visibility"], "unlisted")
             self.assertEqual(row["visibility_source"], "manual")
             self.assertIsNone(row["visibility_rule_id"])
             self.assertEqual(row["visibility_reason"], "manual override")

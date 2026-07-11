@@ -4,7 +4,15 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from logpile.db import ensure_user, get_db, init_db, upsert_session, update_user
+from logpile.db import (
+    ensure_user,
+    get_db,
+    init_db,
+    transition_session_visibility,
+    upsert_session,
+    update_user,
+)
+from logpile.publish import publication_metadata_sha256
 
 
 def open_sqlite(path: Path):
@@ -59,7 +67,7 @@ def make_session(session_id: str, *, username: str, visibility: str) -> dict:
         "visibility_rule_id": None,
         "visibility_reason": f"default:{visibility}",
         "is_private": 1 if visibility == "private" else 0,
-        "file_hash": "hash",
+        "file_hash": "a" * 64,
         "synced_at": "2026-04-11T12:05:00+00:00",
         "model": "claude-3.7",
     }
@@ -75,6 +83,53 @@ class ContractViewTests(unittest.TestCase):
                 username = ensure_user(conn, "alice")
                 update_user(conn, username, profile_visibility="unlisted")
                 upsert_session(conn, make_session("public-1", username=username, visibility="public"))
+                public_row = conn.execute(
+                    "SELECT * FROM sessions WHERE session_id = 'public-1'"
+                ).fetchone()
+                metadata_sha256 = publication_metadata_sha256(public_row)
+                review_id = conn.execute(
+                    """
+                    INSERT INTO publication_reviews (
+                        session_id, reviewed_sha256, reviewed_artifact_path,
+                        reviewed_metadata_sha256,
+                        recommendation, approved_visibility, forced,
+                        successful, reviewed_at
+                    ) VALUES (?, ?, ?, ?, 'public', 'public', 0, 1, ?)
+                    """,
+                    (
+                        "public-1",
+                        "a" * 64,
+                        "/shared/.published/public-1/artifact.jsonl",
+                        metadata_sha256,
+                        "2026-04-11T12:05:00+00:00",
+                    ),
+                ).lastrowid
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET reviewed_sha256 = ?, reviewed_artifact_path = ?,
+                        publication_metadata_sha256 = ?,
+                        reviewed_metadata_sha256 = ?, publication_review_id = ?
+                    WHERE session_id = 'public-1'
+                    """,
+                    (
+                        "a" * 64,
+                        "/shared/.published/public-1/artifact.jsonl",
+                        metadata_sha256,
+                        metadata_sha256,
+                        review_id,
+                    ),
+                )
+                transition_session_visibility(
+                    conn,
+                    "public-1",
+                    "public",
+                    shared_dir=None,
+                    transition_source="review",
+                    reason="contract fixture reviewed publication",
+                    publication_review_id=review_id,
+                    manage_storage=False,
+                )
                 upsert_session(conn, make_session("unlisted-1", username=username, visibility="unlisted"))
                 upsert_session(conn, make_session("private-1", username=username, visibility="private"))
 

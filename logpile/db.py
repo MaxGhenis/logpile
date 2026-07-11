@@ -2,7 +2,9 @@
 import os
 import re
 import sqlite3
+import warnings
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -12,6 +14,15 @@ from .origins import SESSION_ORIGINS
 
 SESSION_VISIBILITIES = ("private", "unlisted", "public")
 PROFILE_VISIBILITIES = ("private", "unlisted", "public")
+VISIBILITY_SOURCES = (
+    "default",
+    "rule",
+    "manual",
+    "marker",
+    "review",
+    "drift",
+    "migration",
+)
 
 # Parses at or above this token_version emit message_claims rows, so their
 # native_* columns are claims-derived. Older rows (whose bytes may be gone)
@@ -146,16 +157,65 @@ CREATE TABLE IF NOT EXISTS sessions (
     parent_session_id    TEXT,
     spawn_depth          INTEGER DEFAULT 0,
     identity_version     INTEGER DEFAULT 0,
-    visibility     TEXT NOT NULL DEFAULT 'public',
+    visibility     TEXT NOT NULL DEFAULT 'private',
     visibility_source TEXT NOT NULL DEFAULT 'default',
     visibility_rule_id INTEGER,
     visibility_reason TEXT,
+    reviewed_sha256 TEXT,
+    reviewed_artifact_path TEXT,
+    publication_metadata_sha256 TEXT,
+    reviewed_metadata_sha256 TEXT,
+    publication_review_id INTEGER,
+    publication_state TEXT NOT NULL DEFAULT 'unreviewed',
     is_private     INTEGER DEFAULT 0,
     file_hash      TEXT,
     file_size      INTEGER,
     file_mtime     REAL,
     synced_at      TEXT,
     model          TEXT
+);
+
+-- Successful publication reviews bind an operator decision to immutable,
+-- hash-addressed bytes.  Rows are append-only history; sessions points at
+-- the currently approved revision.
+CREATE TABLE IF NOT EXISTS publication_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    reviewed_sha256 TEXT NOT NULL,
+    reviewed_artifact_path TEXT NOT NULL,
+    reviewed_metadata_sha256 TEXT NOT NULL,
+    recommendation TEXT NOT NULL,
+    approved_visibility TEXT NOT NULL,
+    forced INTEGER NOT NULL DEFAULT 0,
+    successful INTEGER NOT NULL DEFAULT 1,
+    reviewed_at TEXT NOT NULL
+);
+
+-- Every effective visibility change is auditable, including the deliberately
+-- review-free private -> unlisted local/link transition.
+CREATE TABLE IF NOT EXISTS visibility_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    from_visibility TEXT NOT NULL,
+    to_visibility TEXT NOT NULL,
+    transition_source TEXT NOT NULL,
+    reason TEXT,
+    warning TEXT,
+    publication_review_id INTEGER,
+    transitioned_at TEXT NOT NULL
+);
+
+-- Copy failures survive process restarts.  Source hash/mtime are not advanced
+-- until the archival copy has been hash-verified, and this row forces a retry
+-- even if legacy metadata would otherwise satisfy the cheap fast path.
+CREATE TABLE IF NOT EXISTS sync_copy_retries (
+    source_path TEXT PRIMARY KEY,
+    session_id TEXT,
+    expected_sha256 TEXT,
+    expected_size INTEGER,
+    expected_mtime REAL,
+    last_error TEXT NOT NULL,
+    attempted_at TEXT NOT NULL
 );
 
 -- Usage bucketed by UTC day of the underlying events. Sessions can span
@@ -255,6 +315,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_repo_name           ON sessions(repo_nam
 CREATE INDEX IF NOT EXISTS idx_sessions_git_branch          ON sessions(git_branch);
 CREATE INDEX IF NOT EXISTS idx_sessions_visibility          ON sessions(visibility);
 CREATE INDEX IF NOT EXISTS idx_sessions_visibility_source   ON sessions(visibility_source);
+CREATE INDEX IF NOT EXISTS idx_sessions_publication_state   ON sessions(publication_state);
 CREATE INDEX IF NOT EXISTS idx_sessions_status              ON sessions(session_status);
 CREATE INDEX IF NOT EXISTS idx_sessions_objective_family    ON sessions(objective_family);
 CREATE INDEX IF NOT EXISTS idx_sessions_origin              ON sessions(session_origin);
@@ -272,6 +333,8 @@ CREATE INDEX IF NOT EXISTS idx_session_paths_repo_relative  ON session_paths(rep
 CREATE INDEX IF NOT EXISTS idx_session_paths_normalized     ON session_paths(normalized_path);
 CREATE INDEX IF NOT EXISTS idx_rules_username               ON session_visibility_rules(username);
 CREATE INDEX IF NOT EXISTS idx_rules_priority               ON session_visibility_rules(username, enabled, priority, id);
+CREATE INDEX IF NOT EXISTS idx_publication_reviews_session  ON publication_reviews(session_id, reviewed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_visibility_transitions_session ON visibility_transitions(session_id, transitioned_at DESC);
 """
 
 VIEWS = """
@@ -428,11 +491,17 @@ def normalize_username(value: str) -> str:
     return normalized or "user"
 
 
-def _normalize_visibility(value: str | None, allowed: tuple[str, ...], default: str) -> str:
-    if not value:
-        return default
-    normalized = value.strip().lower()
-    return normalized if normalized in allowed else default
+def _normalize_visibility(
+    value: str | None,
+    allowed: tuple[str, ...],
+) -> str:
+    """Normalize known visibility values and reject everything else closed."""
+    if value is None:
+        raise ValueError("Visibility is required")
+    normalized = str(value).strip().lower()
+    if normalized not in allowed:
+        raise ValueError(f"Unsupported visibility: {value}")
+    return normalized
 
 
 def _normalize_rule_field(value: str | None) -> str:
@@ -556,6 +625,88 @@ def _next_available_username(conn: sqlite3.Connection, base_username: str) -> st
     return username
 
 
+def _publication_session_row(conn: sqlite3.Connection, session_id: str):
+    """Load a session with every mutable, publicly rendered review field."""
+    return conn.execute(
+        """
+        SELECT s.*, COALESCE(u.display_name, u.username, s.username) AS display_name,
+               u.bio AS bio, u.avatar_url AS avatar_url
+        FROM sessions s
+        LEFT JOIN users u ON u.username = s.username
+        WHERE s.session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+
+
+def refresh_session_publication_metadata(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    reason: str = "rendered metadata drifted from the reviewed revision",
+) -> bool:
+    """Refresh one review fingerprint and revoke a stale public rendering.
+
+    Parser backfills and user-profile edits can change public metadata without
+    going through the main session upsert.  They call this same fail-closed
+    hook so Next and Flask never pair reviewed bytes with unreviewed labels.
+    Returns whether a public session was revoked.
+    """
+    from .publish import publication_metadata_sha256
+
+    row = _publication_session_row(conn, session_id)
+    if row is None:
+        return False
+    current_metadata_sha256 = publication_metadata_sha256(row)
+    conn.execute(
+        "UPDATE sessions SET publication_metadata_sha256 = ? WHERE session_id = ?",
+        (current_metadata_sha256, session_id),
+    )
+    if (
+        row["visibility"] != "public"
+        or row["reviewed_metadata_sha256"] == current_metadata_sha256
+    ):
+        return False
+
+    full_reason = f"{reason}; publication revoked and requeued"
+    transition_session_visibility(
+        conn,
+        session_id,
+        "unlisted",
+        shared_dir=None,
+        transition_source="drift",
+        reason=full_reason,
+        manage_storage=False,
+    )
+    conn.execute(
+        """
+        UPDATE sessions
+        SET publication_state = 'source_drift',
+            visibility_reason = ?
+        WHERE session_id = ?
+        """,
+        (full_reason, session_id),
+    )
+    return True
+
+
+def _refresh_user_publication_metadata(
+    conn: sqlite3.Connection,
+    username: str,
+) -> None:
+    """Re-fingerprint display names and revoke any now-stale publication."""
+    session_ids = conn.execute(
+        "SELECT session_id FROM sessions WHERE username = ?",
+        (username,),
+    ).fetchall()
+    for row in session_ids:
+        refresh_session_publication_metadata(
+            conn,
+            row["session_id"],
+            reason="rendered user metadata drifted from the reviewed revision",
+        )
+
+
 def ensure_user(conn: sqlite3.Connection, username: str, display_name: str | None = None) -> str:
     canonical_username = normalize_username(username)
     row = conn.execute(
@@ -569,6 +720,7 @@ def ensure_user(conn: sqlite3.Connection, username: str, display_name: str | Non
                 "UPDATE users SET display_name = ?, updated_at = ? WHERE username = ?",
                 (display_name, now, row["username"]),
             )
+            _refresh_user_publication_metadata(conn, row["username"])
         return row["username"]
 
     base_username = normalize_username(username)
@@ -651,18 +803,26 @@ def update_user(
         updates["github_username"] = github_username.strip() or None
     if profile_visibility is not None:
         updates["profile_visibility"] = _normalize_visibility(
-            profile_visibility, PROFILE_VISIBILITIES, user["profile_visibility"]
+            profile_visibility, PROFILE_VISIBILITIES
         )
     if default_session_visibility is not None:
         updates["default_session_visibility"] = _normalize_visibility(
             default_session_visibility,
             SESSION_VISIBILITIES,
-            user["default_session_visibility"],
         )
 
     assignments = ", ".join(f"{column} = :{column}" for column in updates)
     updates["username"] = user["username"]
     conn.execute(f"UPDATE users SET {assignments} WHERE username = :username", updates)
+    if any(
+        value is not None and value != user[field]
+        for field, value in (
+            ("display_name", display_name),
+            ("bio", bio),
+            ("avatar_url", avatar_url),
+        )
+    ):
+        _refresh_user_publication_metadata(conn, user["username"])
     return get_user_by_identifier(conn, user["username"])
 
 
@@ -693,52 +853,252 @@ def resolve_session_id(conn: sqlite3.Connection, session_id_prefix: str) -> str 
     return rows[0]["session_id"]
 
 
+@dataclass(frozen=True)
+class VisibilityTransitionResult:
+    count: int
+    session_id: str | None
+    from_visibility: str | None
+    to_visibility: str | None
+    warning: str | None = None
+    publication_review_id: int | None = None
+
+
+def _successful_publication_review(
+    conn: sqlite3.Connection,
+    session_id: str,
+    review_id: int | None,
+):
+    if review_id is None:
+        row = conn.execute(
+            "SELECT publication_review_id FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        review_id = row["publication_review_id"] if row else None
+    if review_id is None:
+        return None
+    return conn.execute(
+        """
+        SELECT r.*
+        FROM publication_reviews r
+        JOIN sessions s ON s.session_id = r.session_id
+        WHERE r.id = ?
+          AND r.session_id = ?
+          AND r.successful = 1
+          AND r.approved_visibility = 'public'
+          AND r.reviewed_sha256 = s.reviewed_sha256
+          AND s.file_hash IS NOT NULL
+          AND substr(r.reviewed_sha256, 1, length(s.file_hash)) = s.file_hash
+          AND r.reviewed_artifact_path = s.reviewed_artifact_path
+          AND r.reviewed_metadata_sha256 = s.reviewed_metadata_sha256
+          AND s.reviewed_metadata_sha256 = s.publication_metadata_sha256
+        """,
+        (review_id, session_id),
+    ).fetchone()
+
+
+def transition_session_visibility(
+    conn: sqlite3.Connection,
+    session_id_prefix: str,
+    visibility: str,
+    *,
+    shared_dir: Path | None,
+    transition_source: str = "manual",
+    reason: str | None = None,
+    visibility_rule_id: int | None = None,
+    publication_review_id: int | None = None,
+    public_without_review: str = "raise",
+    manage_storage: bool = True,
+    storage_transition=None,
+) -> VisibilityTransitionResult:
+    """Apply one guarded, audited session-visibility transition.
+
+    All manual, rule/default, marker, migration, and review transitions route
+    through this function.  ``public`` is fail-closed unless a successful
+    review is bound to the current source hash.  Automated defaults/rules may
+    ask to fall back to local-only ``unlisted`` instead of aborting sync.
+    """
+    normalized = _normalize_visibility(visibility, SESSION_VISIBILITIES)
+    normalized_source = (transition_source or "").strip().lower()
+    if normalized_source not in VISIBILITY_SOURCES:
+        raise ValueError(f"Unsupported visibility transition source: {transition_source}")
+    if public_without_review not in {"raise", "unlisted"}:
+        raise ValueError(f"Unsupported public review fallback: {public_without_review}")
+
+    session_id = resolve_session_id(conn, session_id_prefix)
+    if not session_id:
+        return VisibilityTransitionResult(0, None, None, None)
+    row = _publication_session_row(conn, session_id)
+    from .publish import publication_metadata_sha256
+
+    current_metadata_sha256 = publication_metadata_sha256(row)
+    if row["publication_metadata_sha256"] != current_metadata_sha256:
+        conn.execute(
+            "UPDATE sessions SET publication_metadata_sha256 = ? WHERE session_id = ?",
+            (current_metadata_sha256, session_id),
+        )
+        row = _publication_session_row(conn, session_id)
+    raw_current = row["visibility"]
+    invalid_current = False
+    try:
+        current = _normalize_visibility(raw_current, SESSION_VISIBILITIES)
+    except ValueError:
+        # Only the guarded transition API may repair legacy/corrupt stored
+        # values. Treat them as private, record the original value below, and
+        # never let a typo become publishable.
+        current = "private"
+        invalid_current = True
+    warning: str | None = None
+    review = None
+    if normalized == "public":
+        review = _successful_publication_review(
+            conn, session_id, publication_review_id
+        )
+        if review is None:
+            if public_without_review == "raise":
+                raise ValueError(
+                    "Public visibility requires a successful review of the current revision. "
+                    "Run `logpile publish approve` first."
+                )
+            normalized = "unlisted"
+            warning = (
+                "Public visibility requires a successful review record; kept this "
+                "session unlisted for local/link access."
+            )
+    if (
+        current == "private"
+        and normalized == "unlisted"
+        and warning is None
+        and publication_review_id is None
+    ):
+        warning = (
+            "Unlisted sessions are local/link artifacts and are not served in "
+            "public mode; no publish review was required."
+        )
+
+    transition = storage_transition
+    if manage_storage and transition is None and normalized != current:
+        if shared_dir is None:
+            raise ValueError("shared_dir is required for a stored visibility transition")
+        if normalized == "private":
+            from .sync import prepare_private_session_storage
+
+            transition = prepare_private_session_storage(
+                row, shared_dir=Path(shared_dir)
+            )
+        elif current == "private":
+            from .sync import prepare_shared_session_storage
+
+            transition = prepare_shared_session_storage(
+                row, shared_dir=Path(shared_dir)
+            )
+
+    next_shared_path = (
+        str(transition.archive_path) if transition is not None else row["shared_path"]
+    )
+    effective_reason = reason or f"{normalized_source} visibility transition"
+    effective_rule_id = visibility_rule_id if normalized_source == "rule" else None
+    effective_review_id = (
+        review["id"] if review is not None else publication_review_id
+    )
+    stored_source = "manual" if normalized_source == "review" else normalized_source
+    try:
+        cur = conn.execute(
+            """
+            UPDATE sessions
+            SET visibility = ?,
+                visibility_source = ?,
+                visibility_rule_id = ?,
+                visibility_reason = ?,
+                is_private = CASE WHEN ? = 'private' THEN 1 ELSE 0 END,
+                shared_path = ?,
+                publication_review_id = CASE
+                    WHEN ? = 'public' THEN ?
+                    ELSE publication_review_id
+                END,
+                publication_state = CASE
+                    WHEN ? = 'public' THEN 'reviewed'
+                    WHEN ? = 'private' THEN 'revoked'
+                    WHEN reviewed_sha256 IS NOT NULL
+                     AND file_hash IS NOT NULL
+                     AND substr(reviewed_sha256, 1, length(file_hash)) = file_hash
+                     AND reviewed_metadata_sha256 IS NOT NULL
+                     AND reviewed_metadata_sha256 = publication_metadata_sha256
+                    THEN 'reviewed'
+                    ELSE 'unreviewed'
+                END
+            WHERE session_id = ?
+            """,
+            (
+                normalized,
+                stored_source,
+                effective_rule_id,
+                effective_reason,
+                normalized,
+                next_shared_path,
+                normalized,
+                effective_review_id,
+                normalized,
+                normalized,
+                session_id,
+            ),
+        )
+        if current != normalized or invalid_current:
+            conn.execute(
+                """
+                INSERT INTO visibility_transitions (
+                    session_id, from_visibility, to_visibility,
+                    transition_source, reason, warning,
+                    publication_review_id, transitioned_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    str(raw_current) if invalid_current else current,
+                    normalized,
+                    normalized_source,
+                    effective_reason,
+                    warning,
+                    effective_review_id,
+                    _now_iso(),
+                ),
+            )
+    except BaseException:
+        if transition is not None:
+            transition.rollback()
+        raise
+    if transition is not None:
+        defer_storage_transition(conn, transition)
+    return VisibilityTransitionResult(
+        cur.rowcount,
+        session_id,
+        current,
+        normalized,
+        warning,
+        effective_review_id,
+    )
+
+
 def set_session_visibility(
     conn: sqlite3.Connection,
     session_id_prefix: str,
     visibility: str,
     *,
     shared_dir: Path,
+    publication_review_id: int | None = None,
 ) -> int:
-    normalized = _normalize_visibility(visibility, SESSION_VISIBILITIES, "public")
-    session_id = resolve_session_id(conn, session_id_prefix)
-    if not session_id:
-        return 0
-    row = conn.execute(
-        "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
-    ).fetchone()
-    if normalized == "private":
-        from .sync import prepare_private_session_storage
-
-        transition = prepare_private_session_storage(row, shared_dir=Path(shared_dir))
-    else:
-        from .sync import prepare_shared_session_storage
-
-        transition = prepare_shared_session_storage(row, shared_dir=Path(shared_dir))
-    try:
-        cur = conn.execute(
-            """
-            UPDATE sessions
-            SET visibility = ?,
-                visibility_source = 'manual',
-                visibility_rule_id = NULL,
-                visibility_reason = 'manual override',
-                is_private = CASE WHEN ? = 'private' THEN 1 ELSE 0 END,
-                shared_path = ?
-            WHERE session_id = ?
-            """,
-            (
-                normalized,
-                normalized,
-                str(transition.archive_path),
-                session_id,
-            ),
-        )
-    except BaseException:
-        transition.rollback()
-        raise
-    defer_storage_transition(conn, transition)
-    return cur.rowcount
+    """Compatibility wrapper for manual callers around the guarded API."""
+    result = transition_session_visibility(
+        conn,
+        session_id_prefix,
+        visibility,
+        shared_dir=shared_dir,
+        transition_source="review" if publication_review_id is not None else "manual",
+        reason="reviewed publish approval" if publication_review_id is not None else "manual override",
+        publication_review_id=publication_review_id,
+    )
+    if result.warning:
+        warnings.warn(result.warning, RuntimeWarning, stacklevel=2)
+    return result.count
 
 
 def create_visibility_rule(
@@ -761,7 +1121,7 @@ def create_visibility_rule(
     now = _now_iso()
     normalized_field = _normalize_rule_field(field)
     normalized_mode = _normalize_rule_mode(match_mode)
-    normalized_visibility = _normalize_visibility(visibility, SESSION_VISIBILITIES, "public")
+    normalized_visibility = _normalize_visibility(visibility, SESSION_VISIBILITIES)
     normalized_source_scope = _normalize_source_scope(source_scope)
     normalized_threshold = _normalize_threshold(normalized_mode, threshold)
 
@@ -907,7 +1267,7 @@ def resolve_session_visibility(
             "visibility_reason": reason,
         }
 
-    normalized_default = _normalize_visibility(default_visibility, SESSION_VISIBILITIES, "unlisted")
+    normalized_default = _normalize_visibility(default_visibility, SESSION_VISIBILITIES)
     return {
         "visibility": normalized_default,
         "visibility_source": "default",
@@ -963,26 +1323,19 @@ def recompute_session_visibility(
             default_visibility=row["default_session_visibility"],
             session_data=dict(row),
         )
-        conn.execute(
-            """
-            UPDATE sessions
-            SET visibility = ?,
-                visibility_source = ?,
-                visibility_rule_id = ?,
-                visibility_reason = ?,
-                is_private = CASE WHEN ? = 'private' THEN 1 ELSE 0 END
-            WHERE session_id = ?
-            """,
-            (
-                decision["visibility"],
-                decision["visibility_source"],
-                decision["visibility_rule_id"],
-                decision["visibility_reason"],
-                decision["visibility"],
-                row["session_id"],
-            ),
+        result = transition_session_visibility(
+            conn,
+            row["session_id"],
+            str(decision["visibility"]),
+            shared_dir=Path(shared_dir),
+            transition_source=str(decision["visibility_source"]),
+            reason=str(decision["visibility_reason"]),
+            visibility_rule_id=decision["visibility_rule_id"],
+            public_without_review="unlisted",
         )
-        updated += 1
+        if result.warning:
+            warnings.warn(result.warning, RuntimeWarning, stacklevel=2)
+        updated += result.count
 
     if rows:
         from .sync import reconcile_session_storage
@@ -1036,6 +1389,132 @@ def _backfill_users(conn: sqlite3.Connection) -> None:
         ensure_user(conn, username)
 
 
+def _quote_identifier(value: str) -> str:
+    """Quote a SQLite identifier discovered from the database schema."""
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _snapshot_before_identity_rebuild(conn: sqlite3.Connection) -> Path | None:
+    """Create a durable snapshot immediately before destructive table rebuilds.
+
+    In-memory databases used by unit tests have no file to preserve.  On-disk
+    databases get a sibling, mode-0600 SQLite backup; an existing snapshot is
+    never overwritten, so a failed migration can be retried without destroying
+    the first known-good copy.
+    """
+    database_path = ""
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if row[1] == "main":
+            database_path = row[2] or ""
+            break
+    if not database_path:
+        return None
+
+    source_path = Path(database_path)
+    base = source_path.with_name(f"{source_path.name}.pre-identity-migration.sqlite")
+    candidate = base
+    suffix = 2
+    while candidate.exists():
+        candidate = base.with_name(f"{base.name}.{suffix}")
+        suffix += 1
+
+    # The online-backup API needs a stable transaction boundary and includes
+    # committed WAL pages in the destination database.
+    conn.commit()
+    fd = os.open(candidate, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    try:
+        with sqlite3.connect(candidate) as snapshot:
+            conn.backup(snapshot)
+            # A backup copies the source database's WAL-mode header.  A cold
+            # migration snapshot is one self-contained file, not a main file
+            # plus empty sidecars that callers might forget to restore.
+            snapshot.execute("PRAGMA journal_mode=DELETE").fetchone()
+            check = snapshot.execute("PRAGMA quick_check").fetchone()
+            if not check or check[0] != "ok":
+                raise sqlite3.DatabaseError(
+                    f"migration snapshot failed quick_check: {check[0] if check else 'no result'}"
+                )
+    except BaseException:
+        candidate.unlink(missing_ok=True)
+        raise
+    candidate.chmod(0o600)
+    return candidate
+
+
+def _rebuild_column_plan(
+    conn: sqlite3.Connection,
+    table_name: str,
+    *,
+    excluded: set[str] | None = None,
+    renamed: dict[str, str] | None = None,
+    primary_key: str,
+    autoincrement: bool = False,
+) -> tuple[list[sqlite3.Row], list[tuple[str, str]], str]:
+    """Return source metadata, source/target names, and dynamic CREATE SQL."""
+    excluded = excluded or set()
+    renamed = renamed or {}
+    info = conn.execute(f"PRAGMA table_info({_quote_identifier(table_name)})").fetchall()
+    pairs: list[tuple[str, str]] = []
+    declarations: list[str] = []
+    seen: set[str] = set()
+    for column in info:
+        source_name = column[1]
+        if source_name in excluded:
+            continue
+        target_name = renamed.get(source_name, source_name)
+        if target_name in seen:
+            continue
+        seen.add(target_name)
+        pairs.append((source_name, target_name))
+
+        column_type = (column[2] or "").strip()
+        declaration = _quote_identifier(target_name)
+        if column_type:
+            declaration += f" {column_type}"
+        if target_name == primary_key:
+            declaration += " PRIMARY KEY"
+            if autoincrement:
+                declaration += " AUTOINCREMENT"
+        elif column[3]:
+            declaration += " NOT NULL"
+        if column[4] is not None:
+            declaration += f" DEFAULT {column[4]}"
+        declarations.append(declaration)
+
+    if primary_key not in seen:
+        raise sqlite3.DatabaseError(
+            f"cannot rebuild {table_name}: missing primary key column {primary_key}"
+        )
+    create_sql = ",\n                ".join(declarations)
+    return info, pairs, create_sql
+
+
+def _insert_dynamic_row(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_names: list[str],
+    values: list[object],
+) -> None:
+    columns_sql = ", ".join(_quote_identifier(name) for name in column_names)
+    placeholders = ", ".join("?" for _ in column_names)
+    conn.execute(
+        f"INSERT INTO {_quote_identifier(table_name)} ({columns_sql}) "
+        f"VALUES ({placeholders})",
+        values,
+    )
+
+
+def _next_migration_username(base: str, used: set[str]) -> str:
+    candidate = base
+    suffix = 2
+    while candidate in used:
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
 def _rebuild_identity_schema(conn: sqlite3.Connection) -> None:
     user_columns = _table_columns(conn, "users")
     session_columns = _table_columns(conn, "sessions")
@@ -1049,336 +1528,222 @@ def _rebuild_identity_schema(conn: sqlite3.Connection) -> None:
         return
 
     now = _now_iso()
-    conn.execute("DROP VIEW IF EXISTS session_catalog")
-    conn.execute("DROP VIEW IF EXISTS user_catalog")
+    _snapshot_before_identity_rebuild(conn)
 
-    conn.execute(
-        """
-        CREATE TABLE users__new (
-            username TEXT PRIMARY KEY,
-            display_name TEXT,
-            bio TEXT,
-            avatar_url TEXT,
-            profile_visibility TEXT NOT NULL DEFAULT 'public',
-            default_session_visibility TEXT NOT NULL DEFAULT 'unlisted',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    if "slug" in user_columns:
-        conn.execute(
-            """
-            INSERT INTO users__new (
-                username, display_name, bio, avatar_url,
-                profile_visibility, default_session_visibility,
-                created_at, updated_at
-            )
-            SELECT
-                normalize_username_py(COALESCE(NULLIF(username, ''), slug)) AS username,
-                display_name,
-                bio,
-                avatar_url,
-                COALESCE(NULLIF(profile_visibility, ''), 'public') AS profile_visibility,
-                CASE
-                    WHEN default_session_visibility IN ('private', 'unlisted', 'public')
-                    THEN default_session_visibility
-                    ELSE 'unlisted'
-                END AS default_session_visibility,
-                COALESCE(NULLIF(created_at, ''), ?) AS created_at,
-                COALESCE(NULLIF(updated_at, ''), ?) AS updated_at
-            FROM users
-            """,
-            (now, now),
-        )
-    else:
-        conn.execute(
-            """
-            INSERT INTO users__new (
-                username, display_name, bio, avatar_url,
-                profile_visibility, default_session_visibility,
-                created_at, updated_at
-            )
-            SELECT
-                normalize_username_py(username) AS username,
-                display_name,
-                bio,
-                avatar_url,
-                COALESCE(NULLIF(profile_visibility, ''), 'public') AS profile_visibility,
-                CASE
-                    WHEN default_session_visibility IN ('private', 'unlisted', 'public')
-                    THEN default_session_visibility
-                    ELSE 'unlisted'
-                END AS default_session_visibility,
-                COALESCE(NULLIF(created_at, ''), ?) AS created_at,
-                COALESCE(NULLIF(updated_at, ''), ?) AS updated_at
-            FROM users
-            """,
-            (now, now),
-        )
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO users__new (
-            username, display_name, bio, avatar_url,
-            profile_visibility, default_session_visibility,
-            created_at, updated_at
-        )
-        SELECT DISTINCT
-            normalize_username_py(username) AS username,
-            normalize_username_py(username) AS display_name,
-            NULL,
-            NULL,
-            'public',
-            'unlisted',
-            ?,
-            ?
-        FROM sessions
-        WHERE username IS NOT NULL AND username != ''
-        """,
-        (now, now),
+    user_rows = [dict(row) for row in conn.execute("SELECT * FROM users").fetchall()]
+    session_rows = [dict(row) for row in conn.execute("SELECT * FROM sessions").fetchall()]
+    rule_rows = [
+        dict(row) for row in conn.execute("SELECT * FROM session_visibility_rules").fetchall()
+    ]
+    github_columns = _table_columns(conn, "user_github_daily")
+    github_usernames = (
+        [
+            str(row[0])
+            for row in conn.execute(
+                "SELECT DISTINCT username FROM user_github_daily "
+                "WHERE username IS NOT NULL AND username != '' ORDER BY username"
+            ).fetchall()
+        ]
+        if "username" in github_columns
+        else []
     )
 
-    conn.execute(
-        """
-        CREATE TABLE session_visibility_rules__new (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            source_scope TEXT,
-            field TEXT NOT NULL,
-            match_mode TEXT NOT NULL,
-            pattern TEXT NOT NULL,
-            visibility TEXT NOT NULL DEFAULT 'public',
-            priority INTEGER NOT NULL DEFAULT 100,
-            threshold REAL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+    def user_identity(row: dict) -> str:
+        return str(row.get("username") or row.get("slug") or "user")
+
+    # Binary spelling is the final tie-breaker so case-only collisions resolve
+    # identically regardless of insertion order or SQLite rowid allocation.
+    user_rows.sort(
+        key=lambda row: (
+            normalize_username(user_identity(row)),
+            user_identity(row).casefold(),
+            user_identity(row),
+            str(row.get("slug") or ""),
         )
-        """
     )
-    if "user_slug" in rule_columns:
-        conn.execute(
-            """
-            INSERT INTO session_visibility_rules__new (
-                id, username, source_scope, field, match_mode, pattern,
-                visibility, priority, threshold, enabled, created_at, updated_at
-            )
-            SELECT
-                r.id,
-                COALESCE(
-                    (SELECT u.username FROM users__new u WHERE u.username = normalize_username_py(r.user_slug)),
-                    normalize_username_py(r.user_slug)
-                ) AS username,
-                r.source_scope,
-                r.field,
-                r.match_mode,
-                r.pattern,
-                r.visibility,
-                r.priority,
-                r.threshold,
-                r.enabled,
-                COALESCE(NULLIF(r.created_at, ''), ?),
-                COALESCE(NULLIF(r.updated_at, ''), ?)
-            FROM session_visibility_rules r
-            """,
-            (now, now),
+    used_usernames: set[str] = set()
+    username_map: dict[str, str] = {}
+    slug_map: dict[str, str] = {}
+    assigned_rows: list[tuple[dict, str]] = []
+    for row in user_rows:
+        canonical = _next_migration_username(
+            normalize_username(user_identity(row)), used_usernames
         )
-    else:
-        conn.execute(
-            """
-            INSERT INTO session_visibility_rules__new (
-                id, username, source_scope, field, match_mode, pattern,
-                visibility, priority, threshold, enabled, created_at, updated_at
-            )
-            SELECT
-                id,
-                normalize_username_py(username) AS username,
-                source_scope,
-                field,
-                match_mode,
-                pattern,
-                visibility,
-                priority,
-                threshold,
-                enabled,
-                COALESCE(NULLIF(created_at, ''), ?),
-                COALESCE(NULLIF(updated_at, ''), ?)
-            FROM session_visibility_rules
-            """,
-            (now, now),
+        assigned_rows.append((row, canonical))
+        if row.get("username") not in (None, ""):
+            username_map.setdefault(str(row["username"]), canonical)
+        if row.get("slug") not in (None, ""):
+            slug_map.setdefault(str(row["slug"]), canonical)
+
+    def mapped_identity(row: dict, *, legacy_slug: bool) -> str | None:
+        if legacy_slug and row.get("user_slug") not in (None, ""):
+            mapped = slug_map.get(str(row["user_slug"]))
+            if mapped:
+                return mapped
+        if row.get("username") not in (None, ""):
+            mapped = username_map.get(str(row["username"]))
+            if mapped:
+                return mapped
+        return None
+
+    orphan_values: set[str] = set()
+    for row in session_rows:
+        if mapped_identity(row, legacy_slug="user_slug" in session_columns) is None:
+            orphan_values.add(str(row.get("user_slug") or row.get("username") or "user"))
+    for row in rule_rows:
+        if mapped_identity(row, legacy_slug="user_slug" in rule_columns) is None:
+            orphan_values.add(str(row.get("user_slug") or row.get("username") or "user"))
+    for raw_username in github_usernames:
+        if raw_username not in username_map and raw_username not in slug_map:
+            orphan_values.add(raw_username)
+    orphan_map: dict[str, str] = {}
+    for raw_value in sorted(
+        orphan_values,
+        key=lambda value: (normalize_username(value), value.casefold(), value),
+    ):
+        orphan_map[raw_value] = _next_migration_username(
+            normalize_username(raw_value), used_usernames
         )
 
-    conn.execute(
-        """
-        CREATE TABLE sessions__new (
-            session_id     TEXT PRIMARY KEY,
-            source         TEXT NOT NULL,
-            username       TEXT NOT NULL,
-            machine        TEXT,
-            project        TEXT,
-            workspace_root TEXT,
-            worktree_root  TEXT,
-            repo_root      TEXT,
-            repo_name      TEXT,
-            git_branch     TEXT,
-            git_commit     TEXT,
-            git_dirty      INTEGER DEFAULT 0,
-            source_path    TEXT NOT NULL,
-            shared_path    TEXT NOT NULL,
-            first_timestamp TEXT,
-            last_timestamp  TEXT,
-            duration_seconds REAL,
-            user_message_count    INTEGER DEFAULT 0,
-            assistant_message_count INTEGER DEFAULT 0,
-            tool_call_count       INTEGER DEFAULT 0,
-            error_count           INTEGER DEFAULT 0,
-            write_path_count      INTEGER,
-            read_path_count       INTEGER,
-            search_path_count     INTEGER,
-            test_run_count        INTEGER,
-            test_failure_count    INTEGER,
-            lint_run_count        INTEGER,
-            lint_failure_count    INTEGER,
-            build_run_count       INTEGER,
-            build_failure_count   INTEGER,
-            format_run_count      INTEGER,
-            format_failure_count  INTEGER,
-            git_status_count      INTEGER,
-            git_diff_count        INTEGER,
-            git_commit_count      INTEGER,
-            activity_version      INTEGER DEFAULT 0,
-            session_goal          TEXT,
-            session_summary       TEXT,
-            session_outcome       TEXT,
-            session_status        TEXT,
-            narrative_version     INTEGER DEFAULT 0,
-            objective_family      TEXT,
-            objective_label       TEXT,
-            objective_version     INTEGER DEFAULT 0,
-            session_origin        TEXT,
-            origin_version        INTEGER DEFAULT 0,
-            total_input_tokens    INTEGER DEFAULT 0,
-            total_output_tokens   INTEGER DEFAULT 0,
-            fresh_input_tokens    INTEGER DEFAULT 0,
-            cached_input_tokens   INTEGER DEFAULT 0,
-            reasoning_output_tokens INTEGER DEFAULT 0,
-            token_version        INTEGER DEFAULT 0,
-            first_user_message    TEXT,
-            parent_session_id    TEXT,
-            spawn_depth          INTEGER DEFAULT 0,
-            visibility     TEXT NOT NULL DEFAULT 'public',
-            visibility_source TEXT NOT NULL DEFAULT 'default',
-            visibility_rule_id INTEGER,
-            visibility_reason TEXT,
-            is_private     INTEGER DEFAULT 0,
-            file_hash      TEXT,
-            synced_at      TEXT,
-            model          TEXT
-        )
-        """
+    def resolve_identity(row: dict, *, legacy_slug: bool) -> str:
+        mapped = mapped_identity(row, legacy_slug=legacy_slug)
+        if mapped:
+            return mapped
+        raw_value = str(row.get("user_slug") or row.get("username") or "user")
+        return orphan_map[raw_value]
+
+    _user_info, user_pairs, user_create = _rebuild_column_plan(
+        conn,
+        "users",
+        excluded={"slug"},
+        primary_key="username",
     )
-    username_expr = (
-        "COALESCE(NULLIF(user_slug, ''), NULLIF(username, ''))"
-        if "user_slug" in session_columns
-        else "NULLIF(username, '')"
+    rule_renamed = {"user_slug": "username"} if "username" not in rule_columns else {}
+    rule_excluded = {"user_slug"} if "username" in rule_columns else set()
+    _rule_info, rule_pairs, rule_create = _rebuild_column_plan(
+        conn,
+        "session_visibility_rules",
+        excluded=rule_excluded,
+        renamed=rule_renamed,
+        primary_key="id",
+        autoincrement=True,
     )
-    conn.execute(
-        f"""
-        INSERT INTO sessions__new (
-            session_id, source, username, machine, project, workspace_root,
-            worktree_root, repo_root, repo_name, git_branch, git_commit, git_dirty,
-            source_path, shared_path, first_timestamp, last_timestamp, duration_seconds,
-            user_message_count, assistant_message_count, tool_call_count, error_count,
-            write_path_count, read_path_count, search_path_count,
-            test_run_count, test_failure_count, lint_run_count, lint_failure_count,
-            build_run_count, build_failure_count, format_run_count, format_failure_count,
-            git_status_count, git_diff_count, git_commit_count, activity_version,
-            session_goal, session_summary, session_outcome, session_status, narrative_version,
-            objective_family, objective_label, objective_version,
-            session_origin, origin_version,
-            total_input_tokens, total_output_tokens, fresh_input_tokens, cached_input_tokens,
-            reasoning_output_tokens, token_version, first_user_message, parent_session_id, spawn_depth, visibility,
-            visibility_source, visibility_rule_id, visibility_reason,
-            is_private, file_hash, synced_at, model
-        )
-        SELECT
-            session_id,
-            source,
-            COALESCE(
-                (SELECT u.username FROM users__new u WHERE u.username = normalize_username_py({username_expr})),
-                normalize_username_py({username_expr}),
-                'user'
-            ) AS username,
-            machine,
-            project,
-            workspace_root,
-            worktree_root,
-            repo_root,
-            repo_name,
-            git_branch,
-            git_commit,
-            COALESCE(git_dirty, 0),
-            source_path,
-            shared_path,
-            first_timestamp,
-            last_timestamp,
-            duration_seconds,
-            COALESCE(user_message_count, 0),
-            COALESCE(assistant_message_count, 0),
-            COALESCE(tool_call_count, 0),
-            COALESCE(error_count, 0),
-            write_path_count,
-            read_path_count,
-            search_path_count,
-            test_run_count,
-            test_failure_count,
-            lint_run_count,
-            lint_failure_count,
-            build_run_count,
-            build_failure_count,
-            format_run_count,
-            format_failure_count,
-            git_status_count,
-            git_diff_count,
-            git_commit_count,
-            COALESCE(activity_version, 0),
-            session_goal,
-            session_summary,
-            session_outcome,
-            session_status,
-            COALESCE(narrative_version, 0),
-            objective_family,
-            objective_label,
-            COALESCE(objective_version, 0),
-            session_origin,
-            COALESCE(origin_version, 0),
-            COALESCE(total_input_tokens, 0),
-            COALESCE(total_output_tokens, 0),
-            COALESCE(fresh_input_tokens, 0),
-            COALESCE(cached_input_tokens, 0),
-            COALESCE(reasoning_output_tokens, 0),
-            COALESCE(token_version, 0),
-            first_user_message,
-            parent_session_id,
-            COALESCE(spawn_depth, 0),
-            COALESCE(NULLIF(visibility, ''), 'public'),
-            COALESCE(NULLIF(visibility_source, ''), 'default'),
-            visibility_rule_id,
-            visibility_reason,
-            COALESCE(is_private, 0),
-            file_hash,
-            synced_at,
-            model
-        FROM sessions
-        """
+    _session_info, session_pairs, session_create = _rebuild_column_plan(
+        conn,
+        "sessions",
+        excluded={"user_slug"},
+        primary_key="session_id",
     )
 
-    conn.execute("DROP TABLE session_visibility_rules")
-    conn.execute("ALTER TABLE session_visibility_rules__new RENAME TO session_visibility_rules")
-    conn.execute("DROP TABLE sessions")
-    conn.execute("ALTER TABLE sessions__new RENAME TO sessions")
-    conn.execute("DROP TABLE users")
-    conn.execute("ALTER TABLE users__new RENAME TO users")
+    conn.execute("SAVEPOINT identity_schema_rebuild")
+    try:
+        conn.execute("DROP VIEW IF EXISTS session_catalog")
+        conn.execute("DROP VIEW IF EXISTS user_catalog")
+        for table_name in (
+            "users__new",
+            "session_visibility_rules__new",
+            "sessions__new",
+        ):
+            conn.execute(f"DROP TABLE IF EXISTS {_quote_identifier(table_name)}")
+        conn.execute(f"CREATE TABLE users__new ({user_create})")
+        conn.execute(f"CREATE TABLE session_visibility_rules__new ({rule_create})")
+        conn.execute(f"CREATE TABLE sessions__new ({session_create})")
+
+        user_target_names = [target for _source, target in user_pairs]
+        for row, canonical in assigned_rows:
+            values = [
+                canonical if target == "username" else row.get(source)
+                for source, target in user_pairs
+            ]
+            _insert_dynamic_row(conn, "users__new", user_target_names, values)
+
+        # References without a legacy users row still need a canonical owner.
+        # Insert only known profile columns so any additional legacy columns
+        # retain their declared defaults instead of being overwritten.
+        available_user_columns = set(user_target_names)
+        for raw_value, canonical in sorted(orphan_map.items(), key=lambda item: item[1]):
+            defaults = {
+                "username": canonical,
+                "display_name": raw_value,
+                "profile_visibility": "public",
+                "default_session_visibility": "unlisted",
+                "created_at": now,
+                "updated_at": now,
+            }
+            names = [name for name in defaults if name in available_user_columns]
+            _insert_dynamic_row(
+                conn,
+                "users__new",
+                names,
+                [defaults[name] for name in names],
+            )
+
+        rule_target_names = [target for _source, target in rule_pairs]
+        for row in rule_rows:
+            canonical = resolve_identity(row, legacy_slug="user_slug" in rule_columns)
+            values = [
+                canonical if target == "username" else row.get(source)
+                for source, target in rule_pairs
+            ]
+            _insert_dynamic_row(
+                conn, "session_visibility_rules__new", rule_target_names, values
+            )
+
+        session_target_names = [target for _source, target in session_pairs]
+        for row in session_rows:
+            canonical = resolve_identity(row, legacy_slug="user_slug" in session_columns)
+            values = [
+                canonical if target == "username" else row.get(source)
+                for source, target in session_pairs
+            ]
+            _insert_dynamic_row(conn, "sessions__new", session_target_names, values)
+
+        # This table is not rebuilt, so every provider/count/custom column is
+        # preserved in place. Use collision-safe temporary owners before the
+        # final canonical names (for example `Alice` -> `alice` while the old
+        # `alice` row must first move to `alice-2`).
+        github_remaps: list[tuple[str, str]] = []
+        for raw_username in github_usernames:
+            canonical = (
+                username_map.get(raw_username)
+                or slug_map.get(raw_username)
+                or orphan_map[raw_username]
+            )
+            if canonical != raw_username:
+                github_remaps.append((raw_username, canonical))
+        occupied_github_names = set(github_usernames) | {
+            canonical for _raw, canonical in github_remaps
+        }
+        staged_github_names: list[tuple[str, str]] = []
+        for index, (raw_username, canonical) in enumerate(github_remaps):
+            temporary = f"__logpile_identity_migration_{index}__"
+            while temporary in occupied_github_names:
+                temporary += "_"
+            occupied_github_names.add(temporary)
+            conn.execute(
+                "UPDATE user_github_daily SET username = ? WHERE username = ?",
+                (temporary, raw_username),
+            )
+            staged_github_names.append((temporary, canonical))
+        for temporary, canonical in staged_github_names:
+            conn.execute(
+                "UPDATE user_github_daily SET username = ? WHERE username = ?",
+                (canonical, temporary),
+            )
+
+        conn.execute("DROP TABLE session_visibility_rules")
+        conn.execute(
+            "ALTER TABLE session_visibility_rules__new RENAME TO session_visibility_rules"
+        )
+        conn.execute("DROP TABLE sessions")
+        conn.execute("ALTER TABLE sessions__new RENAME TO sessions")
+        conn.execute("DROP TABLE users")
+        conn.execute("ALTER TABLE users__new RENAME TO users")
+        conn.execute("RELEASE SAVEPOINT identity_schema_rebuild")
+    except BaseException:
+        conn.execute("ROLLBACK TO SAVEPOINT identity_schema_rebuild")
+        conn.execute("RELEASE SAVEPOINT identity_schema_rebuild")
+        raise
 
 
 def _migrate_message_claim_occurrences(conn: sqlite3.Connection) -> None:
@@ -1476,6 +1841,25 @@ def _migrate_message_claim_occurrences(conn: sqlite3.Connection) -> None:
 
 def migrate_db(conn: sqlite3.Connection) -> None:
     conn.create_function("normalize_username_py", 1, lambda value: normalize_username(value or ""))
+    sessions_existed = bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+        ).fetchone()
+    )
+    legacy_missing_visibility_ids: list[str] = []
+    if sessions_existed and "visibility" not in _table_columns(conn, "sessions"):
+        legacy_columns = _table_columns(conn, "sessions")
+        private_filter = (
+            "WHERE COALESCE(is_private, 0) != 1"
+            if "is_private" in legacy_columns
+            else ""
+        )
+        legacy_missing_visibility_ids = [
+            str(row[0])
+            for row in conn.execute(
+                f"SELECT session_id FROM sessions {private_filter} ORDER BY session_id"
+            ).fetchall()
+        ]
     conn.executescript(SCHEMA)
 
     _ensure_column(conn, "sessions", "workspace_root", "TEXT")
@@ -1516,10 +1900,23 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "sessions", "token_version", "INTEGER DEFAULT 0")
     _ensure_column(conn, "sessions", "parent_session_id", "TEXT")
     _ensure_column(conn, "sessions", "spawn_depth", "INTEGER DEFAULT 0")
-    _ensure_column(conn, "sessions", "visibility", "TEXT NOT NULL DEFAULT 'public'")
+    # Add legacy rows closed, then explicitly audit the allowed private ->
+    # unlisted migration below. Brand-new tables use the same private default.
+    _ensure_column(conn, "sessions", "visibility", "TEXT NOT NULL DEFAULT 'private'")
     _ensure_column(conn, "sessions", "visibility_source", "TEXT NOT NULL DEFAULT 'default'")
     _ensure_column(conn, "sessions", "visibility_rule_id", "INTEGER")
     _ensure_column(conn, "sessions", "visibility_reason", "TEXT")
+    _ensure_column(conn, "sessions", "reviewed_sha256", "TEXT")
+    _ensure_column(conn, "sessions", "reviewed_artifact_path", "TEXT")
+    _ensure_column(conn, "sessions", "publication_metadata_sha256", "TEXT")
+    _ensure_column(conn, "sessions", "reviewed_metadata_sha256", "TEXT")
+    _ensure_column(conn, "sessions", "publication_review_id", "INTEGER")
+    _ensure_column(
+        conn,
+        "sessions",
+        "publication_state",
+        "TEXT NOT NULL DEFAULT 'unreviewed'",
+    )
     _ensure_column(conn, "session_paths", "repo_relative_path", "TEXT")
     _ensure_column(conn, "users", "display_name", "TEXT")
     _ensure_column(conn, "users", "bio", "TEXT")
@@ -1556,9 +1953,8 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _backfill_users(conn)
     _rebuild_identity_schema(conn)
     _backfill_users(conn)
-    # After _rebuild_identity_schema: the rebuild recreates `sessions` from a
-    # fixed column list that predates these columns, so adding them earlier
-    # would be undone on legacy-slug databases.
+    # Keep these idempotent guards after the dynamic identity rebuild as well;
+    # very old databases may not have had the columns before this migration.
     _ensure_column(conn, "sessions", "cache_creation_input_tokens", "INTEGER DEFAULT 0")
     _ensure_column(conn, "sessions", "cache_creation_5m_input_tokens", "INTEGER DEFAULT 0")
     _ensure_column(conn, "sessions", "cache_creation_1h_input_tokens", "INTEGER DEFAULT 0")
@@ -1568,6 +1964,18 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "sessions", "thread_id", "TEXT")
     _ensure_column(conn, "sessions", "parent_thread_id", "TEXT")
     _ensure_column(conn, "sessions", "identity_version", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "sessions", "reviewed_sha256", "TEXT")
+    _ensure_column(conn, "sessions", "reviewed_artifact_path", "TEXT")
+    _ensure_column(conn, "sessions", "publication_metadata_sha256", "TEXT")
+    _ensure_column(conn, "sessions", "reviewed_metadata_sha256", "TEXT")
+    _ensure_column(conn, "sessions", "publication_review_id", "INTEGER")
+    _ensure_column(
+        conn,
+        "sessions",
+        "publication_state",
+        "TEXT NOT NULL DEFAULT 'unreviewed'",
+    )
+    _ensure_column(conn, "publication_reviews", "reviewed_metadata_sha256", "TEXT")
     # Before explicit raw thread fields existed, Codex stored the thread UUID
     # in parent_session_id. Preserve that only lineage evidence when it is not
     # already an exact canonical session key; the sync resolver will either
@@ -1749,27 +2157,43 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         END
         """
     )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET visibility = CASE
-            WHEN is_private = 1 THEN 'private'
-            WHEN visibility IS NULL OR visibility = '' THEN 'public'
-            ELSE visibility
-        END
-        """
-    )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET is_private = CASE WHEN visibility = 'private' THEN 1 ELSE 0 END
-        """
-    )
+    # Repair legacy flags and invalid stored values through the same guarded
+    # API as live commands. This keeps even migration-time tightening audited.
+    for visibility_row in conn.execute(
+        "SELECT session_id, visibility, is_private FROM sessions ORDER BY session_id"
+    ).fetchall():
+        raw_visibility = visibility_row["visibility"]
+        normalized_visibility = (
+            str(raw_visibility).strip().lower()
+            if raw_visibility is not None
+            else ""
+        )
+        if visibility_row["is_private"] == 1:
+            desired_visibility = "private"
+        elif normalized_visibility in SESSION_VISIBILITIES:
+            desired_visibility = normalized_visibility
+        else:
+            desired_visibility = "private"
+        expected_private = 1 if desired_visibility == "private" else 0
+        if (
+            raw_visibility != desired_visibility
+            or (visibility_row["is_private"] or 0) != expected_private
+        ):
+            transition_session_visibility(
+                conn,
+                visibility_row["session_id"],
+                desired_visibility,
+                shared_dir=None,
+                transition_source="migration",
+                reason="legacy visibility normalized closed",
+                manage_storage=False,
+            )
     conn.execute(
         """
         UPDATE sessions
         SET visibility_source = CASE
-                WHEN visibility_source IN ('manual', 'rule', 'default') THEN visibility_source
+                WHEN visibility_source IN ('manual', 'rule', 'default', 'marker', 'drift', 'migration')
+                THEN visibility_source
                 WHEN visibility IN ('private', 'unlisted') OR is_private = 1 THEN 'manual'
                 ELSE 'default'
             END,
@@ -1790,7 +2214,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         SET display_name = COALESCE(NULLIF(display_name, ''), username),
             profile_visibility = CASE
                 WHEN profile_visibility IN ('private', 'unlisted', 'public') THEN profile_visibility
-                ELSE 'public'
+                ELSE 'private'
             END,
             default_session_visibility = CASE
                 WHEN default_session_visibility IN ('private', 'unlisted', 'public')
@@ -1808,6 +2232,102 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         SET username = normalize_username_py(username)
         """
     )
+    for session_id in legacy_missing_visibility_ids:
+        transition_session_visibility(
+            conn,
+            session_id,
+            "unlisted",
+            shared_dir=None,
+            transition_source="migration",
+            reason="legacy schema lacked an explicit visibility value",
+            manage_storage=False,
+        )
+    conn.execute(
+        """
+        UPDATE sessions
+        SET publication_state = CASE
+            WHEN reviewed_sha256 IS NOT NULL
+             AND reviewed_artifact_path IS NOT NULL
+             AND file_hash IS NOT NULL
+             AND substr(reviewed_sha256, 1, length(file_hash)) = file_hash
+             AND reviewed_metadata_sha256 IS NOT NULL
+             AND reviewed_metadata_sha256 = publication_metadata_sha256
+            THEN 'reviewed'
+            WHEN reviewed_sha256 IS NOT NULL
+             AND reviewed_artifact_path IS NOT NULL
+            THEN 'source_drift'
+            WHEN visibility = 'private' THEN 'revoked'
+            ELSE 'unreviewed'
+        END
+        """
+    )
+    # Legacy public rows have no enforceable review record.  Migrate them
+    # closed to local/link-only unlisted through the same audited guard used
+    # by live commands and rules.
+    from .publish import publication_metadata_sha256
+
+    for public_row in conn.execute(
+        """
+        SELECT s.*, COALESCE(u.display_name, u.username, s.username) AS display_name,
+               u.bio AS bio, u.avatar_url AS avatar_url
+        FROM sessions s
+        LEFT JOIN users u ON u.username = s.username
+        WHERE s.visibility = 'public'
+        """
+    ).fetchall():
+        current_metadata_sha256 = publication_metadata_sha256(public_row)
+        conn.execute(
+            "UPDATE sessions SET publication_metadata_sha256 = ? WHERE session_id = ?",
+            (current_metadata_sha256, public_row["session_id"]),
+        )
+    legacy_public_ids = [
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT s.session_id
+            FROM sessions s
+            WHERE s.visibility = 'public'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM publication_reviews r
+                WHERE r.id = s.publication_review_id
+                  AND r.session_id = s.session_id
+                  AND r.successful = 1
+                  AND r.approved_visibility = 'public'
+                  AND r.reviewed_sha256 = s.reviewed_sha256
+                  AND s.file_hash IS NOT NULL
+                  AND substr(r.reviewed_sha256, 1, length(s.file_hash)) = s.file_hash
+                  AND r.reviewed_artifact_path = s.reviewed_artifact_path
+                  AND r.reviewed_metadata_sha256 = s.reviewed_metadata_sha256
+                  AND s.reviewed_metadata_sha256 = s.publication_metadata_sha256
+              )
+            """
+        ).fetchall()
+    ]
+    for session_id in legacy_public_ids:
+        transition_session_visibility(
+            conn,
+            session_id,
+            "public",
+            shared_dir=None,
+            transition_source="migration",
+            reason="legacy public visibility lacked a verified review record",
+            public_without_review="unlisted",
+            manage_storage=False,
+        )
+        conn.execute(
+            """
+            UPDATE sessions
+            SET publication_state = CASE
+                WHEN reviewed_sha256 IS NOT NULL
+                 AND reviewed_artifact_path IS NOT NULL
+                THEN 'source_drift'
+                ELSE 'unreviewed'
+            END
+            WHERE session_id = ?
+            """,
+            (session_id,),
+        )
     conn.executescript(INDEXES)
     conn.executescript(VIEWS)
 
@@ -2007,12 +2527,53 @@ def upsert_session(conn, data: dict):
         "parent_session_id": None,
         "spawn_depth": 0,
         "identity_version": 0,
+        "visibility": "private",
+        "visibility_source": "default",
+        "visibility_rule_id": None,
+        "visibility_reason": "initial private guard",
+        "is_private": 1,
         "file_size": None,
         "file_mtime": None,
         **data,
     }
     if payload.get("username"):
         payload["username"] = normalize_username(str(payload["username"]))
+    desired_visibility = _normalize_visibility(
+        payload.get("visibility"), SESSION_VISIBILITIES
+    )
+    desired_source = (payload.get("visibility_source") or "default").strip().lower()
+    if desired_source not in VISIBILITY_SOURCES:
+        raise ValueError(f"Unsupported visibility transition source: {desired_source}")
+    desired_rule_id = payload.get("visibility_rule_id")
+    desired_reason = payload.get("visibility_reason") or f"{desired_source}:{desired_visibility}"
+    existing_visibility = conn.execute(
+        """
+        SELECT visibility, visibility_source, reviewed_sha256,
+               reviewed_artifact_path, reviewed_metadata_sha256,
+               publication_review_id, file_hash
+        FROM sessions WHERE session_id = ?
+        """,
+        (payload["session_id"],),
+    ).fetchone()
+    preserve_manual = bool(
+        existing_visibility
+        and (existing_visibility["visibility_source"] or "default") == "manual"
+    )
+    # Metadata upserts do not get to mutate visibility directly.  The guarded
+    # API below performs the effective transition after the row exists.
+    if existing_visibility:
+        payload["visibility"] = _normalize_visibility(
+            existing_visibility["visibility"], SESSION_VISIBILITIES
+        )
+        payload["visibility_source"] = existing_visibility["visibility_source"] or "default"
+    else:
+        payload["visibility"] = "private"
+        payload["visibility_source"] = "default"
+    payload["visibility_rule_id"] = None
+    payload["visibility_reason"] = "initial private guard" if not existing_visibility else (
+        payload.get("visibility_reason") or "preserved during metadata sync"
+    )
+    payload["is_private"] = 1 if payload["visibility"] == "private" else 0
     cache_creation = max(0, int(payload.get("cache_creation_input_tokens", 0) or 0))
     cache_5m = max(0, int(payload.get("cache_creation_5m_input_tokens", 0) or 0))
     cache_1h = max(0, int(payload.get("cache_creation_1h_input_tokens", 0) or 0))
@@ -2171,6 +2732,67 @@ def upsert_session(conn, data: dict):
         """,
         payload,
     )
+    incoming_hash = payload.get("file_hash")
+    from .publish import publication_metadata_sha256
+
+    current_publication_row = _publication_session_row(conn, payload["session_id"])
+    current_metadata_sha256 = publication_metadata_sha256(current_publication_row)
+    conn.execute(
+        "UPDATE sessions SET publication_metadata_sha256 = ? WHERE session_id = ?",
+        (current_metadata_sha256, payload["session_id"]),
+    )
+    revokes_drifted_publication = bool(
+        existing_visibility
+        and existing_visibility["visibility"] == "public"
+        and existing_visibility["reviewed_sha256"]
+        and existing_visibility["reviewed_artifact_path"]
+        and (
+            not incoming_hash
+            or not str(existing_visibility["reviewed_sha256"]).startswith(
+                str(incoming_hash)
+            )
+        )
+        or (
+            existing_visibility
+            and existing_visibility["visibility"] == "public"
+            and existing_visibility["reviewed_metadata_sha256"]
+            and existing_visibility["reviewed_metadata_sha256"]
+            != current_metadata_sha256
+        )
+    )
+    if revokes_drifted_publication:
+        transition_session_visibility(
+            conn,
+            payload["session_id"],
+            "unlisted",
+            shared_dir=None,
+            transition_source="drift",
+            reason="source revision drifted from reviewed artifact; publication revoked and requeued",
+            manage_storage=False,
+        )
+        conn.execute(
+            """
+            UPDATE sessions
+            SET publication_state = 'source_drift',
+                visibility_reason = 'source revision drifted from reviewed artifact; publication revoked and requeued'
+            WHERE session_id = ?
+            """,
+            (payload["session_id"],),
+        )
+    elif not preserve_manual:
+        result = transition_session_visibility(
+            conn,
+            payload["session_id"],
+            desired_visibility,
+            shared_dir=None,
+            transition_source=desired_source,
+            reason=str(desired_reason),
+            visibility_rule_id=desired_rule_id,
+            public_without_review="unlisted",
+            manage_storage=False,
+        )
+        if result.warning and desired_visibility == "public":
+            warnings.warn(result.warning, RuntimeWarning, stacklevel=2)
 
 
 def insert_session_daily_usage(conn, session_id: str, daily_usage: list):
@@ -2281,7 +2903,7 @@ def _session_rank(last_timestamp, first_timestamp, session_id) -> tuple[str, str
     return (last_timestamp or "~", first_timestamp or "~", session_id)
 
 
-def apply_message_claims(conn, session_id: str, message_usage: list) -> set[str]:
+def apply_message_claims(conn, session_id: str, message_usage) -> set[str]:
     """Replace one session's occurrences and return every possibly stale owner.
 
     Losing occurrences remain in the ledger. The `message_claim_owners` view
@@ -2290,55 +2912,59 @@ def apply_message_claims(conn, session_id: str, message_usage: list) -> set[str]
     unchanged loser. Returning every claimant for touched keys makes the
     scoped native refresh correct before and after any such ownership change.
     """
-    message_usage = list(message_usage)
-    current_keys = {m.claim_key for m in message_usage}
-    old_keys = {
-        row[0]
-        for row in conn.execute(
-            "SELECT claim_key FROM message_claims WHERE session_id = ?",
-            (session_id,),
-        )
-    }
-    touched_keys = old_keys | current_keys
-    if not touched_keys:
-        return set()
+    # Stage the current iterable in SQLite rather than converting it to a
+    # list/set. Claude's parser deliberately returns a disk-backed reusable
+    # sequence, and materializing it here would restore output-proportional
+    # heap usage during sync.
+    conn.execute(
+        """
+        CREATE TEMP TABLE IF NOT EXISTS _logpile_current_message_claims (
+            claim_key TEXT PRIMARY KEY,
+            day TEXT,
+            model TEXT,
+            fresh_input_tokens INTEGER NOT NULL,
+            cached_input_tokens INTEGER NOT NULL,
+            cache_creation_input_tokens INTEGER NOT NULL,
+            cache_creation_5m_input_tokens INTEGER NOT NULL,
+            cache_creation_1h_input_tokens INTEGER NOT NULL,
+            cache_creation_unknown_input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE TEMP TABLE IF NOT EXISTS _logpile_touched_message_claims (
+            claim_key TEXT PRIMARY KEY
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute("DELETE FROM _logpile_current_message_claims")
+    conn.execute("DELETE FROM _logpile_touched_message_claims")
 
-    affected: set[str] = {session_id}
-
-    def add_current_claimants(keys: set[str]) -> None:
-        for chunk in _chunked(sorted(keys)):
-            placeholders = ",".join("?" * len(chunk))
-            affected.update(
-                row[0]
-                for row in conn.execute(
-                    f"SELECT DISTINCT session_id FROM message_claims "
-                    f"WHERE claim_key IN ({placeholders})",
-                    chunk,
-                )
+    def normalized_rows():
+        for message in message_usage:
+            total = max(0, int(message.cache_creation_input_tokens or 0))
+            cache_5m = max(0, int(message.cache_creation_5m_input_tokens or 0))
+            cache_1h = max(0, int(message.cache_creation_1h_input_tokens or 0))
+            cache_unknown = max(
+                0,
+                int(
+                    getattr(
+                        message,
+                        "cache_creation_unknown_input_tokens",
+                        0,
+                    )
+                    or 0
+                ),
             )
-
-    add_current_claimants(touched_keys)
-
-    rows_to_write = []
-    for message in message_usage:
-        total = max(0, int(message.cache_creation_input_tokens or 0))
-        cache_5m = max(0, int(message.cache_creation_5m_input_tokens or 0))
-        cache_1h = max(0, int(message.cache_creation_1h_input_tokens or 0))
-        cache_unknown = max(
-            0,
-            int(
-                getattr(message, "cache_creation_unknown_input_tokens", 0) or 0
-            ),
-        )
-        if cache_5m + cache_1h > total:
-            cache_5m = cache_1h = 0
-            cache_unknown = total
-        elif cache_5m + cache_1h + cache_unknown != total:
-            cache_unknown = total - cache_5m - cache_1h
-        rows_to_write.append(
-            (
+            if cache_5m + cache_1h > total:
+                cache_5m = cache_1h = 0
+                cache_unknown = total
+            elif cache_5m + cache_1h + cache_unknown != total:
+                cache_unknown = total - cache_5m - cache_1h
+            yield (
                 message.claim_key,
-                session_id,
                 message.day,
                 message.model,
                 message.fresh_input_tokens,
@@ -2349,42 +2975,110 @@ def apply_message_claims(conn, session_id: str, message_usage: list) -> set[str]
                 cache_unknown,
                 message.output_tokens,
             )
-        )
-    if rows_to_write:
-        conn.executemany(
-            """
-            INSERT INTO message_claims (
-                claim_key, session_id, day, model,
-                fresh_input_tokens, cached_input_tokens,
-                cache_creation_input_tokens, cache_creation_5m_input_tokens,
-                cache_creation_1h_input_tokens,
-                cache_creation_unknown_input_tokens, output_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(claim_key, session_id) DO UPDATE SET
-                day = excluded.day,
-                model = excluded.model,
-                fresh_input_tokens = excluded.fresh_input_tokens,
-                cached_input_tokens = excluded.cached_input_tokens,
-                cache_creation_input_tokens = excluded.cache_creation_input_tokens,
-                cache_creation_5m_input_tokens = excluded.cache_creation_5m_input_tokens,
-                cache_creation_1h_input_tokens = excluded.cache_creation_1h_input_tokens,
-                cache_creation_unknown_input_tokens =
-                    excluded.cache_creation_unknown_input_tokens,
-                output_tokens = excluded.output_tokens
-            """,
-            rows_to_write,
+
+    conn.executemany(
+        """
+        INSERT INTO _logpile_current_message_claims (
+            claim_key, day, model, fresh_input_tokens,
+            cached_input_tokens, cache_creation_input_tokens,
+            cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens,
+            cache_creation_unknown_input_tokens, output_tokens
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(claim_key) DO UPDATE SET
+            day = excluded.day,
+            model = excluded.model,
+            fresh_input_tokens = excluded.fresh_input_tokens,
+            cached_input_tokens = excluded.cached_input_tokens,
+            cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens =
+                excluded.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens =
+                excluded.cache_creation_1h_input_tokens,
+            cache_creation_unknown_input_tokens =
+                excluded.cache_creation_unknown_input_tokens,
+            output_tokens = excluded.output_tokens
+        """,
+        normalized_rows(),
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO _logpile_touched_message_claims (claim_key)
+        SELECT claim_key FROM message_claims WHERE session_id = ?
+        """,
+        (session_id,),
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO _logpile_touched_message_claims (claim_key)
+        SELECT claim_key FROM _logpile_current_message_claims
+        """
+    )
+    if conn.execute(
+        "SELECT 1 FROM _logpile_touched_message_claims LIMIT 1"
+    ).fetchone() is None:
+        return set()
+
+    affected: set[str] = {session_id}
+
+    def add_current_claimants() -> None:
+        affected.update(
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT DISTINCT claims.session_id
+                FROM message_claims AS claims
+                JOIN _logpile_touched_message_claims AS touched
+                  ON touched.claim_key = claims.claim_key
+                """
+            )
         )
 
-    stale_keys = old_keys - current_keys
-    for chunk in _chunked(sorted(stale_keys)):
-        placeholders = ",".join("?" * len(chunk))
-        conn.execute(
-            f"DELETE FROM message_claims WHERE session_id = ? "
-            f"AND claim_key IN ({placeholders})",
-            [session_id, *chunk],
+    add_current_claimants()
+    conn.execute(
+        """
+        INSERT INTO message_claims (
+            claim_key, session_id, day, model,
+            fresh_input_tokens, cached_input_tokens,
+            cache_creation_input_tokens, cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens,
+            cache_creation_unknown_input_tokens, output_tokens
         )
-
-    add_current_claimants(touched_keys)
+        SELECT claim_key, ?, day, model,
+               fresh_input_tokens, cached_input_tokens,
+               cache_creation_input_tokens, cache_creation_5m_input_tokens,
+               cache_creation_1h_input_tokens,
+               cache_creation_unknown_input_tokens, output_tokens
+        FROM _logpile_current_message_claims
+        WHERE 1
+        ON CONFLICT(claim_key, session_id) DO UPDATE SET
+            day = excluded.day,
+            model = excluded.model,
+            fresh_input_tokens = excluded.fresh_input_tokens,
+            cached_input_tokens = excluded.cached_input_tokens,
+            cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens =
+                excluded.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens =
+                excluded.cache_creation_1h_input_tokens,
+            cache_creation_unknown_input_tokens =
+                excluded.cache_creation_unknown_input_tokens,
+            output_tokens = excluded.output_tokens
+        """,
+        (session_id,),
+    )
+    conn.execute(
+        """
+        DELETE FROM message_claims
+        WHERE session_id = ?
+          AND NOT EXISTS (
+              SELECT 1 FROM _logpile_current_message_claims AS current
+              WHERE current.claim_key = message_claims.claim_key
+          )
+        """,
+        (session_id,),
+    )
+    add_current_claimants()
     return affected
 
 
@@ -2503,84 +3197,113 @@ def set_meta(conn, key: str, value: str | None) -> None:
         )
 
 
-def insert_tool_calls(conn, session_id: str, tool_calls: list):
+def insert_tool_calls(conn, session_id: str, tool_calls):
     conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (session_id,))
     conn.executemany(
         "INSERT INTO tool_calls (session_id, tool_name, command, timestamp, is_error) VALUES (?,?,?,?,?)",
-        [
+        (
             (session_id, tc.tool_name, tc.command, tc.timestamp, 1 if tc.is_error else 0)
             for tc in tool_calls
-        ],
+        ),
     )
 
 
-def insert_session_paths(conn, session_id: str, session_paths: list):
+def insert_session_paths(conn, session_id: str, session_paths):
     conn.execute("DELETE FROM session_paths WHERE session_id = ?", (session_id,))
-    if not session_paths:
-        return
+    # Aggregate in SQLite so a transcript touching millions of unique paths
+    # does not build an equally large Python dictionary (and then a second
+    # list for executemany). ``tool_name_missing`` keeps None distinct from
+    # the empty string while still giving the WITHOUT ROWID table a fully
+    # non-null primary key equivalent to the old tuple key.
+    conn.execute(
+        """
+        CREATE TEMP TABLE IF NOT EXISTS _logpile_current_session_paths (
+            normalized_path TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            source TEXT NOT NULL,
+            tool_name_missing INTEGER NOT NULL,
+            tool_name_key TEXT NOT NULL,
+            raw_path TEXT NOT NULL,
+            relative_path TEXT,
+            repo_relative_path TEXT,
+            display_path TEXT NOT NULL,
+            first_timestamp TEXT,
+            last_timestamp TEXT,
+            occurrence_count INTEGER NOT NULL,
+            PRIMARY KEY (
+                normalized_path, operation, source,
+                tool_name_missing, tool_name_key
+            )
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute("DELETE FROM _logpile_current_session_paths")
 
-    aggregated: dict[tuple[str, str, str, str | None], dict] = {}
-    for path in session_paths:
-        key = (
-            path.normalized_path,
-            path.operation,
-            path.source,
-            path.tool_name,
-        )
-        row = aggregated.get(key)
-        if row is None:
-            aggregated[key] = {
-                "session_id": session_id,
-                "raw_path": path.raw_path,
-                "normalized_path": path.normalized_path,
-                "relative_path": path.relative_path,
-                "repo_relative_path": getattr(path, "repo_relative_path", None),
-                "display_path": path.display_path,
-                "operation": path.operation,
-                "source": path.source,
-                "tool_name": path.tool_name,
-                "first_timestamp": path.timestamp,
-                "last_timestamp": path.timestamp,
-                "occurrence_count": 1,
-            }
-            continue
-
-        row["occurrence_count"] += 1
-        if path.timestamp:
-            if not row["first_timestamp"] or path.timestamp < row["first_timestamp"]:
-                row["first_timestamp"] = path.timestamp
-            if not row["last_timestamp"] or path.timestamp > row["last_timestamp"]:
-                row["last_timestamp"] = path.timestamp
+    def staged_rows():
+        for path in session_paths:
+            missing_tool_name = 1 if path.tool_name is None else 0
+            yield (
+                path.normalized_path,
+                path.operation,
+                path.source,
+                missing_tool_name,
+                "" if missing_tool_name else path.tool_name,
+                path.raw_path,
+                path.relative_path,
+                getattr(path, "repo_relative_path", None),
+                path.display_path,
+                path.timestamp,
+                path.timestamp,
+                1,
+            )
 
     conn.executemany(
         """
-        INSERT INTO session_paths (
-            session_id,
-            raw_path,
-            normalized_path,
-            relative_path,
-            repo_relative_path,
-            display_path,
-            operation,
-            source,
-            tool_name,
-            first_timestamp,
-            last_timestamp,
-            occurrence_count
-        ) VALUES (
-            :session_id,
-            :raw_path,
-            :normalized_path,
-            :relative_path,
-            :repo_relative_path,
-            :display_path,
-            :operation,
-            :source,
-            :tool_name,
-            :first_timestamp,
-            :last_timestamp,
-            :occurrence_count
-        )
+        INSERT INTO _logpile_current_session_paths (
+            normalized_path, operation, source,
+            tool_name_missing, tool_name_key, raw_path,
+            relative_path, repo_relative_path, display_path,
+            first_timestamp, last_timestamp, occurrence_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (
+            normalized_path, operation, source,
+            tool_name_missing, tool_name_key
+        ) DO UPDATE SET
+            first_timestamp = CASE
+                WHEN excluded.first_timestamp IS NULL
+                    THEN _logpile_current_session_paths.first_timestamp
+                WHEN _logpile_current_session_paths.first_timestamp IS NULL
+                  OR excluded.first_timestamp
+                     < _logpile_current_session_paths.first_timestamp
+                    THEN excluded.first_timestamp
+                ELSE _logpile_current_session_paths.first_timestamp
+            END,
+            last_timestamp = CASE
+                WHEN excluded.last_timestamp IS NULL
+                    THEN _logpile_current_session_paths.last_timestamp
+                WHEN _logpile_current_session_paths.last_timestamp IS NULL
+                  OR excluded.last_timestamp
+                     > _logpile_current_session_paths.last_timestamp
+                    THEN excluded.last_timestamp
+                ELSE _logpile_current_session_paths.last_timestamp
+            END,
+            occurrence_count =
+                _logpile_current_session_paths.occurrence_count + 1
         """,
-        list(aggregated.values()),
+        staged_rows(),
+    )
+    conn.execute(
+        """
+        INSERT INTO session_paths (
+            session_id, raw_path, normalized_path, relative_path,
+            repo_relative_path, display_path, operation, source,
+            tool_name, first_timestamp, last_timestamp, occurrence_count
+        )
+        SELECT ?, raw_path, normalized_path, relative_path,
+               repo_relative_path, display_path, operation, source,
+               CASE WHEN tool_name_missing = 1 THEN NULL ELSE tool_name_key END,
+               first_timestamp, last_timestamp, occurrence_count
+        FROM _logpile_current_session_paths
+        """,
+        (session_id,),
     )

@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -7,6 +9,9 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from click.testing import CliRunner
+
+from logpile.cli import cli
 from logpile.db import create_visibility_rule, ensure_user, init_db, set_session_visibility, update_user
 from logpile.objectives import normalize_objective_family
 from logpile.sync import sync_sessions
@@ -34,7 +39,7 @@ class WebAppTests(unittest.TestCase):
         *,
         username: str = "alice",
         profile_visibility: str = "public",
-        default_session_visibility: str = "public",
+        default_session_visibility: str = "unlisted",
     ) -> None:
         init_db(db_path)
         with open_sqlite(db_path) as conn:
@@ -182,6 +187,84 @@ class WebAppTests(unittest.TestCase):
             machine="machine-1",
             home=home,
         )
+        self._approve_public(db_path, shared, session_id)
+        return shared, db_path
+
+    def _approve_public(self, db_path: Path, shared: Path, session_id: str) -> None:
+        result = CliRunner().invoke(
+            cli,
+            [
+                "publish",
+                "approve",
+                session_id,
+                "--db",
+                str(db_path),
+                "--shared",
+                str(shared),
+                "--visibility",
+                "public",
+            ],
+        )
+        self.assertEqual(
+            result.exit_code,
+            0,
+            f"{result.output}\n{result.exception!r}",
+        )
+
+    def _seed_mixed_visibility_codex_lineage(self, root: Path) -> tuple[Path, Path]:
+        home = root / "alice"
+        shared = root / "shared"
+        db_path = root / "logpile.db"
+        self._prepare_user(db_path, username="alice")
+        now = datetime.now(timezone.utc) - timedelta(days=1)
+        self._write_codex_session(
+            home,
+            session_id="private-root",
+            message="PRIVATE ROOT SENTINEL: never expose this lineage goal",
+            timestamp=now,
+            total_input_tokens=100_000_000,
+            cached_input_tokens=90_000_000,
+            total_output_tokens=5_000_000,
+        )
+        self._write_codex_session(
+            home,
+            session_id="public-child-a",
+            message="Public child A",
+            timestamp=now + timedelta(minutes=5),
+            parent_session_id="private-root",
+            spawn_depth=1,
+            total_input_tokens=400_000_000,
+            cached_input_tokens=380_000_000,
+            total_output_tokens=15_000_000,
+        )
+        self._write_codex_session(
+            home,
+            session_id="public-child-b",
+            message="Public child B",
+            timestamp=now + timedelta(minutes=10),
+            parent_session_id="private-root",
+            spawn_depth=2,
+            total_input_tokens=350_000_000,
+            cached_input_tokens=330_000_000,
+            total_output_tokens=10_000_000,
+        )
+        sync_sessions(
+            shared_dir=shared,
+            db_path=db_path,
+            username="alice",
+            machine="machine-1",
+            home=home,
+        )
+        self._approve_public(db_path, shared, "public-child-a")
+        self._approve_public(db_path, shared, "public-child-b")
+        with open_sqlite(db_path) as conn:
+            set_session_visibility(
+                conn,
+                "private-root",
+                "private",
+                shared_dir=shared,
+            )
+            conn.commit()
         return shared, db_path
 
     def _init_git_repo(self, root: Path) -> tuple[Path, str]:
@@ -237,7 +320,7 @@ class WebAppTests(unittest.TestCase):
                 self.assertNotIn(b"hello world", sessions_page.data)
                 self.assertEqual(client.get("/sessions/session-1").status_code, 404)
 
-    def test_unlisted_sessions_stay_direct_only(self) -> None:
+    def test_unlisted_sessions_are_not_served_in_public_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             shared, db_path = self._seed_user(root=root)
@@ -249,17 +332,15 @@ class WebAppTests(unittest.TestCase):
             app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
             with app.test_client() as client:
                 profile = client.get("/u/alice")
-                profile_json = client.get("/api/users/alice").get_json()
-                sessions_json = client.get("/api/users/alice/sessions").get_json()
+                profile_json = client.get("/api/users/alice")
+                sessions_json = client.get("/api/users/alice/sessions")
                 detail = client.get("/sessions/session-1")
 
-                self.assertEqual(profile.status_code, 200)
-                self.assertIn(b"No public sessions yet.", profile.data)
-                self.assertEqual(profile_json["summary"]["total_sessions"], 0)
-                self.assertEqual(sessions_json["total"], 0)
-                self.assertEqual(sessions_json["sessions"], [])
-                self.assertEqual(detail.status_code, 200)
-                self.assertIn(b"hello world", detail.data)
+                self.assertEqual(profile.status_code, 404)
+                self.assertEqual(profile_json.status_code, 404)
+                self.assertEqual(sessions_json.status_code, 404)
+                self.assertEqual(detail.status_code, 404)
+                self.assertNotIn(b"hello world", detail.data)
 
     def test_user_sessions_api_omits_message_preview(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -320,8 +401,7 @@ class WebAppTests(unittest.TestCase):
                 machine="machine-1",
                 home=home,
             )
-
-            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
             with app.test_client() as client:
                 pipeline = client.get("/api/sessions?origin=pipeline_eval")
                 direct = client.get("/api/users/alice/sessions?origin=human_direct")
@@ -363,8 +443,7 @@ class WebAppTests(unittest.TestCase):
                 machine="machine-1",
                 home=home,
             )
-
-            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
             with app.test_client() as client:
                 dashboard = client.get("/")
                 pipeline_dashboard = client.get("/?origin=pipeline_eval")
@@ -428,7 +507,7 @@ class WebAppTests(unittest.TestCase):
                 home=home,
             )
 
-            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
             with app.test_client() as client:
                 analysis = client.get("/analysis")
                 pipeline = client.get("/analysis?origin=pipeline_eval")
@@ -488,7 +567,7 @@ class WebAppTests(unittest.TestCase):
                 home=home,
             )
 
-            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
             with app.test_client() as client:
                 analysis = client.get("/analysis")
                 pipeline = client.get("/analysis?origin=pipeline_eval")
@@ -555,6 +634,8 @@ class WebAppTests(unittest.TestCase):
                 machine="machine-1",
                 home=home,
             )
+            for session_id in ("root-codex", "child-codex-a", "child-codex-b"):
+                self._approve_public(db_path, shared, session_id)
 
             app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
             with app.test_client() as client:
@@ -566,6 +647,69 @@ class WebAppTests(unittest.TestCase):
             self.assertIn(b"mostly inherited context", analysis.data.lower())
             self.assertIn(b"2 child sessions", analysis.data)
             self.assertIn(b"spawn depth 2", analysis.data.lower())
+
+    def test_legacy_analysis_stops_before_private_lineage_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_mixed_visibility_codex_lineage(root)
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+
+            with app.test_client() as client:
+                analysis = client.get("/analysis")
+
+            self.assertEqual(analysis.status_code, 200)
+            self.assertNotIn(b"private root sentinel", analysis.data.lower())
+            self.assertNotIn(b"private-root", analysis.data.lower())
+
+    @unittest.skipUnless(
+        shutil.which("bun") and shutil.which("node"),
+        "bun and node are required for the Next.js query regression",
+    )
+    def test_next_analysis_stops_before_private_lineage_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            shared, db_path = self._seed_mixed_visibility_codex_lineage(root)
+            web_dir = Path(__file__).resolve().parents[1] / "web"
+            with tempfile.TemporaryDirectory(
+                prefix=".logpile-next-test-",
+                dir=web_dir,
+            ) as build_dir:
+                bundle = Path(build_dir) / "db.mjs"
+                subprocess.run(
+                    [
+                        "bun",
+                        "build",
+                        "./src/lib/db.ts",
+                        "--target=node",
+                        "--external=better-sqlite3",
+                        f"--outfile={bundle}",
+                    ],
+                    cwd=web_dir,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                script = (
+                    f"const db = await import({json.dumps(bundle.as_uri())});"
+                    "process.stdout.write(JSON.stringify("
+                    "db.getContextExplosionWorkstreams(6)));"
+                )
+                result = subprocess.run(
+                    ["node", "-e", script],
+                    cwd=web_dir,
+                    env={
+                        **os.environ,
+                        "LOGPILE_DB_PATH": str(db_path),
+                        "LOGPILE_SHARED_DIR": str(shared),
+                        "LOGPILE_PUBLIC_MODE": "true",
+                    },
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            self.assertEqual(json.loads(result.stdout), [])
+            self.assertNotIn("PRIVATE ROOT SENTINEL", result.stdout)
 
     def test_sessions_and_api_can_filter_by_objective_family(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -600,7 +744,7 @@ class WebAppTests(unittest.TestCase):
             objective = normalize_objective_family("Make more progress on Logpile analytics.")
             self.assertIsNotNone(objective)
 
-            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
             with app.test_client() as client:
                 page = client.get(f"/sessions?objective={objective}&objectiveLabel=Logpile")
                 payload = client.get(f"/api/sessions?objective={objective}").get_json()
@@ -655,7 +799,7 @@ class WebAppTests(unittest.TestCase):
                 home=home,
             )
 
-            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
             with app.test_client() as client:
                 default_profile = client.get("/api/users/alice").get_json()
                 default_stats = client.get("/api/users/alice/stats").get_json()
@@ -689,6 +833,8 @@ class WebAppTests(unittest.TestCase):
                 update_user(conn, "alice", display_name="Sam")
                 update_user(conn, "bob", display_name="Sam")
                 conn.commit()
+            self._approve_public(db_path, shared, "session-a")
+            self._approve_public(db_path, shared, "session-b")
 
             app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
             with app.test_client() as client:
@@ -743,7 +889,7 @@ class WebAppTests(unittest.TestCase):
                 home=home,
             )
 
-            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
             with app.test_client() as client:
                 payload = client.get("/api/messages-per-day").get_json()
 
@@ -908,7 +1054,7 @@ class WebAppTests(unittest.TestCase):
                 home=home,
             )
 
-            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
             with app.test_client() as client:
                 test_failed = client.get("/api/sessions?activity=test_failed").get_json()
                 writes = client.get("/api/users/alice/sessions?activity=write").get_json()
@@ -1004,7 +1150,10 @@ class WebAppTests(unittest.TestCase):
 
             with public_app.test_client() as client:
                 self.assertEqual(client.get("/api/sessions").get_json(), [])
-                self.assertEqual(client.get("/api/users/alice/sessions").get_json()["total"], 0)
+                self.assertEqual(
+                    client.get("/api/users/alice/sessions").status_code,
+                    404,
+                )
 
             with private_app.test_client() as client:
                 self.assertEqual(len(client.get("/api/sessions").get_json()), 1)
@@ -1025,8 +1174,11 @@ class WebAppTests(unittest.TestCase):
             with public_app.test_client() as client:
                 self.assertEqual(client.get("/sessions/session-1").status_code, 404)
                 self.assertEqual(client.get("/api/sessions").get_json(), [])
-                self.assertEqual(client.get("/api/users/alice").get_json()["summary"]["total_sessions"], 0)
-                self.assertEqual(client.get("/api/users/alice/sessions").get_json()["total"], 0)
+                self.assertEqual(client.get("/api/users/alice").status_code, 404)
+                self.assertEqual(
+                    client.get("/api/users/alice/sessions").status_code,
+                    404,
+                )
 
             with private_app.test_client() as client:
                 self.assertEqual(client.get("/sessions/session-1").status_code, 404)

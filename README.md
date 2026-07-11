@@ -42,7 +42,11 @@ Not just a JSONL viewer — filter by repo, git branch, activity (wrote files, r
 Every analytics page splits by *how the session started*: your direct work, delegated sub-agents, pipeline evals, meta-scaffolding, or system-generated. Stop mixing "what I coded this week" with what your test runners did overnight.
 
 ### Publish queue with secret/PII scanning
-Before anything leaves `private` → `unlisted` → `public`, Logpile scans the transcript and flags findings by severity. You get a recommended visibility and a list of evidence, per session, so the triage step is actual review, not guesswork.
+`unlisted` is a local/link-only state and does not require review. Before a session can become `public`, Logpile scans its transcript and rendered metadata, stores the reviewed transcript and metadata hashes plus an immutable artifact, and flags findings by severity. Transcript or public-metadata drift revokes and requeues the publication. You get a recommended visibility and a list of evidence, per session, so the public gate is an actual review, not guesswork.
+
+Rendered operator metadata (display name, bio, and avatar URL) is part of that
+review fingerprint. Editing it revokes affected public sessions, and the public
+profile stays hidden until at least one current session is reviewed again.
 
 ### Context explosion analysis
 For Codex: detects fork-swarm roots whose children are carrying large inherited-context burden. Surfaces cached-input share, child-token share, spawn depth, and warnings like "mostly inherited context", "fork swarm", "giant child sessions". Tells you where your token budget is actually going.
@@ -98,6 +102,10 @@ activity counts, narrative fields, and origin classification, then writes to
 SQLite. If a rollout stem exists in more than one root (mid-archive race),
 the live `sessions/` copy wins. Unchanged files are skipped on a size+mtime
 fast path, so multi-GB immutable archives are hashed once, not every sync.
+Logpile intentionally keeps archival shared copies. Before copying, sync prints
+the planned copy count/volume and available free space; it refuses an
+insufficient-space plan. A source hash/mtime is committed only after the shared
+copy matches that hash, and failed verification is persisted for retry.
 
 #### Token accounting
 
@@ -233,11 +241,25 @@ logpile backup index --from-r2 --missing --defer-search-index
 logpile backup search-index
 ```
 
-Install cloud support with `uv pip install -e '.[cloud]'`. Raw objects are stored under content-addressed keys such as `raw/sha256/ab/<sha256>.jsonl`; Postgres stores object manifests, source paths, byte ranges, and exact searchable text chunks. Full-text search is indexed by default, while substring search falls back to a direct scan so bulk imports do not create a very large trigram index unless a deployment chooses to add one later. The backup command never deletes local files.
+Install cloud support with `uv pip install -e '.[cloud]'`. Backup uses the same
+Claude, Codex, alternate Codex-home, and OpenClaw discovery roots as sync. Pass
+`--db` and `--shared` when they differ from the defaults so sole-survivor shared
+artifacts whose native source rotated away are included too; byte-identical
+files are deduplicated by SHA-256. Raw objects are stored under
+content-addressed keys such as `raw/sha256/ab/<sha256>.jsonl`; Postgres stores
+object manifests, source paths, byte ranges, and exact searchable text chunks.
+Full-text search is indexed by default, while substring search falls back to a
+direct scan so bulk imports do not create a very large trigram index unless a
+deployment chooses to add one later. The backup command never deletes local
+files.
 
 ### `logpile serve`
 
-Starts the Next.js web app.
+Starts the Next.js web app. Serving is intentionally source-checkout-only: the
+Python wheel does not package either web UI. From a wheel install, `logpile
+serve` exits with instructions to clone the source checkout. The Python-only
+core commands (`sync`, `stats`, `search`, and `db-backup`) continue to work from
+the wheel.
 
 ```
 Options:
@@ -256,8 +278,9 @@ interface without that override.
 
 `--public` mode enforces the hosted contract:
 - only `public` sessions appear in listings and aggregate APIs
-- `unlisted` sessions remain direct-link only
+- `unlisted` sessions are local/link artifacts and are never served
 - `private` sessions are hidden entirely
+- public transcripts come only from hash-verified immutable reviewed artifacts
 - `/publish` queue is unavailable
 
 ### `logpile publish queue`
@@ -281,11 +304,14 @@ Scans one session's transcript for secrets/PII and prints a recommendation + fin
 
 ### `logpile publish approve <session-id>` / `logpile publish apply <session-id>`
 
-Apply a reviewed visibility decision. Defaults to `--visibility unlisted`. `--force` overrides the review recommendation.
+Apply a reviewed visibility decision. Defaults to `--visibility unlisted`. `--force` overrides the review recommendation. A `public` decision records the reviewed SHA-256 and immutable artifact; later source drift revokes and requeues that revision.
 
 ### `logpile private <session-id>` / `logpile visibility <session-id> <level>`
 
-Set session visibility manually. Manual settings win over rules.
+Set session visibility manually. Manual settings win over rules. Moving to
+`unlisted` is allowed without review, emits an explicit local/link-only
+warning, and is audited. Moving to `public` is rejected until the current
+revision has a successful publish review.
 
 ### `logpile users` / `logpile user <username>`
 
@@ -304,7 +330,7 @@ Three session visibility levels:
 | Level | In listings | Direct-link | Profile totals | Public mode |
 |---|---|---|---|---|
 | `public` | ✓ | ✓ | ✓ | ✓ visible |
-| `unlisted` | hidden | ✓ | ✓ | direct-link only |
+| `unlisted` | hidden | ✓ (local/private mode) | ✓ (local/private mode) | hidden entirely |
 | `private` | hidden | hidden | — | hidden entirely |
 
 Plus matching profile visibility at `/u/<username>`.

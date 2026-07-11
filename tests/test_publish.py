@@ -1,6 +1,11 @@
+import base64
+import hashlib
 import json
+import os
+import re
 import sqlite3
 import tempfile
+import tracemalloc
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -10,8 +15,14 @@ from click.testing import CliRunner
 
 from logpile.cli import cli
 import logpile.db as db_module
+import logpile.publish as publish_module
 from logpile.db import ensure_user, init_db, set_session_visibility, update_user
-from logpile.publish import preserve_reviewed_artifact, review_publish_session
+from logpile.publish import (
+    preserve_reviewed_artifact,
+    review_staging_dir,
+    review_publish_session,
+    serialize_publish_review,
+)
 from logpile.sync import sync_sessions
 
 
@@ -109,6 +120,480 @@ class PublishTests(unittest.TestCase):
             self.assertIn("Token or credential", result.output)
             self.assertIn("Private key material", result.output)
             self.assertIn("Inspected file:", result.output)
+
+    def test_scanner_covers_credentials_pii_metadata_and_masks_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+
+            def jwt_part(value: dict) -> str:
+                return base64.urlsafe_b64encode(
+                    json.dumps(value, separators=(",", ":")).encode()
+                ).decode().rstrip("=")
+
+            jwt = (
+                f"{jwt_part({'alg': 'HS256', 'typ': 'JWT'})}."
+                f"{jwt_part({'sub': '123', 'role': 'admin'})}."
+                "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+            )
+            slack_one = "xoxb-" + "123456789012-abcdefghijklmnopqrstuvwxyz"
+            slack_two = "xoxp-" + "987654321098-zyxwvutsrqponmlkjihgfedcba"
+            github_pat = "github_pat_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0"
+            google_key = "AIza" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7R"[:35]
+            stripe_key = "sk_live_" + "A1b2C3d4E5f6G7h8I9j0K1l2"
+            connection_password = "db-Sup3r-Secret"
+            connection_uri = (
+                f"postgresql://app:{connection_password}@db.example.com/prod"
+            )
+            basic_value = base64.b64encode(b"admin:basic-secret-123").decode()
+            npm_token = "npm_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6"
+            card = "4111 1111 1111 1111"
+            ssn = "123-45-6789"
+            phone = "+1 (415) 555-2671"
+            compact_phone = "4155552671"
+            compact_country_phone = "+14155552671"
+            compact_parenthesized_phone = "(415)555-2671"
+            international_phone = "+44 20 7946 0958"
+            windows_path = r"C:\Users\alice\work\private.txt"
+            entropy_token = "Q7mK2vN9xR4pL8sT1wY6aB3cD5eF0hJ2"
+            pem_payload = "MIIE" + "A" * 92
+            pem_end = "-----END PRIVATE KEY-----"
+            pem_block = (
+                "-----BEGIN PRIVATE KEY-----\n"
+                f"{pem_payload}\n"
+                f"{pem_end}"
+            )
+            prefix = "ordinary context " * 40
+            body = " | ".join(
+                (
+                    prefix + slack_one,
+                    slack_two,
+                    github_pat,
+                    jwt,
+                    connection_uri,
+                    f"Authorization: Basic {basic_value}",
+                    npm_token,
+                    ssn,
+                    card,
+                    phone,
+                    compact_phone,
+                    compact_country_phone,
+                    compact_parenthesized_phone,
+                    international_phone,
+                    windows_path,
+                    entropy_token,
+                    "alice@example.com",
+                    pem_block,
+                )
+            )
+            self._write_session(home, body=body)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            with open_sqlite(db_path) as conn:
+                update_user(
+                    conn,
+                    "alice",
+                    bio=f"release contact carries {slack_one}",
+                    avatar_url=connection_uri,
+                )
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET git_branch = ?, session_goal = ?, objective_label = ?,
+                        session_summary = ?
+                    WHERE session_id = 'session-1'
+                    """,
+                    (stripe_key, google_key, f"Review {google_key}", pem_block),
+                )
+                conn.commit()
+                review = review_publish_session(conn, "session-1")
+
+            self.assertIsNotNone(review)
+            assert review is not None
+            self.assertEqual(review.recommendation, "private")
+            titles = {finding.title for finding in review.findings}
+            self.assertTrue(
+                {
+                    "Slack token",
+                    "JSON Web Token",
+                    "GitHub fine-grained token",
+                    "Google API key",
+                    "Stripe live key",
+                    "Credentialed connection URI",
+                    "Basic authorization credential",
+                    "Package registry token",
+                    "US Social Security number",
+                    "Payment card number",
+                    "Phone number",
+                    "Windows home path",
+                    "High-entropy token",
+                    "Email address",
+                    "Private key material",
+                }.issubset(titles),
+                titles,
+            )
+
+            slack_findings = [
+                finding
+                for finding in review.findings
+                if finding.title == "Slack token"
+                and not finding.source.startswith("metadata.")
+            ]
+            self.assertEqual(len(slack_findings), 2)
+            self.assertEqual({finding.match_count for finding in slack_findings}, {2})
+            self.assertEqual({finding.match_index for finding in slack_findings}, {1, 2})
+            self.assertGreater(min(finding.match_start or 0 for finding in slack_findings), 500)
+            self.assertTrue(all("[MASKED]" in finding.evidence for finding in review.findings))
+            self.assertTrue(
+                any(finding.source == "metadata.bio" for finding in review.findings)
+            )
+            self.assertTrue(
+                any(
+                    finding.source == "metadata.avatar_url"
+                    for finding in review.findings
+                )
+            )
+
+            serialized = json.dumps(serialize_publish_review(review))
+            self.assertEqual(review.metadata["session_summary"], "[MASKED]")
+            self.assertNotIn(slack_one, str(review.metadata["bio"]))
+            self.assertNotIn(connection_password, str(review.metadata["avatar_url"]))
+            for secret in (
+                slack_one,
+                slack_two,
+                github_pat,
+                jwt,
+                google_key,
+                stripe_key,
+                connection_password,
+                basic_value,
+                npm_token,
+                ssn,
+                card,
+                phone,
+                compact_phone,
+                compact_country_phone,
+                compact_parenthesized_phone,
+                international_phone,
+                windows_path,
+                entropy_token,
+                "alice@example.com",
+                pem_payload,
+                pem_end,
+            ):
+                self.assertNotIn(secret, serialized)
+
+    def test_scanner_detects_compact_us_phone_forms_and_masks_values(self) -> None:
+        phones = ("4155552671", "+14155552671", "(415)555-2671")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+            source_path = self._write_session(home, body=" | ".join(phones))
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            with open_sqlite(db_path) as conn:
+                review = review_publish_session(conn, "session-1")
+
+            self.assertIsNotNone(review)
+            assert review is not None
+            phone_findings = [
+                finding
+                for finding in review.findings
+                if finding.title == "Phone number"
+                and not finding.source.startswith("metadata.")
+            ]
+            self.assertEqual(len(phone_findings), len(phones))
+            self.assertEqual(
+                {finding.match_count for finding in phone_findings},
+                {len(phones)},
+            )
+            source_text = source_path.read_text(encoding="utf-8")
+            detected_values = {
+                source_text[finding.match_start : finding.match_end]
+                for finding in phone_findings
+                if finding.match_start is not None and finding.match_end is not None
+            }
+            self.assertEqual(detected_values, set(phones))
+            self.assertTrue(
+                all("[MASKED]" in finding.evidence for finding in phone_findings)
+            )
+            for finding in phone_findings:
+                self.assertTrue(
+                    all(phone not in finding.evidence for phone in phones),
+                    finding.evidence,
+                )
+            serialized = json.dumps(serialize_publish_review(review))
+            for phone in phones:
+                self.assertNotIn(phone, serialized)
+
+    def test_scanner_adversarial_negatives_remain_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+            body = " | ".join(
+                (
+                    "xoxb-short",
+                    "github_pat_short",
+                    "abc.def.ghi",
+                    "AIza" + "A" * 34,
+                    "sk_test_A1b2C3d4E5f6G7h8I9j0",
+                    "postgresql://db.example.com/prod",
+                    "Authorization: Basic bm8tY29sb24=",
+                    "npm_short",
+                    "000-00-0000",
+                    "4111 1111 1111 1112",
+                    "123-456-7890",
+                    "1155552671",
+                    "4151552671",
+                    "4151112671",
+                    "4155550000",
+                    "2222222222",
+                    "2345678901",
+                    "9876543210",
+                    "+24155552671",
+                    "order 41555526710",
+                    r"C:\Program Files\Example\app.exe",
+                    "a" * 80,
+                    "sha256=" + "a" * 64,
+                    "release 2026-07-11 version 1.2.3 from 192.168.1.1",
+                )
+            )
+            self._write_session(home, body=body)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            with open_sqlite(db_path) as conn:
+                review = review_publish_session(conn, "session-1")
+
+            self.assertIsNotNone(review)
+            assert review is not None
+            self.assertEqual(review.recommendation, "public")
+            self.assertEqual(review.findings, [])
+
+    def test_review_streams_hash_and_staged_bytes_without_read_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            stage_dir = root / "staging"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+            self._write_session(home, body="Clean staged review.")
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            with open_sqlite(db_path) as conn, mock.patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("whole-file read used"),
+            ):
+                review = review_publish_session(
+                    conn,
+                    "session-1",
+                    stage_dir=stage_dir,
+                )
+
+            self.assertIsNotNone(review)
+            assert review is not None and review.staged_path is not None
+            staged_path = Path(review.staged_path)
+            staged_bytes = staged_path.read_bytes()
+            self.assertEqual(review.inspected_size, len(staged_bytes))
+            self.assertEqual(
+                review.inspected_sha256,
+                hashlib.sha256(staged_bytes).hexdigest(),
+            )
+            self.assertEqual(os.stat(staged_path).st_mode & 0o777, 0o600)
+
+    def test_scanner_bounds_evidence_but_counts_many_matches(self) -> None:
+        email_count = 25_000
+        body = " ".join(
+            f"person{index:05d}@example.com" for index in range(email_count)
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+            self._write_session(home, body=body)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            with open_sqlite(db_path) as conn:
+                tracemalloc.start()
+                try:
+                    review = review_publish_session(conn, "session-1")
+                    _, peak = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+
+            self.assertIsNotNone(review)
+            assert review is not None
+            email_findings = [
+                finding
+                for finding in review.findings
+                if finding.title == "Email address"
+                and not finding.source.startswith("metadata.")
+            ]
+            self.assertEqual(len(email_findings), 5)
+            self.assertEqual(
+                {finding.match_count for finding in email_findings},
+                {email_count},
+            )
+            self.assertEqual(
+                {finding.omitted_count for finding in email_findings},
+                {email_count - len(email_findings)},
+            )
+            self.assertEqual(
+                [finding.match_index for finding in email_findings],
+                [1, 2, 3, 4, 5],
+            )
+            self.assertLess(peak, 32 * 1024 * 1024)
+
+    def test_scanner_detects_and_masks_long_home_path_across_chunk_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+            self._write_session(home, body="Clean session before boundary fixture.")
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            long_home_path = (
+                "/Users/"
+                + "u" * 255
+                + "".join(f"/{chr(97 + index % 26) * 255}" for index in range(32))
+            )
+            distance_before_boundary = 5_000
+            match_start = publish_module._SCAN_CHUNK_BYTES - distance_before_boundary
+            self.assertGreater(distance_before_boundary, 4_096)
+            self.assertLess(distance_before_boundary, publish_module._SCAN_OVERLAP_CHARS)
+            self.assertGreater(
+                match_start + len(long_home_path),
+                publish_module._SCAN_CHUNK_BYTES,
+            )
+
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
+                ).fetchone()
+                assert row is not None
+                artifact_path = Path(row["shared_path"])
+                artifact_path.write_text(
+                    " " * match_start + long_home_path + "\n",
+                    encoding="utf-8",
+                )
+                review = review_publish_session(conn, "session-1")
+
+            self.assertIsNotNone(review)
+            assert review is not None
+            path_findings = [
+                finding
+                for finding in review.findings
+                if finding.title == "Absolute home path"
+                and not finding.source.startswith("metadata.")
+            ]
+            self.assertEqual(len(path_findings), 1)
+            self.assertEqual(path_findings[0].match_start, match_start)
+            self.assertEqual(
+                path_findings[0].match_end,
+                match_start + len(long_home_path),
+            )
+            self.assertIn("[MASKED]", path_findings[0].evidence)
+            self.assertNotIn(
+                long_home_path,
+                json.dumps(serialize_publish_review(review)),
+            )
+
+    def test_streaming_scanner_emits_exact_cutoff_straddles_once(self) -> None:
+        cases = (
+            (
+                "Google API key",
+                "AIza" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7R"[:35],
+            ),
+            (
+                "Token or credential",
+                "sk-ant-" + "A1b2C3d4" * 12,
+            ),
+        )
+        cutoff = 137
+        match_start = cutoff - 1
+
+        for title, secret in cases:
+            with self.subTest(title=title):
+                suffix_length = (
+                    publish_module._SCAN_OVERLAP_CHARS - len(secret) + 1
+                )
+                first_chunk = " " * match_start + secret + " " * suffix_length
+                self.assertEqual(
+                    len(first_chunk) - publish_module._SCAN_OVERLAP_CHARS,
+                    cutoff,
+                )
+                self.assertLess(match_start, cutoff)
+                self.assertGreater(match_start + len(secret), cutoff)
+
+                accumulator = publish_module._FindingAccumulator()
+                scanner = publish_module._StreamingTextScanner(
+                    "cutoff fixture",
+                    accumulator,
+                )
+                scanner.feed(first_chunk)
+                scanner.feed(" ordinary continuation")
+                scanner.feed("", final=True)
+                matches = [
+                    finding
+                    for finding in accumulator.finalize()
+                    if finding.title == title
+                ]
+
+                self.assertEqual(len(matches), 1)
+                self.assertEqual(matches[0].match_start, match_start)
+                self.assertEqual(matches[0].match_end, match_start + len(secret))
+                self.assertEqual(matches[0].match_index, 1)
+                self.assertEqual(matches[0].match_count, 1)
+                self.assertIn("[MASKED]", matches[0].evidence)
+                self.assertNotIn(secret, matches[0].evidence)
+
+    def test_streaming_scanner_retains_left_boundary_context_at_cutoff(self) -> None:
+        secret = "AIza" + "A" * 35
+        cutoff = 137
+        first_chunk = (
+            " " * (cutoff - 1)
+            + "x"
+            + secret
+            + " " * (publish_module._SCAN_OVERLAP_CHARS - len(secret))
+        )
+        self.assertEqual(
+            len(first_chunk) - publish_module._SCAN_OVERLAP_CHARS,
+            cutoff,
+        )
+
+        accumulator = publish_module._FindingAccumulator()
+        scanner = publish_module._StreamingTextScanner("boundary fixture", accumulator)
+        scanner.feed(first_chunk)
+        scanner.feed("", final=True)
+
+        self.assertFalse(
+            any(
+                finding.title == "Google API key"
+                for finding in accumulator.finalize()
+            )
+        )
+
+    def test_scanner_patterns_have_finite_width_within_overlap(self) -> None:
+        widths = [
+            re._parser.parse(rule.regex.pattern, rule.regex.flags).getwidth()[1]
+            for rule in publish_module._PATTERN_RULES
+        ]
+        self.assertTrue(all(width < re._parser.MAXWIDTH for width in widths))
+        self.assertLessEqual(max(widths), publish_module._SCAN_OVERLAP_CHARS)
 
     def test_publish_queue_lists_pending_sessions_with_reviews(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -268,9 +753,22 @@ class PublishTests(unittest.TestCase):
                 home=home,
             )
 
-            with open_sqlite(db_path) as conn:
-                set_session_visibility(conn, "session-1", "public", shared_dir=shared)
-                conn.commit()
+            approval = CliRunner().invoke(
+                cli,
+                [
+                    "publish",
+                    "approve",
+                    "session-1",
+                    "--db",
+                    str(db_path),
+                    "--shared",
+                    str(shared),
+                    "--visibility",
+                    "public",
+                    "--force",
+                ],
+            )
+            self.assertEqual(approval.exit_code, 0, approval.output)
 
             result = CliRunner().invoke(
                 cli,
@@ -477,7 +975,7 @@ class PublishTests(unittest.TestCase):
             self.assertEqual(private_archive.stat().st_mode & 0o777, 0o600)
             self.assertFalse((shared / "alice" / "claudecode" / "demo" / "session-1.jsonl").exists())
 
-    def test_review_does_not_flag_local_home_paths_from_metadata_alone(self) -> None:
+    def test_review_scans_rendered_home_path_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -515,8 +1013,9 @@ class PublishTests(unittest.TestCase):
             )
 
             self.assertEqual(result.exit_code, 0, result.output)
-            self.assertIn("Recommendation: public", result.output)
-            self.assertNotIn("Absolute home path", result.output)
+            self.assertIn("Recommendation: unlisted", result.output)
+            self.assertIn("Absolute home path", result.output)
+            self.assertNotIn("/Users/alice/work/logpile", result.output)
 
     def test_review_prefers_shared_publish_artifact_over_private_source_log(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -633,24 +1132,31 @@ class PublishTests(unittest.TestCase):
             sync_sessions(shared, db_path, "alice", "machine-1", home)
 
             with open_sqlite(db_path) as conn:
-                review = review_publish_session(conn, "session-1")
-                assert review is not None
-                shared_path = Path(
-                    conn.execute(
-                        "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
-                    ).fetchone()[0]
+                review = review_publish_session(
+                    conn,
+                    "session-1",
+                    stage_dir=review_staging_dir(shared),
                 )
-                shared_path.unlink()
-                shared_path.symlink_to(source)
-                source.write_text('{"newer": "source bytes"}\n', encoding="utf-8")
+                assert review is not None
+                artifact = (
+                    shared
+                    / ".published"
+                    / "session-1"
+                    / f"{review.inspected_sha256}.jsonl"
+                )
+                artifact.parent.mkdir(mode=0o700, parents=True)
+                artifact.symlink_to(source)
 
-                with self.assertRaisesRegex(ValueError, "symlinked artifact"):
+                with self.assertRaisesRegex(ValueError, "not a regular file"):
                     preserve_reviewed_artifact(
-                        conn, review, shared_dir=shared
+                        conn,
+                        review,
+                        shared_dir=shared,
+                        approved_visibility="public",
                     )
 
-            self.assertEqual(source.read_text(encoding="utf-8"), '{"newer": "source bytes"}\n')
-            self.assertTrue(shared_path.is_symlink())
+            self.assertIn("reviewed bytes", source.read_text(encoding="utf-8"))
+            self.assertTrue(artifact.is_symlink())
 
     def test_preserve_reviewed_artifact_rejects_non_directory_shared_root_without_chmod(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -666,15 +1172,24 @@ class PublishTests(unittest.TestCase):
             sync_sessions(shared, db_path, "alice", "machine-1", home)
 
             with open_sqlite(db_path) as conn:
-                review = review_publish_session(conn, "session-1")
+                review = review_publish_session(
+                    conn,
+                    "session-1",
+                    stage_dir=review_staging_dir(shared),
+                )
                 assert review is not None
                 moved = root / "original-shared"
                 shared.rename(moved)
                 shared.write_text("not a directory", encoding="utf-8")
                 shared.chmod(0o600)
 
-                with self.assertRaisesRegex(ValueError, "not a directory"):
-                    preserve_reviewed_artifact(conn, review, shared_dir=shared)
+                with self.assertRaisesRegex(ValueError, "unsafe publish directory"):
+                    preserve_reviewed_artifact(
+                        conn,
+                        review,
+                        shared_dir=shared,
+                        approved_visibility="public",
+                    )
 
             self.assertEqual(shared.stat().st_mode & 0o777, 0o600)
             self.assertEqual(shared.read_text(encoding="utf-8"), "not a directory")

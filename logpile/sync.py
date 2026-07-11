@@ -5,6 +5,7 @@ import fnmatch
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+from .discovery import claude_projects_root, codex_session_roots, discover_transcripts
 from .parsers import (
     PrivateSessionMarker,
     file_hash,
@@ -35,9 +37,11 @@ from .db import (
     insert_session_paths,
     insert_tool_calls,
     normalize_username,
+    refresh_session_publication_metadata,
     refresh_native_usage,
     resolve_session_visibility,
     set_meta,
+    transition_session_visibility,
     upsert_session,
 )
 
@@ -454,29 +458,13 @@ def _secure_copy_file(
         raise
 
 
-def _codex_session_roots(home: Path) -> list[Path]:
-    """All Codex rollout roots under a home dir.
-
-    Live sessions come first so that when a rollout exists both live and
-    archived (mid-archive race), the live copy wins the per-run stem dedup.
-    ~/.codex/archived_sessions alone held 26GB that sync never saw.
-    """
-    roots = [
-        home / ".codex" / "sessions",
-        home / ".codex" / "archived_sessions",
-        home / ".codex-2" / "sessions",
-        home / ".codex-3" / "sessions",
-    ]
-    openclaw_agents = home / ".openclaw" / "agents"
-    if openclaw_agents.exists():
-        roots.extend(sorted(openclaw_agents.glob("*/agent/codex-home/sessions")))
-    # Keep standard roots even when absent at discovery time. Codex can move a
-    # live rollout into a newly-created archived_sessions root while this sync
-    # is hashing it; the later root pass should still pick up that rename.
-    return roots
-
-
-def _unchanged_on_disk(existing_row, jsonl_path: Path, shared_dir: Path) -> bool:
+def _unchanged_on_disk(
+    existing_row,
+    jsonl_path: Path,
+    shared_dir: Path,
+    *,
+    preflight_source: tuple[int, float, str] | None = None,
+) -> bool:
     """Cheap no-op check for a synced session: same path, same size+mtime,
     and the shared copy (when one is expected) still present.
 
@@ -484,6 +472,12 @@ def _unchanged_on_disk(existing_row, jsonl_path: Path, shared_dir: Path) -> bool
     again — tens of GB per sync once immutable archives are scanned. Any
     mismatch here just falls through to the full hash-and-parse path.
     """
+    if "copy_retry_pending" in existing_row.keys() and existing_row["copy_retry_pending"]:
+        return False
+    # Full SHA-256 replaced the legacy 16-character prefix.  Force one
+    # verified reparse/copy so old rows cannot remain on the cheap fast path.
+    if len(existing_row["file_hash"] or "") != 64:
+        return False
     if existing_row["file_size"] is None or existing_row["file_mtime"] is None:
         return False
     if existing_row["source_path"] != str(jsonl_path):
@@ -496,16 +490,82 @@ def _unchanged_on_disk(existing_row, jsonl_path: Path, shared_dir: Path) -> bool
         return False
     if abs(existing_row["file_mtime"] - stat.st_mtime) > 1e-6:
         return False
+    # Published revisions get a streaming content check even when an attacker
+    # or restore operation preserves size+mtime.  Public bytes stay frozen in
+    # the reviewed artifact, but any source drift must still be requeued.
+    if existing_row["visibility"] == "public":
+        try:
+            source_hash = (
+                preflight_source[2]
+                if preflight_source is not None
+                and preflight_source[0] == stat.st_size
+                and abs(preflight_source[1] - stat.st_mtime) <= 1e-6
+                else file_hash(jsonl_path)
+            )
+            if source_hash != existing_row["file_hash"]:
+                return False
+        except OSError:
+            return False
     shared_path = existing_row["shared_path"] or ""
     if existing_row["visibility"] == "private":
         if not shared_path:
-            return True
+            # Older rows could predate private archival copies.  Treat the
+            # missing managed artifact as repair work so preflight accounts
+            # for its volume and the normal copy-and-verify path heals it.
+            return False
         return _harden_managed_artifact(
             Path(shared_path), _private_archive_root(shared_dir)
         )
     if not shared_path:
         return False
     return _harden_managed_artifact(Path(shared_path), shared_dir)
+
+
+def _record_copy_retry(
+    conn,
+    *,
+    source_path: Path,
+    session_id: str,
+    expected_sha256: str,
+    file_stat,
+    error: BaseException,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO sync_copy_retries (
+            source_path, session_id, expected_sha256, expected_size,
+            expected_mtime, last_error, attempted_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_path) DO UPDATE SET
+            session_id = excluded.session_id,
+            expected_sha256 = excluded.expected_sha256,
+            expected_size = excluded.expected_size,
+            expected_mtime = excluded.expected_mtime,
+            last_error = excluded.last_error,
+            attempted_at = excluded.attempted_at
+        """,
+        (
+            str(source_path),
+            session_id,
+            expected_sha256,
+            file_stat.st_size,
+            file_stat.st_mtime,
+            str(error),
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    print(
+        f"Warning: archival copy for {source_path} was not verified; "
+        "source hash/mtime were not advanced and sync will retry.",
+        file=sys.stderr,
+    )
+
+
+def _clear_copy_retry(conn, source_path: Path, session_id: str) -> None:
+    conn.execute(
+        "DELETE FROM sync_copy_retries WHERE source_path = ? OR session_id = ?",
+        (str(source_path), session_id),
+    )
 
 
 def _resolve_sync_username(conn, requested_username: str) -> str:
@@ -833,6 +893,7 @@ def _sync_shared_copy(
     project: str,
     filename: str,
     visibility: str,
+    expected_sha256: str,
     existing_shared_path: str | None = None,
 ) -> tuple[str, bool]:
     transition = _prepare_sync_shared_copy(
@@ -845,6 +906,25 @@ def _sync_shared_copy(
         visibility=visibility,
         existing_shared_path=existing_shared_path,
     )
+    copied_path = transition.archive_path
+    managed_root = (
+        _private_archive_root(shared_dir) if visibility == "private" else shared_dir
+    )
+    try:
+        if not _harden_managed_artifact(copied_path, managed_root):
+            raise OSError(
+                errno.EIO,
+                f"archival copy is not a safe regular file: {copied_path}",
+            )
+        copied_sha256 = file_hash(copied_path)
+        if copied_sha256 != expected_sha256:
+            raise OSError(
+                errno.EIO,
+                "archival copy hash mismatch; source metadata was not advanced",
+            )
+    except BaseException:
+        transition.rollback()
+        raise
     defer_storage_transition(conn, transition)
     return str(transition.archive_path), transition.changed
 
@@ -978,6 +1058,82 @@ def should_ignore(path: Path, patterns: list[str]) -> bool:
         if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(path.name, pattern):
             return True
     return False
+
+
+def _format_copy_volume(value: int) -> str:
+    amount = float(max(0, value))
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    unit = units[0]
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            break
+        amount /= 1024
+    return f"{amount:.1f} {unit}"
+
+
+def _preflight_shared_copy_volume(
+    *,
+    home: Path,
+    shared_dir: Path,
+    existing: dict[str, object],
+    patterns: list[str],
+) -> tuple[int, int, dict[str, tuple[int, float, str]]]:
+    """Plan conservative archival-copy volume before mutating storage."""
+    planned_bytes = 0
+    planned_files = 0
+    public_source_hashes: dict[str, tuple[int, float, str]] = {}
+    seen_session_ids: set[tuple[str, str]] = set()
+    for discovered in discover_transcripts(home):
+        jsonl_path = discovered.path
+        if should_ignore(jsonl_path, patterns):
+            continue
+        if discovered.source == "claudecode" and _is_claude_workflow_journal(jsonl_path):
+            continue
+        session_key = (discovered.source, jsonl_path.stem)
+        if session_key in seen_session_ids:
+            continue
+        seen_session_ids.add(session_key)
+        row = existing.get(jsonl_path.stem)
+        preflight_source = None
+        if row is not None and row["visibility"] == "public":
+            try:
+                source_stat = jsonl_path.stat()
+                preflight_source = (
+                    source_stat.st_size,
+                    source_stat.st_mtime,
+                    file_hash(jsonl_path),
+                )
+                public_source_hashes[str(jsonl_path)] = preflight_source
+            except OSError:
+                preflight_source = None
+        if row is not None and _unchanged_on_disk(
+            row,
+            jsonl_path,
+            shared_dir,
+            preflight_source=preflight_source,
+        ):
+            continue
+        try:
+            size = jsonl_path.stat().st_size
+        except OSError:
+            continue
+        planned_bytes += max(0, size)
+        planned_files += 1
+
+    if not planned_files:
+        return 0, 0, public_source_hashes
+    free_bytes = shutil.disk_usage(shared_dir).free
+    message = (
+        "Archival shared-copy preflight plans "
+        f"{_format_copy_volume(planned_bytes)} across {planned_files} transcript(s); "
+        f"{_format_copy_volume(free_bytes)} free at {shared_dir}."
+    )
+    print(f"Warning: {message}", file=sys.stderr)
+    if planned_bytes > free_bytes:
+        raise StorageSafetyError(
+            f"{message} Not enough free space; no transcript copies were started."
+        )
+    return planned_bytes, planned_files, public_source_hashes
 
 
 def project_from_claude_path(jsonl_path: Path) -> str:
@@ -1152,33 +1308,47 @@ def _repo_relative_path(normalized_path: str | None, root: str | None) -> str | 
     return relative if relative not in {"", "."} else None
 
 
+class _AnnotatedSessionPaths:
+    """Reusable lazy view that adds repo-relative paths without a list."""
+
+    def __init__(
+        self,
+        session_paths,
+        canonical_root: str | None,
+    ) -> None:
+        self._session_paths = session_paths
+        self._canonical_root = canonical_root
+
+    def __iter__(self):
+        for session_path in self._session_paths:
+            yield replace(
+                session_path,
+                repo_relative_path=_repo_relative_path(
+                    session_path.normalized_path,
+                    self._canonical_root,
+                ),
+            )
+
+    def __len__(self) -> int:
+        return len(self._session_paths)
+
+
 def _annotate_session_paths(
-    session_paths: list,
+    session_paths,
     *,
     repo_root: str | None,
     worktree_root: str | None,
     workspace_root: str | None,
-) -> list:
+) -> _AnnotatedSessionPaths:
     canonical_root = worktree_root or workspace_root
-    annotated = []
-    for session_path in session_paths:
-        annotated.append(
-            replace(
-                session_path,
-                repo_relative_path=_repo_relative_path(
-                    session_path.normalized_path,
-                    canonical_root,
-                ),
-            )
-        )
-    return annotated
+    return _AnnotatedSessionPaths(session_paths, canonical_root)
 
 
 def _matches_any(command: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
     return any(pattern.search(command) for pattern in patterns)
 
 
-def _derive_session_activity(tool_calls: list, session_paths: list) -> dict[str, int]:
+def _derive_session_activity(tool_calls, session_paths) -> dict[str, int]:
     metrics = {
         "write_path_count": 0,
         "read_path_count": 0,
@@ -1197,19 +1367,45 @@ def _derive_session_activity(tool_calls: list, session_paths: list) -> dict[str,
         "activity_version": SESSION_ACTIVITY_VERSION,
     }
 
-    unique_paths_by_operation = {
-        "write": set(),
-        "read": set(),
-        "search": set(),
-    }
-    for session_path in session_paths:
-        operation = session_path.operation
-        if operation in unique_paths_by_operation:
-            unique_paths_by_operation[operation].add(session_path.normalized_path)
-
-    metrics["write_path_count"] = len(unique_paths_by_operation["write"])
-    metrics["read_path_count"] = len(unique_paths_by_operation["read"])
-    metrics["search_path_count"] = len(unique_paths_by_operation["search"])
+    if len(session_paths):
+        with tempfile.TemporaryDirectory(prefix="logpile-path-counts-") as td:
+            count_db_path = Path(td) / "paths.sqlite"
+            fd = os.open(
+                count_db_path,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            os.close(fd)
+            count_db = sqlite3.connect(count_db_path)
+            try:
+                count_db.execute("PRAGMA journal_mode = OFF")
+                count_db.execute("PRAGMA synchronous = OFF")
+                count_db.execute("PRAGMA temp_store = FILE")
+                count_db.execute("PRAGMA cache_size = -1024")
+                count_db.execute("PRAGMA mmap_size = 0")
+                count_db.execute(
+                    """
+                    CREATE TABLE unique_paths (
+                        operation TEXT NOT NULL,
+                        normalized_path TEXT NOT NULL,
+                        PRIMARY KEY (operation, normalized_path)
+                    ) WITHOUT ROWID
+                    """
+                )
+                count_db.executemany(
+                    "INSERT OR IGNORE INTO unique_paths VALUES (?, ?)",
+                    (
+                        (path.operation, path.normalized_path)
+                        for path in session_paths
+                        if path.operation in {"write", "read", "search"}
+                    ),
+                )
+                for operation, count in count_db.execute(
+                    "SELECT operation, COUNT(*) FROM unique_paths GROUP BY operation"
+                ):
+                    metrics[f"{operation}_path_count"] = int(count)
+            finally:
+                count_db.close()
 
     for tool_call in tool_calls:
         command = (tool_call.command or "").strip().lower()
@@ -1507,6 +1703,11 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
                 row["session_id"],
             ),
         )
+        refresh_session_publication_metadata(
+            conn,
+            row["session_id"],
+            reason="rotated transcript metadata drifted from the reviewed revision",
+        )
         insert_tool_calls(conn, row["session_id"], info.tool_calls)
         insert_session_daily_usage(conn, row["session_id"], info.daily_usage)
         affected.add(row["session_id"])
@@ -1604,16 +1805,18 @@ def _tighten_private_marker(
     storage_row["source_path"] = str(jsonl_path)
     transition = prepare_private_session_storage(storage_row, shared_dir=shared_dir)
     try:
+        if not _harden_managed_artifact(
+            transition.archive_path,
+            _private_archive_root(shared_dir),
+        ) or file_hash(transition.archive_path) != fhash:
+            raise OSError(
+                errno.EIO,
+                "private marker archival copy hash mismatch; source metadata was not advanced",
+            )
         conn.execute(
             """
             UPDATE sessions
-            SET visibility = 'private',
-                visibility_source = 'marker',
-                visibility_rule_id = NULL,
-                visibility_reason = ?,
-                is_private = 1,
-                source_path = ?,
-                shared_path = ?,
+            SET source_path = ?,
                 file_hash = ?,
                 file_size = ?,
                 file_mtime = ?,
@@ -1621,9 +1824,7 @@ def _tighten_private_marker(
             WHERE session_id = ?
             """,
             (
-                f"inline {marker.marker}",
                 str(jsonl_path),
-                str(transition.archive_path),
                 fhash,
                 file_stat.st_size,
                 file_stat.st_mtime,
@@ -1631,10 +1832,34 @@ def _tighten_private_marker(
                 existing_row["session_id"],
             ),
         )
-    except BaseException:
-        transition.rollback()
+        transition_session_visibility(
+            conn,
+            existing_row["session_id"],
+            "private",
+            shared_dir=shared_dir,
+            transition_source="marker",
+            reason=f"inline {marker.marker}",
+            manage_storage=False,
+            storage_transition=transition,
+        )
+        _clear_copy_retry(conn, jsonl_path, existing_row["session_id"])
+    except OSError as exc:
+        if transition.active:
+            transition.rollback()
+        _record_copy_retry(
+            conn,
+            source_path=jsonl_path,
+            session_id=existing_row["session_id"],
+            expected_sha256=fhash,
+            file_stat=file_stat,
+            error=exc,
+        )
+        conn.commit()
         raise
-    defer_storage_transition(conn, transition)
+    except BaseException:
+        if transition.active:
+            transition.rollback()
+        raise
 
 
 def sync_sessions(
@@ -1747,6 +1972,10 @@ def _sync_sessions(
                     project,
                     file_size,
                     file_mtime,
+                    EXISTS (
+                        SELECT 1 FROM sync_copy_retries scr
+                        WHERE scr.source_path = sessions.source_path
+                    ) AS copy_retry_pending,
                     (
                         SELECT COUNT(*)
                         FROM session_paths sp
@@ -1756,6 +1985,12 @@ def _sync_sessions(
                 """
             )
         }
+        _planned_bytes, _planned_files, preflight_source_hashes = _preflight_shared_copy_volume(
+            home=home,
+            shared_dir=shared_dir,
+            existing=existing,
+            patterns=patterns,
+        )
         processed_count = 0
         repo_metadata_cache: dict[str, dict[str, str | int | None]] = {}
         # Sessions whose native_* aggregates must be recomputed before this
@@ -1775,7 +2010,7 @@ def _sync_sessions(
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
         # ── Claude Code sessions ───────────────────────────────────────────────
-        claude_root = home / ".claude" / "projects"
+        claude_root = claude_projects_root(home)
         if claude_root.exists():
             for jsonl_path in sorted(claude_root.rglob("*.jsonl")):
                 if should_ignore(jsonl_path, patterns):
@@ -1857,7 +2092,12 @@ def _sync_sessions(
                 if (
                     existing_row
                     and not needs_structure_backfill
-                    and _unchanged_on_disk(existing_row, jsonl_path, shared_dir)
+                    and _unchanged_on_disk(
+                        existing_row,
+                        jsonl_path,
+                        shared_dir,
+                        preflight_source=preflight_source_hashes.get(str(jsonl_path)),
+                    )
                 ):
                     skipped_count += 1
                     continue
@@ -1886,14 +2126,23 @@ def _sync_sessions(
                             project=existing_row["project"] or project_from_claude_path(jsonl_path),
                             filename=jsonl_path.name,
                             visibility=existing_row["visibility"],
+                            expected_sha256=fhash,
                             existing_shared_path=existing_row["shared_path"],
                         )
                     except OSError as exc:
-                        if exc.errno == errno.ENOSPC:
-                            raise
+                        _record_copy_retry(
+                            conn,
+                            source_path=jsonl_path,
+                            session_id=session_id,
+                            expected_sha256=fhash,
+                            file_stat=file_stat,
+                            error=exc,
+                        )
+                        conn.commit()
                         _report_rotation_skip(jsonl_path, exc, verbose)
                         skipped_count += 1
                         continue
+                    _clear_copy_retry(conn, jsonl_path, session_id)
                     row_moved = (
                         existing_row["source_path"] != str(jsonl_path)
                         or existing_row["file_size"] != file_stat.st_size
@@ -2012,14 +2261,23 @@ def _sync_sessions(
                         project=project,
                         filename=jsonl_path.name,
                         visibility=storage_visibility,
+                        expected_sha256=fhash,
                         existing_shared_path=existing_row["shared_path"] if existing_row else None,
                     )
                 except OSError as exc:
-                    if exc.errno == errno.ENOSPC:
-                        raise
+                    _record_copy_retry(
+                        conn,
+                        source_path=jsonl_path,
+                        session_id=info.session_id,
+                        expected_sha256=fhash,
+                        file_stat=file_stat,
+                        error=exc,
+                    )
+                    conn.commit()
                     _report_rotation_skip(jsonl_path, exc, verbose)
                     skipped_count += 1
                     continue
+                _clear_copy_retry(conn, jsonl_path, info.session_id)
 
                 upsert_session(conn, {
                     "session_id": info.session_id,
@@ -2094,7 +2352,7 @@ def _sync_sessions(
 
         # ── Codex sessions ─────────────────────────────────────────────────────
         seen_codex_stems: set[str] = set()
-        for codex_root in _codex_session_roots(home):
+        for codex_root in codex_session_roots(home):
             for jsonl_path in sorted(codex_root.rglob("*.jsonl")):
                 if should_ignore(jsonl_path, patterns):
                     skipped_count += 1
@@ -2130,7 +2388,12 @@ def _sync_sessions(
                 if (
                     existing_row
                     and not needs_structure_backfill
-                    and _unchanged_on_disk(existing_row, jsonl_path, shared_dir)
+                    and _unchanged_on_disk(
+                        existing_row,
+                        jsonl_path,
+                        shared_dir,
+                        preflight_source=preflight_source_hashes.get(str(jsonl_path)),
+                    )
                 ):
                     skipped_count += 1
                     continue
@@ -2158,15 +2421,24 @@ def _sync_sessions(
                             project=existing_row["project"] or "unknown",
                             filename=jsonl_path.name,
                             visibility=existing_row["visibility"],
+                            expected_sha256=fhash,
                             existing_shared_path=existing_row["shared_path"],
                         )
                     except OSError as exc:
-                        if exc.errno == errno.ENOSPC:
-                            raise
+                        _record_copy_retry(
+                            conn,
+                            source_path=jsonl_path,
+                            session_id=session_id,
+                            expected_sha256=fhash,
+                            file_stat=file_stat,
+                            error=exc,
+                        )
+                        conn.commit()
                         _report_rotation_skip(jsonl_path, exc, verbose)
                         seen_codex_stems.discard(session_id)
                         skipped_count += 1
                         continue
+                    _clear_copy_retry(conn, jsonl_path, session_id)
                     row_moved = (
                         existing_row["source_path"] != str(jsonl_path)
                         or existing_row["file_size"] != file_stat.st_size
@@ -2295,15 +2567,24 @@ def _sync_sessions(
                         project=project,
                         filename=jsonl_path.name,
                         visibility=storage_visibility,
+                        expected_sha256=fhash,
                         existing_shared_path=existing_row["shared_path"] if existing_row else None,
                     )
                 except OSError as exc:
-                    if exc.errno == errno.ENOSPC:
-                        raise
+                    _record_copy_retry(
+                        conn,
+                        source_path=jsonl_path,
+                        session_id=session_id,
+                        expected_sha256=fhash,
+                        file_stat=file_stat,
+                        error=exc,
+                    )
+                    conn.commit()
                     _report_rotation_skip(jsonl_path, exc, verbose)
                     seen_codex_stems.discard(session_id)
                     skipped_count += 1
                     continue
+                _clear_copy_retry(conn, jsonl_path, session_id)
 
                 # Use file_stem as session_id (unique per file)
                 upsert_session(conn, {

@@ -303,6 +303,73 @@ class SyncTests(unittest.TestCase):
             self._assert_private_archive(shared_path, shared)
             self.assertFalse(copied_path.exists())
 
+    def test_public_source_drift_with_restored_size_and_mtime_is_requeued(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            session_path = self._write_claude_session(
+                home,
+                assistant_content=[{"type": "text", "text": "hi"}],
+            )
+
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            approved = CliRunner().invoke(
+                cli,
+                [
+                    "publish",
+                    "approve",
+                    "session-1",
+                    "--db",
+                    str(db_path),
+                    "--shared",
+                    str(shared),
+                    "--visibility",
+                    "public",
+                ],
+            )
+            self.assertEqual(approved.exit_code, 0, approved.output)
+
+            before_stat = session_path.stat()
+            with open_sqlite(db_path) as conn:
+                before = conn.execute(
+                    """
+                    SELECT file_hash, reviewed_artifact_path
+                    FROM sessions WHERE session_id = 'session-1'
+                    """
+                ).fetchone()
+            reviewed_bytes = Path(before["reviewed_artifact_path"]).read_bytes()
+
+            self._write_claude_session(
+                home,
+                assistant_content=[{"type": "text", "text": "yo"}],
+            )
+            self.assertEqual(session_path.stat().st_size, before_stat.st_size)
+            os.utime(
+                session_path,
+                ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns),
+            )
+
+            result = sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            self.assertEqual(result.updated, 1)
+            with open_sqlite(db_path) as conn:
+                after = conn.execute(
+                    """
+                    SELECT visibility, publication_state, file_hash,
+                           reviewed_artifact_path
+                    FROM sessions WHERE session_id = 'session-1'
+                    """
+                ).fetchone()
+            self.assertEqual(after["visibility"], "unlisted")
+            self.assertEqual(after["publication_state"], "source_drift")
+            self.assertNotEqual(after["file_hash"], before["file_hash"])
+            self.assertEqual(
+                Path(after["reviewed_artifact_path"]).read_bytes(),
+                reviewed_bytes,
+            )
+
     def test_malformed_bound_fields_do_not_abort_later_files(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1816,11 +1883,25 @@ class SyncTests(unittest.TestCase):
                 session = conn.execute(
                     "SELECT username, visibility FROM sessions WHERE session_id = 'legacy-session'"
                 ).fetchone()
+                transition = conn.execute(
+                    """
+                    SELECT from_visibility, to_visibility, transition_source, warning
+                    FROM visibility_transitions
+                    WHERE session_id = 'legacy-session'
+                    ORDER BY id DESC LIMIT 1
+                    """
+                ).fetchone()
 
             self.assertEqual(user[0], "alice-smith")
             self.assertEqual(user[1], "Alice Smith")
             self.assertEqual(session[0], "alice-smith")
-            self.assertEqual(session[1], "public")
+            self.assertEqual(session[1], "unlisted")
+            self.assertEqual(
+                (transition["from_visibility"], transition["to_visibility"]),
+                ("private", "unlisted"),
+            )
+            self.assertEqual(transition["transition_source"], "migration")
+            self.assertIn("local/link artifacts", transition["warning"])
 
     def test_user_default_visibility_applies_to_new_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1860,9 +1941,19 @@ class SyncTests(unittest.TestCase):
                 rows = conn.execute(
                     "SELECT session_id, visibility FROM sessions ORDER BY session_id"
                 ).fetchall()
+                guarded = conn.execute(
+                    """
+                    SELECT to_visibility, warning
+                    FROM visibility_transitions
+                    WHERE session_id = 'session-1'
+                    ORDER BY id DESC LIMIT 1
+                    """
+                ).fetchone()
 
-            self.assertEqual((rows[0]["session_id"], rows[0]["visibility"]), ("session-1", "public"))
+            self.assertEqual((rows[0]["session_id"], rows[0]["visibility"]), ("session-1", "unlisted"))
             self.assertEqual((rows[1]["session_id"], rows[1]["visibility"]), ("session-2", "unlisted"))
+            self.assertEqual(guarded["to_visibility"], "unlisted")
+            self.assertIn("successful review record", guarded["warning"])
 
 
 # --- archive-integrity tests -------------------------------------------------

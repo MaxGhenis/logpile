@@ -32,6 +32,20 @@ DEFAULT_ROOT = _default_root()
 DEFAULT_SHARED = DEFAULT_ROOT / "shared"
 DEFAULT_DB = _default_db(DEFAULT_ROOT)
 BACKEND_CHOICES = ["auto", "local", "cloud"]
+SOURCE_CHECKOUT_URL = "https://github.com/MaxGhenis/logpile"
+
+
+def _source_checkout_root() -> Path | None:
+    """Return the repository root only when this package runs from a checkout."""
+
+    candidate = Path(__file__).resolve().parent.parent
+    if (
+        (candidate / "pyproject.toml").is_file()
+        and (candidate / "web" / "package.json").is_file()
+        and (candidate / "logpile" / "cli.py").is_file()
+    ):
+        return candidate
+    return None
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -549,6 +563,8 @@ def sync(
             home=Path.home(),
             db_url=db_url,
             storage_config=storage_config,
+            db_path=Path(db),
+            shared_dir=Path(shared),
             index_text=index_text,
         )
         plan = result["plan"]
@@ -577,9 +593,18 @@ def sync(
 def serve(shared, db, host, port, public, unsafe_network, dev, flask):
     """Start the Logpile web viewer.
 
-    Uses the Next.js frontend (web/) by default.
-    Falls back to the legacy Flask server with --flask.
+    Web assets intentionally live in the source checkout and are not bundled
+    into Python wheels. Uses Next.js by default; --flask selects the legacy UI.
     """
+    source_root = _source_checkout_root()
+    if source_root is None:
+        raise click.ClickException(
+            "`logpile serve` requires the Logpile source checkout; Python wheels "
+            "intentionally do not contain web assets. Clone "
+            f"{SOURCE_CHECKOUT_URL} and run `./logpile.sh serve` there. "
+            "Wheel installs still support sync, stats, search, and db-backup."
+        )
+
     if not public and not unsafe_network and not _is_loopback_host(host):
         raise click.ClickException(
             "Private mode is unauthenticated and may only bind to loopback. "
@@ -606,13 +631,12 @@ def serve(shared, db, host, port, public, unsafe_network, dev, flask):
     import signal
     import sys
 
-    # Find web/ directory relative to the package
-    pkg_dir = Path(__file__).resolve().parent.parent
-    web_dir = pkg_dir / "web"
+    # Source-only web tree, validated before any database or runtime checks.
+    web_dir = source_root / "web"
     if not web_dir.exists():
         click.echo(
             f"Next.js app not found at {web_dir}.\n"
-            "Either run from the logpile repo, or use --flask for the legacy server.",
+            f"Use a complete source checkout from {SOURCE_CHECKOUT_URL}.",
             err=True,
         )
         raise SystemExit(1)
@@ -721,20 +745,25 @@ def private(session_id, db, shared):
 @click.option("--shared", default=str(DEFAULT_SHARED), show_default=True)
 def visibility(session_id, level, db, shared):
     """Set session visibility."""
-    from .db import get_db, set_session_visibility
+    from .db import get_db, transition_session_visibility
     from .sync import StorageSafetyError
 
     with get_db(_prepare_db(db)) as conn:
         try:
-            count = set_session_visibility(
+            result = transition_session_visibility(
                 conn,
                 session_id,
                 level,
                 shared_dir=Path(shared),
+                transition_source="manual",
+                reason="manual override",
             )
         except (ValueError, StorageSafetyError) as exc:
             click.echo(str(exc), err=True)
             raise SystemExit(1)
+        if result.warning:
+            click.echo(f"Warning: {result.warning}", err=True)
+        count = result.count
         click.echo(
             f"Updated {count} session(s) to visibility={level}"
             if count
@@ -1188,15 +1217,19 @@ def backup_schema():
 
 @backup_group.command("plan")
 @click.option("--home", default=str(Path.home()), show_default=True)
+@click.option("--db", default=str(DEFAULT_DB), show_default=True)
+@click.option("--shared", default=str(DEFAULT_SHARED), show_default=True)
 @click.option("--include-codex-db/--no-codex-db", default=True, show_default=True)
 @click.option("--limit", default=None, type=int, help="Only inspect the first N files.")
 @click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
-def backup_plan(home, include_codex_db, limit, json_output):
+def backup_plan(home, db, shared, include_codex_db, limit, json_output):
     """Show the raw local log files that would be backed up."""
     from .backup import format_bytes, plan_backup, plan_to_dict
 
     plan = plan_backup(
         home=Path(home),
+        db_path=Path(db),
+        shared_dir=Path(shared),
         include_codex_db=include_codex_db,
         limit=limit,
     )
@@ -1211,6 +1244,8 @@ def backup_plan(home, include_codex_db, limit, json_output):
 
 @backup_group.command("push")
 @click.option("--home", default=str(Path.home()), show_default=True)
+@click.option("--db", default=str(DEFAULT_DB), show_default=True)
+@click.option("--shared", default=str(DEFAULT_SHARED), show_default=True)
 @click.option("--db-url", envvar="LOGPILE_SUPABASE_DB_URL", help="Supabase/Postgres connection URL.")
 @click.option("--bucket", envvar="LOGPILE_R2_BUCKET", help="R2/S3 bucket for immutable raw logs.")
 @click.option("--endpoint-url", envvar="LOGPILE_R2_ENDPOINT_URL", help="S3-compatible endpoint URL.")
@@ -1230,6 +1265,8 @@ def backup_plan(home, include_codex_db, limit, json_output):
 @click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
 def backup_push(
     home,
+    db,
+    shared,
     db_url,
     bucket,
     endpoint_url,
@@ -1257,6 +1294,8 @@ def backup_push(
     if dry_run:
         plan = plan_backup(
             home=Path(home),
+            db_path=Path(db),
+            shared_dir=Path(shared),
             include_codex_db=include_codex_db,
             limit=limit,
         )
@@ -1291,6 +1330,8 @@ def backup_push(
             home=Path(home),
             db_url=db_url,
             storage_config=storage_config,
+            db_path=Path(db),
+            shared_dir=Path(shared),
             include_codex_db=include_codex_db,
             limit=limit,
             index_text=index_text,
@@ -1507,42 +1548,72 @@ def publish_review(session_id, db, json_output):
 
 
 def _publish_apply_impl(session_id, db, shared, visibility, force):
-    from .db import get_db, set_session_visibility
+    from .db import get_db, transition_session_visibility
     from .publish import (
         can_apply_visibility,
         format_publish_review,
         preserve_reviewed_artifact,
+        review_staging_dir,
         review_publish_session,
     )
+    from .sync import StorageSafetyError
 
+    review = None
     with get_db(_prepare_db(db)) as conn:
         try:
-            review = review_publish_session(conn, session_id)
+            review = review_publish_session(
+                conn,
+                session_id,
+                stage_dir=review_staging_dir(Path(shared)),
+            )
         except ValueError as exc:
             click.echo(str(exc), err=True)
             raise SystemExit(1)
-        if not review:
-            click.echo(f"No session found matching '{session_id}'")
-            raise SystemExit(1)
+        try:
+            if not review:
+                click.echo(f"No session found matching '{session_id}'")
+                raise SystemExit(1)
 
-        allowed, reason = can_apply_visibility(review, visibility, force=force)
-        if not allowed:
-            for line in format_publish_review(review):
-                click.echo(line)
-            click.echo(reason, err=True)
-            raise SystemExit(1)
+            allowed, reason = can_apply_visibility(review, visibility, force=force)
+            if not allowed:
+                for line in format_publish_review(review):
+                    click.echo(line)
+                click.echo(reason, err=True)
+                raise SystemExit(1)
 
-        count = set_session_visibility(
-            conn,
-            review.session_id,
-            visibility,
-            shared_dir=Path(shared),
-        )
-        if not count:
-            click.echo(f"No session found matching '{session_id}'")
+            review_id = preserve_reviewed_artifact(
+                conn,
+                review,
+                shared_dir=Path(shared),
+                approved_visibility=visibility,
+                forced=force,
+            )
+            result = transition_session_visibility(
+                conn,
+                review.session_id,
+                visibility,
+                shared_dir=Path(shared),
+                transition_source="review",
+                reason="reviewed publish approval",
+                publication_review_id=review_id,
+            )
+            if result.warning:
+                click.echo(f"Warning: {result.warning}", err=True)
+            if not result.count:
+                click.echo(f"No session found matching '{session_id}'")
+                raise SystemExit(1)
+            click.echo(
+                f"Updated {result.count} session(s) to visibility={visibility}"
+            )
+        except (ValueError, OSError, StorageSafetyError) as exc:
+            click.echo(str(exc), err=True)
             raise SystemExit(1)
-        preserve_reviewed_artifact(conn, review, shared_dir=Path(shared))
-        click.echo(f"Updated {count} session(s) to visibility={visibility}")
+        finally:
+            if review and review.staged_path:
+                try:
+                    Path(review.staged_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 @publish_group.command("approve")

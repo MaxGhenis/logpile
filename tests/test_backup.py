@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from logpile.backup import (
     R2Config,
@@ -19,6 +20,7 @@ from logpile.backup import (
     push_backup,
     snapshot_candidate,
 )
+from logpile.db import init_db
 
 
 def write_jsonl(path: Path, records: list[dict]) -> None:
@@ -30,40 +32,277 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
 
 
 class BackupTests(unittest.TestCase):
-    def test_plan_discovers_agent_logs_and_codex_db_files(self) -> None:
+    def test_plan_discovers_all_roots_rotated_shared_rows_and_deduplicates_sha256(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
+            shared = home / "logpile" / "shared"
+            db_path = home / "logpile" / "logpile.db"
+            primary_records = [
+                {
+                    "type": "session_meta",
+                    "payload": {"id": "codex-1", "timestamp": "2026-05-16T10:00:00Z"},
+                }
+            ]
             write_jsonl(
                 home / ".codex" / "sessions" / "2026" / "05" / "16" / "rollout.jsonl",
-                [
-                    {
-                        "type": "session_meta",
-                        "payload": {"id": "codex-1", "timestamp": "2026-05-16T10:00:00Z"},
-                    }
-                ],
+                primary_records,
             )
             write_jsonl(
                 home / ".codex" / "archived_sessions" / "old.jsonl",
                 [{"type": "session_meta", "payload": {"id": "archive-1"}}],
             )
+            codex_2 = home / ".codex-2" / "sessions" / "codex-2.jsonl"
+            codex_3 = home / ".codex-3" / "sessions" / "codex-3.jsonl"
+            openclaw = (
+                home
+                / ".openclaw"
+                / "agents"
+                / "bot"
+                / "agent"
+                / "codex-home"
+                / "sessions"
+                / "openclaw.jsonl"
+            )
+            write_jsonl(codex_2, [{"type": "session_meta", "payload": {"id": "codex-2"}}])
+            write_jsonl(codex_3, [{"type": "session_meta", "payload": {"id": "codex-3"}}])
+            write_jsonl(openclaw, [{"type": "session_meta", "payload": {"id": "openclaw"}}])
+            # A second native path with byte-identical content must not produce
+            # a second backup candidate/object manifest.
+            duplicate = home / ".codex-2" / "sessions" / "duplicate.jsonl"
+            write_jsonl(duplicate, primary_records)
             write_jsonl(
                 home / ".claude" / "projects" / "-tmp-project" / "claude.jsonl",
                 [{"type": "user", "sessionId": "claude-1", "message": {"content": "hi"}}],
             )
+            rotated_shared = shared / "alice" / "claudecode" / "demo" / "rotated.jsonl"
+            write_jsonl(
+                rotated_shared,
+                [
+                    {
+                        "type": "user",
+                        "sessionId": "rotated-only",
+                        "message": {"content": "sole surviving shared artifact"},
+                    }
+                ],
+            )
+            init_db(db_path)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO sessions (
+                        session_id, source, username, source_path, shared_path
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "rotated-only",
+                        "claudecode",
+                        "alice",
+                        str(home / ".claude" / "projects" / "gone" / "rotated.jsonl"),
+                        str(rotated_shared),
+                    ),
+                )
             codex_db = home / ".codex" / "logs_2.sqlite"
             codex_db.parent.mkdir(parents=True, exist_ok=True)
             with sqlite3.connect(codex_db) as conn:
                 conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY)")
 
-            plan = plan_backup(home=home)
+            discovered = set(
+                discover_raw_paths(
+                    home,
+                    db_path=db_path,
+                    shared_dir=shared,
+                )
+            )
+            plan = plan_backup(
+                home=home,
+                db_path=db_path,
+                shared_dir=shared,
+            )
 
-            self.assertEqual(len(plan.candidates), 4)
-            self.assertEqual(plan.source_counts["codex"], 1)
+            self.assertTrue({codex_2, codex_3, openclaw, duplicate, rotated_shared} <= discovered)
+            self.assertEqual(len(discovered), 9)
+            self.assertEqual(len(plan.candidates), 8)
+            self.assertEqual(len({candidate.sha256 for candidate in plan.candidates}), 8)
+            self.assertEqual(plan.source_counts["codex"], 4)
             self.assertEqual(plan.source_counts["codex_archive"], 1)
-            self.assertEqual(plan.source_counts["claudecode"], 1)
+            self.assertEqual(plan.source_counts["claudecode"], 2)
             self.assertEqual(plan.source_counts["codex_db"], 1)
+            self.assertIn(rotated_shared, {candidate.path for candidate in plan.candidates})
             self.assertTrue(all(len(candidate.sha256) == 64 for candidate in plan.candidates))
             self.assertTrue(all(candidate.object_key.startswith("raw/sha256/") for candidate in plan.candidates))
+
+    def test_db_managed_private_reviewed_and_reused_artifacts_are_included(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            shared = home / "logpile" / "shared"
+            private = shared.parent / f".{shared.name}-private"
+            db_path = home / "logpile" / "logpile.db"
+
+            reused_source = home / ".codex" / "sessions" / "reused.jsonl"
+            reused_archive = shared / "alice" / "codex" / "demo" / "reused.jsonl"
+            private_archive = private / "alice" / "claudecode" / "demo" / "private.jsonl"
+            reviewed_artifact = (
+                shared / ".published" / "reviewed" / ("a" * 64 + ".jsonl")
+            )
+            write_jsonl(reused_source, [{"type": "session_meta", "payload": {"id": "new"}}])
+            write_jsonl(reused_archive, [{"type": "session_meta", "payload": {"id": "old"}}])
+            write_jsonl(private_archive, [{"type": "user", "message": {"content": "private"}}])
+            write_jsonl(reviewed_artifact, [{"type": "user", "message": {"content": "reviewed"}}])
+
+            init_db(db_path)
+            with sqlite3.connect(db_path) as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO sessions (
+                        session_id, source, username, source_path, shared_path,
+                        reviewed_artifact_path
+                    ) VALUES (?, ?, 'alice', ?, ?, ?)
+                    """,
+                    (
+                        (
+                            "reused",
+                            "codex",
+                            str(reused_source),
+                            str(reused_archive),
+                            None,
+                        ),
+                        (
+                            "private",
+                            "claudecode",
+                            str(home / "gone-private.jsonl"),
+                            str(private_archive),
+                            None,
+                        ),
+                        (
+                            "reviewed",
+                            "claudecode",
+                            str(home / "gone-reviewed.jsonl"),
+                            "",
+                            str(reviewed_artifact),
+                        ),
+                    ),
+                )
+
+            discovered = set(
+                discover_raw_paths(
+                    home,
+                    db_path=db_path,
+                    shared_dir=shared,
+                    include_codex_db=False,
+                )
+            )
+            self.assertEqual(
+                discovered,
+                {reused_source, reused_archive, private_archive, reviewed_artifact},
+            )
+            plan = plan_backup(
+                home=home,
+                db_path=db_path,
+                shared_dir=shared,
+                include_codex_db=False,
+            )
+            self.assertEqual(len(plan.candidates), 4)
+            self.assertEqual(len({candidate.sha256 for candidate in plan.candidates}), 4)
+
+    def test_configured_corrupt_logpile_db_fails_backup_discovery_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            shared = home / "logpile" / "shared"
+            artifact = shared / "alice" / "codex" / "only-copy.jsonl"
+            write_jsonl(
+                artifact,
+                [{"type": "session_meta", "payload": {"id": "only-copy"}}],
+            )
+            db_path = home / "logpile" / "logpile.db"
+            db_path.write_bytes(b"this is not a SQLite database")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"Could not read configured Logpile database.*file is not a database",
+            ):
+                plan_backup(
+                    home=home,
+                    db_path=db_path,
+                    shared_dir=shared,
+                    include_codex_db=False,
+                )
+
+    def test_sessions_query_error_fails_backup_discovery_closed(self) -> None:
+        class FailingSessionsQueryConnection:
+            row_factory = None
+            closed = False
+
+            def execute(self, sql: str):
+                if sql.lstrip().startswith("PRAGMA table_info"):
+                    return [
+                        (0, "source"),
+                        (1, "source_path"),
+                        (2, "shared_path"),
+                        (3, "reviewed_artifact_path"),
+                    ]
+                raise sqlite3.OperationalError("injected sessions query failure")
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            shared = home / "logpile" / "shared"
+            shared.mkdir(parents=True)
+            db_path = home / "logpile" / "logpile.db"
+            with sqlite3.connect(db_path):
+                pass
+            failing_connection = FailingSessionsQueryConnection()
+
+            with patch(
+                "logpile.discovery.sqlite3.connect",
+                return_value=failing_connection,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"Could not read configured Logpile database.*injected sessions query failure",
+                ):
+                    list(
+                        discover_raw_paths(
+                            home,
+                            db_path=db_path,
+                            shared_dir=shared,
+                            include_codex_db=False,
+                        )
+                    )
+            self.assertTrue(failing_connection.closed)
+
+    def test_valid_non_logpile_or_missing_db_remains_optional(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            shared = home / "logpile" / "shared"
+            db_path = home / "logpile" / "other.sqlite"
+            db_path.parent.mkdir(parents=True)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE unrelated (value TEXT)")
+
+            self.assertEqual(
+                list(
+                    discover_raw_paths(
+                        home,
+                        db_path=db_path,
+                        shared_dir=shared,
+                        include_codex_db=False,
+                    )
+                ),
+                [],
+            )
+            self.assertEqual(
+                list(
+                    discover_raw_paths(
+                        home,
+                        db_path=home / "logpile" / "missing.sqlite",
+                        shared_dir=shared,
+                        include_codex_db=False,
+                    )
+                ),
+                [],
+            )
 
     def test_sqlite_snapshot_includes_committed_wal_and_excludes_sidecars(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -386,19 +625,24 @@ class BackupTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as td:
                 home = Path(td)
+                records = [
+                    {"type": "session_meta", "payload": {"id": "push-1"}},
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "find raw log cloud backup"}],
+                        },
+                    },
+                ]
                 write_jsonl(
                     home / ".codex" / "sessions" / "2026" / "05" / "16" / "rollout.jsonl",
-                    [
-                        {"type": "session_meta", "payload": {"id": "push-1"}},
-                        {
-                            "type": "response_item",
-                            "payload": {
-                                "type": "message",
-                                "role": "user",
-                                "content": [{"type": "input_text", "text": "find raw log cloud backup"}],
-                            },
-                        },
-                    ],
+                    records,
+                )
+                write_jsonl(
+                    home / ".codex-3" / "sessions" / "duplicate.jsonl",
+                    records,
                 )
 
                 result = push_backup(

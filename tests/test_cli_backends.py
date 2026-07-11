@@ -130,6 +130,17 @@ class CliBackendTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         fake_app.run.assert_called_once_with(host="127.0.0.1", port=5002)
 
+    def test_wheel_serve_fails_with_source_checkout_instructions(self) -> None:
+        with mock.patch("logpile.cli._source_checkout_root", return_value=None):
+            result = CliRunner().invoke(cli, ["serve"])
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("requires the Logpile source checkout", result.output)
+        self.assertIn("https://github.com/MaxGhenis/logpile", result.output)
+        self.assertIn("wheels intentionally do not contain web assets", result.output)
+        self.assertIn("sync, stats, search, and db-backup", result.output)
+        self.assertNotIn("Database not found", result.output)
+
     def test_private_serve_refuses_non_loopback_without_override(self) -> None:
         result = CliRunner().invoke(cli, ["serve", "--host", "0.0.0.0"])
 

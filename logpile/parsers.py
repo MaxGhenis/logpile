@@ -2,12 +2,17 @@
 import hashlib
 import json
 import logging
+import os
 import re
 import shlex
+import sqlite3
+import tempfile
+from collections.abc import Iterator, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TextIO
 
 
 logger = logging.getLogger(__name__)
@@ -114,10 +119,373 @@ class SessionInfo:
     parent_thread_id: Optional[str] = None
     parent_session_id: Optional[str] = None
     spawn_depth: int = 0
-    tool_calls: list = field(default_factory=list)
-    session_paths: list = field(default_factory=list)
-    daily_usage: list = field(default_factory=list)
-    message_usage: list = field(default_factory=list)  # MessageUsage, claudecode only
+    tool_calls: Sequence[ToolCall] = field(default_factory=list)
+    session_paths: Sequence[SessionPath] = field(default_factory=list)
+    daily_usage: Sequence[DailyUsage] = field(default_factory=list)
+    message_usage: Sequence[MessageUsage] = field(default_factory=list)  # claudecode only
+
+
+class _SqliteSequence(Sequence):
+    """Small reusable sequence view over a parser's disk-backed spool.
+
+    A transcript can contain millions of assistant messages and tool calls.
+    Keeping those output rows in Python lists merely moves the whole-file
+    memory problem one layer down from JSON decoding.  These views retain the
+    familiar ``len``/index/iteration behavior without retaining every row in
+    the Python heap.
+    """
+
+    def __init__(self, spool, table: str, columns: str, factory) -> None:
+        self._spool = spool
+        self._table = table
+        self._columns = columns
+        self._factory = factory
+
+    def __len__(self) -> int:
+        row = self._spool.connection.execute(
+            f"SELECT COUNT(*) FROM {self._table}"
+        ).fetchone()
+        return int(row[0])
+
+    def __iter__(self):
+        rows = self._spool.connection.execute(
+            f"SELECT {self._columns} FROM {self._table} ORDER BY seq"
+        )
+        for row in rows:
+            yield self._factory(row)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[position] for position in range(start, stop, step)]
+        if index < 0:
+            index += len(self)
+        if index < 0:
+            raise IndexError(index)
+        row = self._spool.connection.execute(
+            f"SELECT {self._columns} FROM {self._table} "
+            "ORDER BY seq LIMIT 1 OFFSET ?",
+            (index,),
+        ).fetchone()
+        if row is None:
+            raise IndexError(index)
+        return self._factory(row)
+
+
+class _ParseSpool:
+    """Mode-0600 SQLite spill storage for cardinality-dependent parse state."""
+
+    def __init__(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="logpile-session-parse-"
+        )
+        path = Path(self._temporary_directory.name) / "state.sqlite"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        self.connection = sqlite3.connect(path)
+        # Bound SQLite's own page cache and keep sensitive transcript-derived
+        # state on disk in the mode-0700 temporary directory.
+        self.connection.execute("PRAGMA journal_mode = OFF")
+        self.connection.execute("PRAGMA synchronous = OFF")
+        self.connection.execute("PRAGMA temp_store = FILE")
+        self.connection.execute("PRAGMA cache_size = -1024")
+        self.connection.execute("PRAGMA mmap_size = 0")
+        self.connection.executescript(
+            """
+            CREATE TABLE messages (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT NOT NULL UNIQUE,
+                fresh_input INTEGER NOT NULL,
+                cached_input INTEGER NOT NULL,
+                cache_creation INTEGER NOT NULL,
+                cache_creation_5m INTEGER NOT NULL,
+                cache_creation_1h INTEGER NOT NULL,
+                cache_creation_unknown INTEGER NOT NULL,
+                output INTEGER NOT NULL,
+                model TEXT,
+                timestamp TEXT,
+                request_id TEXT,
+                uuid TEXT
+            );
+            CREATE TABLE tool_calls (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_name TEXT NOT NULL,
+                command TEXT,
+                timestamp TEXT,
+                is_error INTEGER NOT NULL DEFAULT 0,
+                operation TEXT NOT NULL,
+                input_paths_json TEXT NOT NULL,
+                command_paths_json TEXT NOT NULL,
+                call_id_json TEXT
+            );
+            CREATE INDEX tool_calls_call_id
+                ON tool_calls(call_id_json) WHERE call_id_json IS NOT NULL;
+            CREATE TABLE session_paths (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                raw_path TEXT NOT NULL,
+                normalized_path TEXT NOT NULL,
+                display_path TEXT NOT NULL,
+                relative_path TEXT,
+                operation TEXT NOT NULL,
+                source TEXT NOT NULL,
+                tool_name TEXT,
+                timestamp TEXT
+            );
+            """
+        )
+
+    def close(self) -> None:
+        connection = getattr(self, "connection", None)
+        if connection is not None:
+            self.connection = None
+            connection.close()
+        temporary_directory = getattr(self, "_temporary_directory", None)
+        if temporary_directory is not None:
+            self._temporary_directory = None
+            temporary_directory.cleanup()
+
+    def __del__(self) -> None:
+        self.close()
+
+    @staticmethod
+    def _json_scalar(value: Any) -> str | None:
+        if value is None:
+            return None
+        try:
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return json.dumps(str(value), ensure_ascii=False)
+
+    def put_message(
+        self,
+        message_id: str,
+        *,
+        fresh_input: int,
+        cached_input: int,
+        cache_creation: int,
+        cache_creation_5m: int,
+        cache_creation_1h: int,
+        cache_creation_unknown: int,
+        output: int,
+        model: str | None,
+        timestamp: str | None,
+        request_id: Any,
+        uuid: Any,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO messages (
+                message_id, fresh_input, cached_input, cache_creation,
+                cache_creation_5m, cache_creation_1h,
+                cache_creation_unknown, output, model, timestamp,
+                request_id, uuid
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(message_id) DO UPDATE SET
+                fresh_input = excluded.fresh_input,
+                cached_input = excluded.cached_input,
+                cache_creation = excluded.cache_creation,
+                cache_creation_5m = excluded.cache_creation_5m,
+                cache_creation_1h = excluded.cache_creation_1h,
+                cache_creation_unknown = excluded.cache_creation_unknown,
+                output = excluded.output,
+                model = excluded.model,
+                timestamp = excluded.timestamp,
+                request_id = excluded.request_id,
+                uuid = excluded.uuid
+            WHERE excluded.output > messages.output
+            """,
+            (
+                message_id,
+                fresh_input,
+                cached_input,
+                cache_creation,
+                cache_creation_5m,
+                cache_creation_1h,
+                cache_creation_unknown,
+                output,
+                model,
+                timestamp,
+                _string_id(request_id),
+                _string_id(uuid),
+            ),
+        )
+
+    def append_tool_call(self, tool_call: ToolCall) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO tool_calls (
+                tool_name, command, timestamp, is_error, operation,
+                input_paths_json, command_paths_json, call_id_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tool_call.tool_name,
+                tool_call.command,
+                tool_call.timestamp,
+                1 if tool_call.is_error else 0,
+                tool_call.operation,
+                json.dumps(tool_call.input_paths, ensure_ascii=False),
+                json.dumps(tool_call.command_paths, ensure_ascii=False),
+                self._json_scalar(tool_call.call_id),
+            ),
+        )
+
+    def set_tool_result(self, call_id: Any, is_error: bool) -> None:
+        call_id_json = self._json_scalar(call_id)
+        if call_id_json is None:
+            return
+        self.connection.execute(
+            """
+            UPDATE tool_calls
+            SET is_error = ?
+            WHERE seq = (
+                SELECT MAX(seq) FROM tool_calls WHERE call_id_json = ?
+            )
+            """,
+            (1 if is_error else 0, call_id_json),
+        )
+
+    @staticmethod
+    def _tool_call(row) -> ToolCall:
+        return ToolCall(
+            tool_name=row[0],
+            command=row[1],
+            timestamp=row[2],
+            is_error=bool(row[3]),
+            operation=row[4],
+            input_paths=json.loads(row[5]),
+            command_paths=json.loads(row[6]),
+            call_id=json.loads(row[7]) if row[7] is not None else None,
+        )
+
+    def tool_calls(self) -> Sequence[ToolCall]:
+        return _SqliteSequence(
+            self,
+            "tool_calls",
+            (
+                "tool_name, command, timestamp, is_error, operation, "
+                "input_paths_json, command_paths_json, call_id_json"
+            ),
+            self._tool_call,
+        )
+
+    def message_totals(self) -> tuple[int, ...]:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*),
+                   COALESCE(SUM(fresh_input), 0),
+                   COALESCE(SUM(cached_input), 0),
+                   COALESCE(SUM(cache_creation), 0),
+                   COALESCE(SUM(cache_creation_5m), 0),
+                   COALESCE(SUM(cache_creation_1h), 0),
+                   COALESCE(SUM(cache_creation_unknown), 0),
+                   COALESCE(SUM(output), 0)
+            FROM messages
+            """
+        ).fetchone()
+        return tuple(int(value) for value in row)
+
+    def iter_message_state(self):
+        yield from self.connection.execute(
+            """
+            SELECT message_id, fresh_input, cached_input, cache_creation,
+                   cache_creation_5m, cache_creation_1h,
+                   cache_creation_unknown, output, model, timestamp,
+                   request_id, uuid
+            FROM messages ORDER BY seq
+            """
+        )
+
+    @staticmethod
+    def _message_usage(row, fallback_day: str) -> MessageUsage:
+        message_id = row[0]
+        if row[10]:
+            claim_key = f"{message_id}:{row[10]}"
+        elif row[11]:
+            claim_key = f"uuid:{row[11]}"
+        else:
+            claim_key = f"mid:{message_id}"
+        return MessageUsage(
+            claim_key=claim_key,
+            day=_day_of(row[9]) or fallback_day,
+            model=row[8],
+            fresh_input_tokens=row[1],
+            cached_input_tokens=row[2],
+            cache_creation_input_tokens=row[3],
+            cache_creation_5m_input_tokens=row[4],
+            cache_creation_1h_input_tokens=row[5],
+            cache_creation_unknown_input_tokens=row[6],
+            output_tokens=row[7],
+        )
+
+    def message_usage(self, fallback_day: str) -> Sequence[MessageUsage]:
+        return _SqliteSequence(
+            self,
+            "messages",
+            (
+                "message_id, fresh_input, cached_input, cache_creation, "
+                "cache_creation_5m, cache_creation_1h, "
+                "cache_creation_unknown, output, model, timestamp, "
+                "request_id, uuid"
+            ),
+            lambda row: self._message_usage(row, fallback_day),
+        )
+
+    def build_session_paths(self, workspace_root: str | None) -> None:
+        self.connection.execute("DELETE FROM session_paths")
+        for tool_call in self.tool_calls():
+            for source_name, candidates in (
+                ("tool_input", tool_call.input_paths),
+                ("command", tool_call.command_paths),
+            ):
+                for candidate in _unique_preserve_order(candidates):
+                    normalized = _normalize_session_path(candidate, workspace_root)
+                    if not normalized:
+                        continue
+                    normalized_path, relative_path, display_path = normalized
+                    self.connection.execute(
+                        """
+                        INSERT INTO session_paths (
+                            raw_path, normalized_path, display_path,
+                            relative_path, operation, source, tool_name,
+                            timestamp
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            candidate,
+                            normalized_path,
+                            display_path,
+                            relative_path,
+                            tool_call.operation,
+                            source_name,
+                            tool_call.tool_name,
+                            tool_call.timestamp,
+                        ),
+                    )
+
+    @staticmethod
+    def _session_path(row) -> SessionPath:
+        return SessionPath(
+            raw_path=row[0],
+            normalized_path=row[1],
+            display_path=row[2],
+            relative_path=row[3],
+            operation=row[4],
+            source=row[5],
+            tool_name=row[6],
+            timestamp=row[7],
+        )
+
+    def session_paths(self) -> Sequence[SessionPath]:
+        return _SqliteSequence(
+            self,
+            "session_paths",
+            (
+                "raw_path, normalized_path, display_path, relative_path, "
+                "operation, source, tool_name, timestamp"
+            ),
+            self._session_path,
+        )
 
 
 @dataclass(frozen=True)
@@ -481,6 +849,71 @@ def _load_jsonl(
             load_stats.as_dict(),
         )
     return records
+
+
+def _iter_jsonl(
+    path: Path | TextIO,
+    *,
+    stats: JsonlLoadStats | None = None,
+    report_malformed: bool = True,
+) -> Iterator[dict]:
+    """Yield validated JSONL objects without retaining the transcript.
+
+    Callers that build durable state must check ``stats.io_errors`` after the
+    iterator is exhausted.  A file that rotates during a read may already
+    have yielded records, but the non-zero error count lets the caller discard
+    its compact partial state instead of committing a truncated session.
+
+    ``_load_jsonl`` remains as a compatibility helper for focused loader
+    diagnostics.  Ingestion and transcript rendering use this iterator so a
+    multi-gigabyte JSONL file is never materialized as a list of dictionaries.
+    """
+    load_stats = stats if stats is not None else JsonlLoadStats()
+    label = getattr(path, "name", path)
+    stream_context = (
+        nullcontext(path)
+        if hasattr(path, "read")
+        else open(path, encoding="utf-8", errors="replace")
+    )
+    try:
+        if hasattr(path, "seek"):
+            path.seek(0)
+        with stream_context as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    load_stats.invalid_json_lines += 1
+                    continue
+                except Exception as exc:
+                    load_stats.count_exception(exc)
+                    continue
+                if not isinstance(record, dict):
+                    load_stats.count_record_type(record)
+                    continue
+                try:
+                    malformed_field = _malformed_record_field(record)
+                except Exception as exc:
+                    load_stats.count_exception(exc)
+                    continue
+                if malformed_field is not None:
+                    load_stats.count_malformed_field(*malformed_field)
+                    continue
+                yield record
+    except OSError as exc:
+        load_stats.io_errors += 1
+        logger.warning("Could not read JSONL file %s: %s", label, exc)
+    finally:
+        if report_malformed and load_stats.malformed_record_count:
+            logger.warning(
+                "Skipped %d malformed JSONL record(s) in %s: %s",
+                load_stats.malformed_record_count,
+                label,
+                load_stats.as_dict(),
+            )
 
 
 def _normalize_codex_record(record: dict) -> tuple[str, dict, Optional[str]]:
@@ -1098,6 +1531,23 @@ def _claude_session_identity(
             agent_id = _string_id(record.get("agentId"))
         sidechain_flag = sidechain_flag or record.get("isSidechain") is True
 
+    return _claude_session_identity_from_observations(
+        path,
+        raw_session_id=raw_session_id,
+        agent_id=agent_id,
+        sidechain_flag=sidechain_flag,
+    )
+
+
+def _claude_session_identity_from_observations(
+    path: Path,
+    *,
+    raw_session_id: str | None,
+    agent_id: str | None,
+    sidechain_flag: bool,
+) -> tuple[str, str, Optional[str], Optional[str], int]:
+    """Resolve Claude identity from compact fields gathered while streaming."""
+
     parts = path.parts
     subagent_indices = [
         index for index, part in enumerate(parts) if part == "subagents"
@@ -1124,29 +1574,13 @@ def _claude_session_identity(
 
 def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessionMarker]:
     """Parse a Claude Code JSONL file and return a SessionInfo."""
-    records = _load_jsonl(path)
-    if not records:
-        return None
-    private_marker = _private_marker(records)
-    if private_marker:
-        return PrivateSessionMarker(path.stem, "claudecode", private_marker)
-
-    (
-        session_id,
-        thread_id,
-        parent_thread_id,
-        parent_session_id,
-        spawn_depth,
-    ) = _claude_session_identity(path, records)
-    fallback_day = _fallback_usage_day(path, records)
-
-    # Get project from cwd field
+    record_count = 0
+    private_marker = None
+    raw_session_id = None
+    agent_id = None
+    sidechain_flag = False
     project = "unknown"
-    for r in records:
-        if r.get("cwd"):
-            project = r["cwd"]
-            break
-    workspace_root = project
+    fallback_day = None
 
     # Deduplicate assistant messages by message.id, keep last (highest tokens).
     # NOTE: this is per-file only. Resuming a Claude Code session copies the
@@ -1156,18 +1590,34 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
     # ledger: each kept message is also emitted as a MessageUsage claim
     # (message_usage) and sync resolves one owning session per claim_key in
     # the message_claims table, which feeds the native_* columns.
-    seen_msg: dict = {}  # message_id -> {"fresh_input": ..., "cached_input": ..., "output": ..., ...}
+    # Cardinality-dependent state lives in a mode-0600 disk spool.  The
+    # resulting sequences remain reusable/indexable, but a session with
+    # millions of messages or tool calls does not retain millions of Python
+    # objects (or an equally large id->index dictionary) in memory.
+    spool = _ParseSpool()
     first_timestamp = None
     last_timestamp = None
     user_message_count = 0
-    tool_calls = []
-    tool_call_index_by_id: dict[str, int] = {}
     first_user_message = ""
     error_count = 0
     model = None
     daily: dict[str, DailyUsage] = {}
 
-    for r in records:
+    load_stats = JsonlLoadStats()
+    for r in _iter_jsonl(path, stats=load_stats):
+        record_count += 1
+        if private_marker is None:
+            private_marker = _private_marker((r,))
+        if raw_session_id is None:
+            raw_session_id = _string_id(r.get("sessionId"))
+        if agent_id is None:
+            agent_id = _string_id(r.get("agentId"))
+        sidechain_flag = sidechain_flag or r.get("isSidechain") is True
+        if project == "unknown" and r.get("cwd"):
+            project = r["cwd"]
+        if fallback_day is None:
+            fallback_day = _day_of(r.get("timestamp"))
+
         rtype = r.get("type", "")
         ts = r.get("timestamp")
         if ts:
@@ -1193,8 +1643,8 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
                             if is_error:
                                 error_count += 1
                             tool_use_id = block.get("tool_use_id")
-                            if tool_use_id and tool_use_id in tool_call_index_by_id:
-                                tool_calls[tool_call_index_by_id[tool_use_id]].is_error = is_error
+                            if tool_use_id:
+                                spool.set_tool_result(tool_use_id, is_error)
                     continue
 
             text = _extract_text(content)
@@ -1221,21 +1671,20 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
             mdl = msg.get("model")
 
             if msg_id:
-                prev = seen_msg.get(msg_id)
-                if prev is None or out > prev["output"]:
-                    seen_msg[msg_id] = {
-                        "fresh_input": fresh_inp,
-                        "cached_input": cached_inp,
-                        "cache_creation": cache_creation,
-                        "cache_creation_5m": cw5,
-                        "cache_creation_1h": cw1,
-                        "cache_creation_unknown": cw_unknown,
-                        "output": out,
-                        "model": mdl,
-                        "timestamp": ts,
-                        "request_id": r.get("requestId"),
-                        "uuid": r.get("uuid"),
-                    }
+                spool.put_message(
+                    str(msg_id),
+                    fresh_input=fresh_inp,
+                    cached_input=cached_inp,
+                    cache_creation=cache_creation,
+                    cache_creation_5m=cw5,
+                    cache_creation_1h=cw1,
+                    cache_creation_unknown=cw_unknown,
+                    output=out,
+                    model=mdl,
+                    timestamp=ts,
+                    request_id=r.get("requestId"),
+                    uuid=r.get("uuid"),
+                )
                 if mdl and not model:
                     model = mdl
 
@@ -1256,7 +1705,7 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
                                 cmd = " ".join(str(c) for c in cmd)
                         input_paths = _extract_argument_paths(inp_data)
                         command_paths = _extract_command_paths(str(cmd) if cmd else None)
-                        tool_calls.append(ToolCall(
+                        spool.append_tool_call(ToolCall(
                             tool_name=tool_name,
                             command=str(cmd)[:500] if cmd else None,
                             timestamp=ts,
@@ -1265,39 +1714,62 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
                             command_paths=command_paths,
                             call_id=tool_use_id,
                         ))
-                        if tool_use_id:
-                            tool_call_index_by_id[tool_use_id] = len(tool_calls) - 1
                         bucket = _daily_bucket(daily, ts)
                         if bucket is not None:
                             bucket.tool_call_count += 1
 
-    assistant_message_count = len(seen_msg)
-    fresh_input = sum(v["fresh_input"] for v in seen_msg.values())
-    cached_input = sum(v["cached_input"] for v in seen_msg.values())
-    cache_creation_input = sum(v["cache_creation"] for v in seen_msg.values())
-    cache_creation_5m = sum(v["cache_creation_5m"] for v in seen_msg.values())
-    cache_creation_1h = sum(v["cache_creation_1h"] for v in seen_msg.values())
-    cache_creation_unknown = sum(
-        v["cache_creation_unknown"] for v in seen_msg.values()
+    if load_stats.io_errors or not record_count:
+        return None
+    if private_marker:
+        return PrivateSessionMarker(path.stem, "claudecode", private_marker)
+
+    (
+        session_id,
+        thread_id,
+        parent_thread_id,
+        parent_session_id,
+        spawn_depth,
+    ) = _claude_session_identity_from_observations(
+        path,
+        raw_session_id=raw_session_id,
+        agent_id=agent_id,
+        sidechain_flag=sidechain_flag,
     )
+    if fallback_day is None:
+        fallback_day = _fallback_usage_day(path, ())
+    workspace_root = project
+
+    (
+        assistant_message_count,
+        fresh_input,
+        cached_input,
+        cache_creation_input,
+        cache_creation_5m,
+        cache_creation_1h,
+        cache_creation_unknown,
+        total_output,
+    ) = spool.message_totals()
+    tool_calls = spool.tool_calls()
+    tool_call_count = len(tool_calls)
+    spool.build_session_paths(workspace_root)
+    session_paths = spool.session_paths()
+    message_usage = spool.message_usage(fallback_day)
     # Every prompt token reaches the model exactly one way: uncached (fresh),
     # written to cache, or read from cache.
     total_input = fresh_input + cache_creation_input + cached_input
-    total_output = sum(v["output"] for v in seen_msg.values())
-
-    for v in seen_msg.values():
-        bucket = _daily_bucket(daily, v["timestamp"])
+    for v in spool.iter_message_state():
+        bucket = _daily_bucket(daily, v[9])
         if bucket is None:
             continue
         bucket.assistant_message_count += 1
-        bucket.fresh_input_tokens += v["fresh_input"]
-        bucket.cached_input_tokens += v["cached_input"]
-        bucket.cache_creation_input_tokens += v["cache_creation"]
-        bucket.cache_creation_5m_input_tokens += v["cache_creation_5m"]
-        bucket.cache_creation_1h_input_tokens += v["cache_creation_1h"]
-        bucket.cache_creation_unknown_input_tokens += v["cache_creation_unknown"]
-        bucket.total_input_tokens += v["fresh_input"] + v["cache_creation"] + v["cached_input"]
-        bucket.total_output_tokens += v["output"]
+        bucket.fresh_input_tokens += v[1]
+        bucket.cached_input_tokens += v[2]
+        bucket.cache_creation_input_tokens += v[3]
+        bucket.cache_creation_5m_input_tokens += v[4]
+        bucket.cache_creation_1h_input_tokens += v[5]
+        bucket.cache_creation_unknown_input_tokens += v[6]
+        bucket.total_input_tokens += v[1] + v[3] + v[2]
+        bucket.total_output_tokens += v[7]
 
     _reconcile_daily_usage(
         daily,
@@ -1314,30 +1786,9 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
             "reasoning_output_tokens": 0,
             "user_message_count": user_message_count,
             "assistant_message_count": assistant_message_count,
-            "tool_call_count": len(tool_calls),
+            "tool_call_count": tool_call_count,
         },
     )
-
-    message_usage = []
-    for msg_id, v in seen_msg.items():
-        if v["request_id"]:
-            claim_key = f"{msg_id}:{v['request_id']}"
-        elif v["uuid"]:
-            claim_key = f"uuid:{v['uuid']}"
-        else:
-            claim_key = f"mid:{msg_id}"
-        message_usage.append(MessageUsage(
-            claim_key=claim_key,
-            day=_day_of(v["timestamp"]) or fallback_day,
-            model=v["model"],
-            fresh_input_tokens=v["fresh_input"],
-            cached_input_tokens=v["cached_input"],
-            cache_creation_input_tokens=v["cache_creation"],
-            cache_creation_5m_input_tokens=v["cache_creation_5m"],
-            cache_creation_1h_input_tokens=v["cache_creation_1h"],
-            cache_creation_unknown_input_tokens=v["cache_creation_unknown"],
-            output_tokens=v["output"],
-        ))
 
     return SessionInfo(
         session_id=session_id,
@@ -1347,7 +1798,7 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
         last_timestamp=last_timestamp,
         user_message_count=user_message_count,
         assistant_message_count=assistant_message_count,
-        tool_call_count=len(tool_calls),
+        tool_call_count=tool_call_count,
         error_count=error_count,
         total_input_tokens=total_input,
         total_output_tokens=total_output,
@@ -1365,7 +1816,7 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
         parent_session_id=parent_session_id,
         spawn_depth=spawn_depth,
         tool_calls=tool_calls,
-        session_paths=_build_session_paths(tool_calls, workspace_root),
+        session_paths=session_paths,
         daily_usage=_sorted_daily(daily),
         message_usage=message_usage,
     )
@@ -1373,30 +1824,62 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
 
 def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMarker]:
     """Parse a Codex JSONL file and return a SessionInfo."""
-    records = _load_jsonl(path)
-    if not records:
-        return None
-    private_marker = _private_marker(records)
-    if private_marker:
-        return PrivateSessionMarker(path.stem, "codex", private_marker)
-
-    first_rec = records[0]
-    session_id = path.stem
-    thread_id = _string_id(first_rec.get("id")) or path.stem
-    first_timestamp = first_rec.get("timestamp")
-    project = _extract_codex_project(records)
-    workspace_root = project
+    inspection_stats = JsonlLoadStats()
+    record_count = 0
+    first_rec: dict | None = None
+    first_normalized: tuple[str, dict, Optional[str]] | None = None
+    replay_candidate = False
+    replay_boundary: int | None = None
+    private_marker = None
+    project = "unknown"
     model = None
+    fallback_day = None
+    thread_id = path.stem
+    first_timestamp = None
     parent_thread_id = None
     parent_session_id = None
     spawn_depth = 0
-    fallback_day = _fallback_usage_day(path, records)
-
-    # A copied ancestor can contain any number of session_meta records.  Leaf
-    # identity and lineage come exclusively from the first one in this file.
     leaf_meta_found = False
-    for record in records:
+
+    for index, record in enumerate(_iter_jsonl(path, stats=inspection_stats)):
+        record_count += 1
         record_type, payload, timestamp = _normalize_codex_record(record)
+        if first_rec is None:
+            first_rec = record
+            first_normalized = (record_type, payload, timestamp)
+            thread_id = _string_id(record.get("id")) or path.stem
+            first_timestamp = record.get("timestamp")
+        elif index == 1 and first_normalized is not None:
+            first_type, first_payload, _ = first_normalized
+            replay_candidate = (
+                first_type == "session_meta"
+                and record_type == "session_meta"
+                and bool(_string_id(first_payload.get("forked_from_id")))
+                and _string_id(payload.get("id"))
+                == _string_id(first_payload.get("forked_from_id"))
+            )
+        elif replay_candidate and replay_boundary is None:
+            if record_type == "event_msg" and payload.get("type") == "task_started":
+                started_at = _started_at_epoch_second(payload.get("started_at"))
+                record_second = _timestamp_epoch_second(timestamp)
+                if started_at is not None and started_at == record_second:
+                    replay_boundary = index
+
+        if private_marker is None:
+            private_marker = _private_marker((record,))
+        if fallback_day is None:
+            fallback_day = _day_of(record.get("timestamp"))
+        if project == "unknown":
+            if record_type in {"session_meta", "turn_context"} and payload.get("cwd"):
+                project = str(payload["cwd"])
+            elif record_type == "message" and payload.get("role") == "user":
+                text = _extract_text(payload.get("content", []))
+                match = re.search(r"<cwd>(.*?)</cwd>", text, flags=re.DOTALL)
+                if match:
+                    project = match.group(1).strip()
+
+        # A copied ancestor can contain any number of session_meta records.
+        # Leaf identity and lineage come exclusively from the first one.
         if record_type == "session_meta" and not leaf_meta_found:
             leaf_meta_found = True
             thread_id = _string_id(payload.get("id")) or thread_id
@@ -1418,16 +1901,23 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
                 or nested_parent
                 or _string_id(payload.get("forked_from_id"))
             )
-            # Sync resolves this raw thread reference to the parent's
-            # canonical rollout filename stem before persistence.
             parent_session_id = parent_thread_id
         if record_type == "turn_context" and payload.get("model") and not model:
             model = payload["model"]
 
+    if inspection_stats.io_errors or not record_count or first_rec is None:
+        return None
+    if private_marker:
+        return PrivateSessionMarker(path.stem, "codex", private_marker)
+
+    session_id = path.stem
+    workspace_root = project
+    if fallback_day is None:
+        fallback_day = _fallback_usage_day(path, ())
+
     user_message_count = 0
     assistant_message_count = 0
-    tool_calls = []
-    tool_call_index_by_id: dict[str, int] = {}
+    spool = _ParseSpool()
     first_user_message = ""
     error_count = 0
     last_timestamp = first_timestamp
@@ -1442,10 +1932,18 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
     # native usage. Explicit all-zero vectors start a new billing epoch;
     # maxima are retained only inside an epoch so small downward telemetry
     # wobbles clamp to zero without erasing genuine post-reset usage.
-    replay_start, replay_end = _codex_replay_window(records)
+    replay_start = 1 if replay_candidate else 0
+    replay_end = (
+        replay_boundary
+        if replay_candidate and replay_boundary is not None
+        else record_count if replay_candidate else 0
+    )
     baseline = [0, 0, 0, 0]  # current epoch maxima
 
-    for index, record in enumerate(records):
+    parse_stats = JsonlLoadStats()
+    for index, record in enumerate(
+        _iter_jsonl(path, stats=parse_stats, report_malformed=False)
+    ):
         record_type, payload, timestamp = _normalize_codex_record(record)
         if timestamp:
             if not first_timestamp:
@@ -1524,7 +2022,7 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
             tool_name = payload.get("name", "unknown")
             args = _load_tool_args(payload.get("arguments", {}))
             cmd = _extract_command(args)
-            tool_calls.append(ToolCall(
+            spool.append_tool_call(ToolCall(
                 tool_name=tool_name,
                 command=str(cmd)[:500] if cmd else None,
                 timestamp=timestamp,
@@ -1533,9 +2031,6 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
                 command_paths=_extract_command_paths(cmd),
                 call_id=payload.get("call_id") or payload.get("id"),
             ))
-            call_id = payload.get("call_id") or payload.get("id")
-            if call_id:
-                tool_call_index_by_id[str(call_id)] = len(tool_calls) - 1
             bucket = _daily_bucket(daily, timestamp)
             if bucket is not None:
                 bucket.tool_call_count += 1
@@ -1545,9 +2040,16 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
             if is_error:
                 error_count += 1
             call_id = payload.get("call_id") or payload.get("id")
-            if call_id and str(call_id) in tool_call_index_by_id:
-                tool_calls[tool_call_index_by_id[str(call_id)]].is_error = is_error
+            if call_id:
+                spool.set_tool_result(call_id, is_error)
 
+    if parse_stats.io_errors:
+        return None
+
+    tool_calls = spool.tool_calls()
+    tool_call_count = len(tool_calls)
+    spool.build_session_paths(workspace_root)
+    session_paths = spool.session_paths()
     total_input_tokens = fresh_input_tokens + cached_input_tokens
     _reconcile_daily_usage(
         daily,
@@ -1564,7 +2066,7 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
             "reasoning_output_tokens": reasoning_output_tokens,
             "user_message_count": user_message_count,
             "assistant_message_count": assistant_message_count,
-            "tool_call_count": len(tool_calls),
+            "tool_call_count": tool_call_count,
         },
     )
 
@@ -1576,7 +2078,7 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
         last_timestamp=last_timestamp,
         user_message_count=user_message_count,
         assistant_message_count=assistant_message_count,
-        tool_call_count=len(tool_calls),
+        tool_call_count=tool_call_count,
         error_count=error_count,
         total_input_tokens=total_input_tokens,
         total_output_tokens=total_output_tokens,
@@ -1591,7 +2093,7 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
         parent_session_id=parent_session_id,
         spawn_depth=spawn_depth,
         tool_calls=tool_calls,
-        session_paths=_build_session_paths(tool_calls, workspace_root),
+        session_paths=session_paths,
         daily_usage=_sorted_daily(daily),
     )
 
@@ -1602,16 +2104,16 @@ def file_hash(path: Path) -> str:
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
-    return h.hexdigest()[:16]
+    return h.hexdigest()
 
 
-def render_claudecode_transcript(path: Path) -> list:
+def render_claudecode_transcript(path: Path | TextIO) -> list:
     """Return list of turn dicts for transcript display."""
-    records = _load_jsonl(path)
     turns = []
     seen_msg_ids = set()
+    load_stats = JsonlLoadStats()
 
-    for r in records:
+    for r in _iter_jsonl(path, stats=load_stats):
         rtype = r.get("type", "")
         ts = r.get("timestamp")
 
@@ -1694,15 +2196,15 @@ def render_claudecode_transcript(path: Path) -> list:
                 "output_tokens": usage.get("output_tokens", 0),
             })
 
-    return turns
+    return [] if load_stats.io_errors else turns
 
 
-def render_codex_transcript(path: Path) -> list:
+def render_codex_transcript(path: Path | TextIO) -> list:
     """Return list of turn dicts for Codex transcript display."""
-    records = _load_jsonl(path)
     turns = []
+    load_stats = JsonlLoadStats()
 
-    for record in records:
+    for record in _iter_jsonl(path, stats=load_stats):
         record_type, payload, timestamp = _normalize_codex_record(record)
 
         if record_type == "message":
@@ -1767,4 +2269,4 @@ def render_codex_transcript(path: Path) -> list:
             if text.strip():
                 turns.append({"type": "thinking", "text": text, "timestamp": timestamp})
 
-    return turns
+    return [] if load_stats.io_errors else turns

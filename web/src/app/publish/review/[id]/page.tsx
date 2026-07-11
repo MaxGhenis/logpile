@@ -173,7 +173,7 @@ export default async function PublishReviewPage({
                 <IconShieldCheck size={28} stroke={1.5} className="mx-auto text-lp-green mb-2" />
                 <div className="text-sm font-medium text-lp-text mb-1">No findings</div>
                 <div className="text-xs text-lp-text-faint">
-                  No secrets, PII, or structural issues detected.
+                  No configured patterns detected; manual review required.
                 </div>
               </div>
             )}
@@ -248,6 +248,15 @@ function FindingCard({ finding }: { finding: import("@/lib/types").PublishFindin
       <div className="flex gap-3 mt-1.5 text-[0.62rem] text-lp-text-faint">
         {finding.source && <span>source: {finding.source}</span>}
         {finding.line_number && <span>line {finding.line_number}</span>}
+        {finding.match_start !== null && finding.match_end !== null && (
+          <span>offsets {finding.match_start}:{finding.match_end}</span>
+        )}
+        {finding.match_count > 1 && (
+          <span>match {finding.match_index}/{finding.match_count}</span>
+        )}
+        {finding.match_index === 1 && finding.omitted_count > 0 && (
+          <span>{finding.omitted_count} evidence item(s) omitted</span>
+        )}
       </div>
     </div>
   );

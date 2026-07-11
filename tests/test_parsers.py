@@ -2,10 +2,18 @@ from datetime import datetime, timezone
 import json
 import os
 import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from logpile.db import (
+    apply_message_claims,
+    get_db,
+    init_db,
+    insert_session_paths,
+    insert_tool_calls,
+)
 from logpile.parsers import (
     JsonlLoadStats,
     PrivateSessionMarker,
@@ -17,6 +25,7 @@ from logpile.parsers import (
     parse_codex_session,
     render_codex_transcript,
 )
+from logpile.sync import _annotate_session_paths, _derive_session_activity
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -774,6 +783,206 @@ class CodexParserTests(unittest.TestCase):
             new_hash = file_hash(path)
 
             self.assertNotEqual(old_hash, new_hash)
+            self.assertEqual(len(new_hash), 64)
+
+    def test_large_synthetic_transcript_is_parsed_with_bounded_memory(self) -> None:
+        """A large file must not be materialized as a record list."""
+        padding = "x" * (256 * 1024)
+        line = json.dumps({"type": "progress", "padding": padding}) + "\n"
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "large.jsonl"
+            with path.open("w", encoding="utf-8") as handle:
+                for _ in range(128):
+                    handle.write(line)
+            self.assertGreater(path.stat().st_size, 32 * 1024 * 1024)
+
+            with mock.patch(
+                "logpile.parsers._load_jsonl",
+                side_effect=AssertionError("whole-file loader used"),
+            ):
+                tracemalloc.start()
+                try:
+                    info = parse_claudecode_session(path)
+                    _, peak = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+
+        self.assertIsNotNone(info)
+        self.assertLess(peak, 8 * 1024 * 1024)
+
+    def test_high_cardinality_outputs_spill_to_disk_without_dropping_rows(self) -> None:
+        """Message/tool cardinality must not become parser heap cardinality."""
+        count = 20_000
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "high-cardinality.jsonl"
+            with path.open("w", encoding="utf-8") as handle:
+                for index in range(count):
+                    handle.write(json.dumps({
+                        "type": "assistant",
+                        "timestamp": "2026-07-11T12:00:00Z",
+                        "requestId": f"req-{index}",
+                        "message": {
+                            "id": f"msg-{index}",
+                            "model": "claude-test",
+                            "usage": {
+                                "input_tokens": 1,
+                                "output_tokens": index + 1,
+                            },
+                            "content": [{
+                                "type": "tool_use",
+                                "id": f"tool-{index}",
+                                "name": "Bash",
+                                "input": {
+                                    "command": f"cat src/row-{index}.py",
+                                    "file_path": f"src/row-{index}.py",
+                                },
+                            }],
+                        },
+                    }))
+                    handle.write("\n")
+                    handle.write(json.dumps({
+                        "type": "user",
+                        "timestamp": "2026-07-11T12:00:01Z",
+                        "message": {"content": [{
+                            "type": "tool_result",
+                            "tool_use_id": f"tool-{index}",
+                            "is_error": index % 7 == 0,
+                        }]},
+                    }))
+                    handle.write("\n")
+
+            tracemalloc.start()
+            try:
+                info = parse_claudecode_session(path)
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+
+            self.assertIsNotNone(info)
+            assert info is not None
+            self.assertLess(peak, 12 * 1024 * 1024)
+            self.assertEqual(len(info.tool_calls), count)
+            self.assertEqual(len(info.message_usage), count)
+            self.assertEqual(len(info.session_paths), count * 2)
+            self.assertEqual(info.tool_calls[0].call_id, "tool-0")
+            self.assertEqual(info.tool_calls[-1].call_id, f"tool-{count - 1}")
+            self.assertTrue(info.tool_calls[0].is_error)
+            self.assertEqual(info.tool_calls[-1].is_error, (count - 1) % 7 == 0)
+            self.assertEqual(
+                info.message_usage[-1].claim_key,
+                f"msg-{count - 1}:req-{count - 1}",
+            )
+
+            # Exercise the actual sync sinks: both iterables must stream all
+            # rows into the ledger without re-materializing or capping them.
+            db_path = root / "logpile.db"
+            init_db(db_path)
+            annotated_paths = _annotate_session_paths(
+                info.session_paths,
+                repo_root=None,
+                worktree_root=None,
+                workspace_root=None,
+            )
+            tracemalloc.start()
+            with get_db(db_path) as conn:
+                try:
+                    activity = _derive_session_activity(
+                        info.tool_calls,
+                        annotated_paths,
+                    )
+                    insert_tool_calls(conn, info.session_id, info.tool_calls)
+                    insert_session_paths(conn, info.session_id, annotated_paths)
+                    apply_message_claims(conn, info.session_id, info.message_usage)
+                    self.assertEqual(activity["read_path_count"], count)
+                    self.assertEqual(
+                        conn.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0],
+                        count,
+                    )
+                    self.assertEqual(
+                        conn.execute("SELECT COUNT(*) FROM message_claims").fetchone()[0],
+                        count,
+                    )
+                    self.assertEqual(
+                        conn.execute("SELECT COUNT(*) FROM session_paths").fetchone()[0],
+                        count * 2,
+                    )
+                    self.assertEqual(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM tool_calls WHERE is_error = 1"
+                        ).fetchone()[0],
+                        (count + 6) // 7,
+                    )
+                finally:
+                    _, sync_peak = tracemalloc.get_traced_memory()
+                    tracemalloc.stop()
+            self.assertLess(sync_peak, 12 * 1024 * 1024)
+
+    def test_codex_high_cardinality_tool_state_spills_to_disk(self) -> None:
+        """Codex's tool-call/result index must be bounded just like Claude's."""
+        count = 15_000
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "codex-high-cardinality.jsonl"
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "type": "session_meta",
+                    "timestamp": "2026-07-11T12:00:00Z",
+                    "payload": {
+                        "id": "codex-high-cardinality",
+                        "cwd": "/tmp/project",
+                    },
+                }))
+                handle.write("\n")
+                for index in range(count):
+                    handle.write(json.dumps({
+                        "type": "response_item",
+                        "timestamp": "2026-07-11T12:00:01Z",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "call_id": f"call-{index}",
+                            "arguments": json.dumps({
+                                "cmd": f"cat src/codex-{index}.py",
+                                "file_path": f"src/codex-{index}.py",
+                            }),
+                        },
+                    }))
+                    handle.write("\n")
+                    handle.write(json.dumps({
+                        "type": "response_item",
+                        "timestamp": "2026-07-11T12:00:02Z",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": f"call-{index}",
+                            "output": json.dumps({
+                                "output": "",
+                                "metadata": {
+                                    "exit_code": 1 if index % 11 == 0 else 0,
+                                },
+                            }),
+                        },
+                    }))
+                    handle.write("\n")
+
+            tracemalloc.start()
+            try:
+                info = parse_codex_session(path)
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+
+        self.assertIsNotNone(info)
+        assert info is not None
+        self.assertLess(peak, 12 * 1024 * 1024)
+        self.assertEqual(len(info.tool_calls), count)
+        self.assertEqual(len(info.session_paths), count * 2)
+        self.assertEqual(info.tool_calls[0].call_id, "call-0")
+        self.assertEqual(info.tool_calls[-1].call_id, f"call-{count - 1}")
+        self.assertTrue(info.tool_calls[0].is_error)
+        self.assertEqual(info.error_count, (count + 10) // 11)
 
     def test_parse_claudecode_session_extracts_input_and_command_paths(self) -> None:
         records = [

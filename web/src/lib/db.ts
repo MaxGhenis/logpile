@@ -42,7 +42,12 @@ function listedProfileClause(alias = "u"): string {
   if (!config.publicMode) {
     return `${alias}.listed_private = 1`;
   }
-  return `${alias}.listed_public = 1`;
+  return `(${alias}.listed_public = 1 AND EXISTS (
+    SELECT 1
+    FROM session_catalog profile_visible_session
+    WHERE profile_visible_session.username = ${alias}.username
+      AND profile_visible_session.direct_public = 1
+  ))`;
 }
 
 /** For list pages: show public sessions only in public mode, public+unlisted in private mode. */
@@ -66,7 +71,23 @@ export function isProfileDirectlyVisible(user: User | undefined): boolean {
   if (!user) return false;
   if (!config.publicMode) return true;
   const row = user as User & { direct_public?: number };
-  return row.direct_public === 1 || user.profile_visibility === "public" || user.profile_visibility === "unlisted";
+  const profileAllowsDirect =
+    row.direct_public === 1
+    || user.profile_visibility === "public"
+    || user.profile_visibility === "unlisted";
+  if (!profileAllowsDirect) return false;
+  // Public profile free text is reviewed with each published session. Once a
+  // profile edit revokes those sessions, the profile itself must disappear.
+  return Boolean(
+    getDb()
+      .prepare(
+        `SELECT 1
+         FROM session_catalog s
+         WHERE s.username = ? AND s.direct_public = 1
+         LIMIT 1`,
+      )
+      .get(user.username),
+  );
 }
 
 /* ── Dashboard ────────────────────────────────────────────────────── */
@@ -453,12 +474,18 @@ export function getSession(sessionId: string) {
     .prepare(
       `SELECT s.*,
         COALESCE(u.display_name, s.username) AS user_display_name,
-        COALESCE(u.profile_visibility, 'public') AS user_profile_visibility
+        COALESCE(u.profile_visibility, 'public') AS user_profile_visibility,
+        u.bio AS user_bio,
+        u.avatar_url AS user_avatar_url
       FROM session_catalog s
       LEFT JOIN user_catalog u ON u.username = s.username
       WHERE s.session_id = ?`
     )
-    .get(sessionId) as (SessionRow & { user_profile_visibility: string }) | undefined;
+    .get(sessionId) as (SessionRow & {
+      user_profile_visibility: string;
+      user_bio: string | null;
+      user_avatar_url: string | null;
+    }) | undefined;
 }
 
 export function getSessionToolCalls(sessionId: string) {
@@ -1472,7 +1499,12 @@ export function getContextExplosionWorkstreams(limit = 6, origin?: string): Cont
     listedSessionClause("s", "u"),
     "s.source = 'codex'",
     "s.first_timestamp >= ?",
-    "(s.parent_session_id IS NOT NULL OR EXISTS (SELECT 1 FROM sessions child WHERE child.parent_session_id = s.session_id))",
+    `(s.parent_session_id IS NOT NULL OR EXISTS (
+      SELECT 1
+      FROM session_catalog child
+      WHERE child.parent_session_id = s.session_id
+        AND ${listedSessionClause("child")}
+    ))`,
     "(COALESCE(s.total_input_tokens, 0) + COALESCE(s.total_output_tokens, 0)) > 0",
   ];
   const params: unknown[] = [cutoff];
@@ -1497,7 +1529,9 @@ export function getContextExplosionWorkstreams(limit = 6, origin?: string): Cont
           parent.session_id AS current_session_id,
           parent.parent_session_id AS parent_session_id
         FROM lineage
-        JOIN sessions parent ON parent.session_id = lineage.parent_session_id
+        JOIN session_catalog parent
+          ON parent.session_id = lineage.parent_session_id
+         AND ${listedSessionClause("parent")}
         WHERE lineage.parent_session_id IS NOT NULL
       ),
       roots AS (
@@ -1536,8 +1570,12 @@ export function getContextExplosionWorkstreams(limit = 6, origin?: string): Cont
         root.objective_label AS root_objective_label
       FROM recent
       JOIN roots ON roots.leaf_session_id = recent.session_id
-      JOIN session_catalog s ON s.session_id = recent.session_id
-      JOIN session_catalog root ON root.session_id = roots.root_session_id
+      JOIN session_catalog s
+        ON s.session_id = recent.session_id
+       AND ${listedSessionClause("s")}
+      JOIN session_catalog root
+        ON root.session_id = roots.root_session_id
+       AND ${listedSessionClause("root")}
       ORDER BY root.first_timestamp DESC, s.first_timestamp DESC`
     )
     .all(...params) as ContextExplosionRawRow[];

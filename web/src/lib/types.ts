@@ -64,6 +64,12 @@ export interface Session {
   total_output_tokens: number;
   first_user_message: string | null;
   visibility: "private" | "unlisted" | "public";
+  reviewed_sha256: string | null;
+  reviewed_artifact_path: string | null;
+  publication_metadata_sha256: string | null;
+  reviewed_metadata_sha256: string | null;
+  publication_review_id: number | null;
+  publication_state: "unreviewed" | "reviewed" | "source_drift" | "revoked";
   is_private: number;
   file_hash: string | null;
   synced_at: string | null;
@@ -296,6 +302,11 @@ export interface PublishFinding {
   evidence: string;
   source: string;
   line_number: number | null;
+  match_start: number | null;
+  match_end: number | null;
+  match_index: number;
+  match_count: number;
+  omitted_count: number;
 }
 
 export interface PublishReview {
@@ -306,6 +317,8 @@ export interface PublishReview {
   recommendation: "private" | "unlisted" | "public";
   rationale: string;
   inspected_path: string | null;
+  inspected_sha256: string | null;
+  inspected_size: number;
   metadata: Record<string, string | number | null>;
   findings: PublishFinding[];
 }

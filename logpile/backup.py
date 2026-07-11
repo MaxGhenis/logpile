@@ -13,6 +13,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from .discovery import (
+    DiscoveredTranscript,
+    discover_transcripts,
+    transcript_roots,
+)
 from .parsers import _extract_text, _normalize_codex_record
 
 
@@ -289,13 +294,14 @@ def _safe_relative(path: Path, root: Path) -> str:
 
 
 def _source_for_path(path: Path, home: Path) -> str | None:
+    absolute = Path(os.path.abspath(path))
+    for root in transcript_roots(home):
+        try:
+            absolute.relative_to(Path(os.path.abspath(root.path)))
+            return root.source
+        except ValueError:
+            continue
     rel = _safe_relative(path, home)
-    if rel.startswith(".codex/archived_sessions/"):
-        return "codex_archive"
-    if rel.startswith(".codex/sessions/"):
-        return "codex"
-    if rel.startswith(".claude/projects/"):
-        return "claudecode"
     if rel.startswith(".codex/logs_2.sqlite"):
         return "codex_db"
     return None
@@ -332,11 +338,16 @@ def file_id_for(relative_path: str, sha256: str) -> str:
     return hashlib.sha256(f"{relative_path}\0{sha256}".encode("utf-8")).hexdigest()
 
 
-def build_candidate(path: Path, *, home: Path) -> RawFileCandidate:
+def build_candidate(
+    path: Path,
+    *,
+    home: Path,
+    source: str | None = None,
+) -> RawFileCandidate:
     stat = path.stat()
     relative_path = _safe_relative(path, home)
     sha256 = sha256_file(path)
-    source = _source_for_path(path, home) or "other"
+    source = source or _source_for_path(path, home) or "other"
     return RawFileCandidate(
         path=path,
         relative_path=relative_path,
@@ -355,6 +366,7 @@ def snapshot_candidate(
     path: Path,
     *,
     home: Path,
+    source: str | None = None,
     temp_dir: Path | None = None,
 ) -> Iterator[RawFileCandidate]:
     stat = path.stat()
@@ -376,7 +388,7 @@ def snapshot_candidate(
             os.chmod(snapshot_path, 0o600)
         snapshot_size = snapshot_path.stat().st_size
         relative_path = _safe_relative(path, home)
-        source = _source_for_path(path, home) or "other"
+        source = source or _source_for_path(path, home) or "other"
         yield RawFileCandidate(
             path=path,
             relative_path=relative_path,
@@ -396,37 +408,78 @@ def snapshot_candidate(
             pass
 
 
-def discover_raw_paths(home: Path, *, include_codex_db: bool = True) -> Iterator[Path]:
-    roots = [
-        home / ".codex" / "sessions",
-        home / ".codex" / "archived_sessions",
-        home / ".claude" / "projects",
-    ]
-    for root in roots:
-        if root.exists():
-            yield from sorted(path for path in root.rglob("*.jsonl") if path.is_file())
-
+def _discover_raw_files(
+    home: Path,
+    *,
+    db_path: Path | None = None,
+    shared_dir: Path | None = None,
+    include_codex_db: bool = True,
+) -> Iterator[DiscoveredTranscript]:
+    yield from discover_transcripts(
+        home,
+        db_path=db_path,
+        shared_dir=shared_dir,
+    )
     if include_codex_db:
         path = home / ".codex" / "logs_2.sqlite"
         if path.is_file():
             # WAL and SHM are deliberately excluded. snapshot_candidate()
             # folds committed WAL pages into one verified SQLite database.
-            yield path
+            yield DiscoveredTranscript(path, "codex_db")
+
+
+def discover_raw_paths(
+    home: Path,
+    *,
+    db_path: Path | None = None,
+    shared_dir: Path | None = None,
+    include_codex_db: bool = True,
+) -> Iterator[Path]:
+    """Yield every raw path backup considers, before content deduplication."""
+
+    for discovered in _discover_raw_files(
+        home,
+        db_path=db_path,
+        shared_dir=shared_dir,
+        include_codex_db=include_codex_db,
+    ):
+        yield discovered.path
 
 
 def plan_backup(
     *,
     home: Path,
+    db_path: Path | None = None,
+    shared_dir: Path | None = None,
     include_codex_db: bool = True,
     limit: int | None = None,
 ) -> BackupPlan:
     candidates: list[RawFileCandidate] = []
-    for path in discover_raw_paths(home, include_codex_db=include_codex_db):
+    seen_sha256s: set[str] = set()
+    for discovered in _discover_raw_files(
+        home,
+        db_path=db_path,
+        shared_dir=shared_dir,
+        include_codex_db=include_codex_db,
+    ):
+        path = discovered.path
         if _raw_suffix(path) == ".sqlite":
-            with snapshot_candidate(path, home=home) as candidate:
-                candidates.append(replace(candidate, upload_path=None))
+            with snapshot_candidate(
+                path,
+                home=home,
+                source=discovered.source,
+            ) as candidate:
+                candidate = replace(candidate, upload_path=None)
         else:
-            candidates.append(build_candidate(path, home=home))
+            candidate = build_candidate(
+                path,
+                home=home,
+                source=discovered.source,
+            )
+        if candidate.sha256 in seen_sha256s:
+            continue
+        seen_sha256s.add(candidate.sha256)
+        candidates.append(candidate)
         if limit is not None and len(candidates) >= limit:
             break
     return BackupPlan(candidates=candidates)
@@ -1264,6 +1317,8 @@ def push_backup(
     home: Path,
     db_url: str,
     storage_config: R2Config,
+    db_path: Path | None = None,
+    shared_dir: Path | None = None,
     include_codex_db: bool = True,
     limit: int | None = None,
     index_text: bool = True,
@@ -1272,7 +1327,13 @@ def push_backup(
     dry_run: bool = False,
 ) -> dict:
     if dry_run:
-        plan = plan_backup(home=home, include_codex_db=include_codex_db, limit=limit)
+        plan = plan_backup(
+            home=home,
+            db_path=db_path,
+            shared_dir=shared_dir,
+            include_codex_db=include_codex_db,
+            limit=limit,
+        )
         return {"plan": plan_to_dict(plan), "uploaded": 0, "indexed_chunks": 0, "dry_run": True}
 
     store = S3ObjectStore(storage_config)
@@ -1285,17 +1346,43 @@ def push_backup(
     indexed_chunks = 0
     files_indexed = 0
     skipped_existing = 0
+    seen_local_sha256s: set[str] = set()
+    unique_considered = 0
 
-    for index, path in enumerate(discover_raw_paths(home, include_codex_db=include_codex_db)):
-        if limit is not None and index >= limit:
-            break
+    for discovered in _discover_raw_files(
+        home,
+        db_path=db_path,
+        shared_dir=shared_dir,
+        include_codex_db=include_codex_db,
+    ):
+        path = discovered.path
         try:
             if missing_only and _raw_suffix(path) != ".sqlite":
-                probe = build_candidate(path, home=home)
+                probe = build_candidate(
+                    path,
+                    home=home,
+                    source=discovered.source,
+                )
+                if probe.sha256 in seen_local_sha256s:
+                    continue
                 if probe.sha256 in existing_sha256s:
+                    if limit is not None and unique_considered >= limit:
+                        break
+                    seen_local_sha256s.add(probe.sha256)
+                    unique_considered += 1
                     skipped_existing += 1
                     continue
-            with snapshot_candidate(path, home=home) as candidate:
+            with snapshot_candidate(
+                path,
+                home=home,
+                source=discovered.source,
+            ) as candidate:
+                if candidate.sha256 in seen_local_sha256s:
+                    continue
+                if limit is not None and unique_considered >= limit:
+                    break
+                seen_local_sha256s.add(candidate.sha256)
+                unique_considered += 1
                 if missing_only and candidate.sha256 in existing_sha256s:
                     skipped_existing += 1
                     continue
