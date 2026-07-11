@@ -11,23 +11,61 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Follow symlink chains before locating the checkout. This keeps an invocation
+# such as ~/bin/logpile working even when that link points outside the repo.
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE_LINK="$(readlink "$SOURCE")"
+  if [[ "$SOURCE_LINK" == /* ]]; then
+    SOURCE="$SOURCE_LINK"
+  else
+    SOURCE="$SOURCE_DIR/$SOURCE_LINK"
+  fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 VENV="$SCRIPT_DIR/.venv"
 WEB_DIR="$SCRIPT_DIR/web"
 
+require_command() {
+  local name="$1"
+  local install_url="$2"
+
+  if ! command -v "$name" >/dev/null 2>&1; then
+    echo "logpile: required command '$name' was not found." >&2
+    echo "Install it from $install_url and retry." >&2
+    exit 127
+  fi
+}
+
 # Bootstrap Python venv
 if [[ ! -x "$VENV/bin/logpile" ]]; then
+  require_command uv "https://docs.astral.sh/uv/getting-started/installation/"
   echo "Bootstrapping Python…"
   cd "$SCRIPT_DIR"
-  uv venv --python 3.11 "$VENV" >/dev/null 2>&1 || uv venv "$VENV" >/dev/null
-  uv pip install -e . --quiet
+  UV_FROZEN=false uv sync --locked --quiet
   echo "Done."
 fi
 
-# Bootstrap bun deps for serve command
-if [[ "${1:-}" == "serve" ]] && [[ ! -d "$WEB_DIR/node_modules" ]]; then
-  echo "Installing Next.js dependencies…"
-  (cd "$WEB_DIR" && bun install --silent)
+# Bootstrap bun deps for the Next.js serve command.
+needs_bun=false
+if [[ "${1:-}" == "serve" ]]; then
+  needs_bun=true
+  for arg in "$@"; do
+    if [[ "$arg" == "--flask" ]]; then
+      needs_bun=false
+    fi
+  done
+fi
+
+if [[ "$needs_bun" == true ]]; then
+  require_command bun "https://bun.sh/docs/installation"
+  if [[ ! -d "$WEB_DIR/node_modules" ]]; then
+    echo "Installing Next.js dependencies…"
+  fi
+  # Always reconcile node_modules with the lockfile. Presence alone does not
+  # prove that a checkout has picked up patched dependency versions.
+  (cd "$WEB_DIR" && bun install --frozen-lockfile --silent)
 fi
 
 exec "$VENV/bin/logpile" "$@"

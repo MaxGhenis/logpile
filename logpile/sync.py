@@ -5,17 +5,27 @@ import fnmatch
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
-from dataclasses import replace
+import tempfile
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 
-from .parsers import parse_claudecode_session, parse_codex_session, file_hash
+from .parsers import (
+    PrivateSessionMarker,
+    file_hash,
+    parse_claudecode_session,
+    parse_codex_session,
+)
 from .objectives import SESSION_OBJECTIVE_VERSION, derive_session_objective
 from .origins import SESSION_ORIGIN_VERSION, derive_session_origin
 from .db import (
     apply_message_claims,
+    defer_storage_transition,
+    defer_storage_transitions,
     ensure_user,
     get_meta,
     get_user_by_identifier,
@@ -38,7 +48,114 @@ SESSION_NARRATIVE_VERSION = 1
 #    Claude cache_creation capture, per-day usage rows, file size/mtime.
 # 5: cross-session Claude dedup — parses emit message_claims and native_*
 #    columns are claims-derived (db.CLAIMS_TOKEN_VERSION).
-SESSION_TOKEN_VERSION = 5
+# 6: ISO-8601 timestamps are normalized to UTC before daily usage bucketing.
+SESSION_TOKEN_VERSION = 6
+
+
+class SyncStatus(str, Enum):
+    COMPLETED = "completed"
+    LOCK_CONTENDED = "lock_contended"
+
+
+class SyncResult(tuple):
+    """Tuple-compatible sync counts with a machine-readable completion status."""
+
+    status = SyncStatus.COMPLETED
+
+    def __new__(cls, new: int, updated: int, skipped: int):
+        return super().__new__(cls, (new, updated, skipped))
+
+    @property
+    def new(self) -> int:
+        return self[0]
+
+    @property
+    def updated(self) -> int:
+        return self[1]
+
+    @property
+    def skipped(self) -> int:
+        return self[2]
+
+
+class SyncLockContended(SyncResult):
+    status = SyncStatus.LOCK_CONTENDED
+
+
+class SyncLockError(RuntimeError):
+    """The platform or filesystem could not provide the required sync lock."""
+
+
+class StorageSafetyError(RuntimeError):
+    """A storage transition could not preserve the only durable transcript."""
+
+
+@dataclass
+class PrivateStorageTransition:
+    """Filesystem changes that can be finalized or reversed around a DB update."""
+
+    archive_path: Path
+    changed: bool = False
+    rollback_moves: list[tuple[Path, Path]] = field(default_factory=list)
+    rollback_unlinks: list[Path] = field(default_factory=list)
+    commit_unlinks: list[Path] = field(default_factory=list)
+    rollback_quarantine_root: Path | None = None
+    active: bool = True
+
+    def rollback(self) -> None:
+        if not self.active:
+            return
+        errors: list[OSError] = []
+        for path in reversed(self.rollback_unlinks):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                quarantined = False
+                if self.rollback_quarantine_root is not None and _lexists(path):
+                    try:
+                        quarantine_dir = (
+                            self.rollback_quarantine_root / ".rollback-quarantine"
+                        )
+                        _secure_private_mkdir(
+                            quarantine_dir, self.rollback_quarantine_root
+                        )
+                        quarantine = _temporary_sibling(
+                            quarantine_dir / path.name, "rollback"
+                        )
+                        os.replace(path, quarantine)
+                        os.chmod(quarantine, 0o600)
+                        quarantined = True
+                    except OSError as quarantine_exc:
+                        errors.append(quarantine_exc)
+                    except StorageSafetyError as quarantine_exc:
+                        errors.append(OSError(str(quarantine_exc)))
+                if not quarantined:
+                    errors.append(exc)
+        for current, original in reversed(self.rollback_moves):
+            try:
+                if current.exists() or current.is_symlink():
+                    _secure_mkdir(original.parent)
+                    os.replace(current, original)
+            except OSError as exc:
+                errors.append(exc)
+        self.active = False
+        if errors:
+            raise StorageSafetyError(
+                f"Could not roll back private transcript storage: {errors[0]}"
+            ) from errors[0]
+
+    def commit(self) -> None:
+        if not self.active:
+            return
+        for path in self.commit_unlinks:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                # Quarantine files are already private and outside the shared
+                # tree. A later cleanup is preferable to rolling visibility
+                # back after the durable archive has been created.
+                pass
+        self.active = False
 _TEST_PATTERNS = (
     re.compile(r"\b(pytest|py\.test|vitest|jest|nosetests|rspec)\b"),
     re.compile(r"\bpython(?:\d+(?:\.\d+)?)?\s+-m\s+(pytest|unittest)\b"),
@@ -77,6 +194,263 @@ def _safe_expanduser(path: Path) -> Path:
         return path
 
 
+def _secure_mkdir(path: Path, *, harden_existing: bool = True) -> None:
+    """Create private runtime directories without umask-readable intermediates."""
+    path = Path(path)
+    missing: list[Path] = []
+    cursor = path
+    while not cursor.exists():
+        missing.append(cursor)
+        if cursor.parent == cursor:
+            break
+        cursor = cursor.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+    if harden_existing and path.exists() and not path.is_symlink():
+        path.chmod(0o700)
+
+
+def _harden_regular_file(path: Path) -> bool:
+    """Set an existing regular file to 0600 without following symlinks.
+
+    O_NONBLOCK prevents an attacker-controlled FIFO replacement from hanging
+    sync between the lstat and open.  The descriptor check closes the race
+    before fchmod.
+    """
+    path = Path(path)
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return False
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(path, flags)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        os.fchmod(fd, 0o600)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _harden_managed_artifact(path: Path, root: Path) -> bool:
+    """Harden a regular artifact and its managed directory ancestry."""
+    path = _lexical_path(path)
+    root = _lexical_path(root)
+    try:
+        relative_parent = path.parent.relative_to(root)
+    except ValueError:
+        return False
+
+    directories = [root]
+    current = root
+    for component in relative_parent.parts:
+        current /= component
+        directories.append(current)
+    for directory in directories:
+        try:
+            mode = directory.lstat().st_mode
+            if not stat.S_ISDIR(mode):
+                return False
+            directory.chmod(0o700)
+        except OSError:
+            return False
+    return _harden_regular_file(path)
+
+
+def _lexical_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        _lexical_path(path).relative_to(_lexical_path(root))
+        return True
+    except ValueError:
+        return False
+
+
+def _secure_managed_mkdir(path: Path, root: Path, *, label: str) -> None:
+    """Create a managed directory without traversing symlink components."""
+    path = _lexical_path(path)
+    root = _lexical_path(root)
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise StorageSafetyError(
+            f"{label.title()} path escapes its configured root: {path}"
+        ) from exc
+
+    current = root
+    components = (Path(), *relative.parts)
+    for component in components:
+        if component != Path():
+            current = current / component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            try:
+                current.mkdir(mode=0o700)
+                mode = current.lstat().st_mode
+            except FileExistsError:
+                # A concurrent replacement won the create race; validate it
+                # with lstat below instead of following it.
+                mode = current.lstat().st_mode
+        except OSError as exc:
+            raise StorageSafetyError(
+                f"Cannot inspect {label} directory {current}: {exc}"
+            ) from exc
+
+        if not stat.S_ISDIR(mode):
+            kind = "symlink" if stat.S_ISLNK(mode) else "non-directory"
+            raise StorageSafetyError(
+                f"Refusing {kind} {label} component: {current}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(current, flags)
+            try:
+                if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                    raise StorageSafetyError(
+                        f"Refusing replaced {label} component: {current}"
+                    )
+                os.fchmod(fd, 0o700)
+            finally:
+                os.close(fd)
+        except StorageSafetyError:
+            raise
+        except OSError as exc:
+            raise StorageSafetyError(
+                f"Cannot secure {label} directory {current}: {exc}"
+            ) from exc
+
+
+def _secure_private_mkdir(path: Path, private_root: Path) -> None:
+    _secure_managed_mkdir(path, private_root, label="private archive")
+
+
+def _secure_shared_mkdir(path: Path, shared_root: Path) -> None:
+    _secure_managed_mkdir(path, shared_root, label="shared storage")
+
+
+def _validate_private_archive_file(path: Path, private_root: Path) -> None:
+    """Validate the archive ancestry and reject non-regular archive leaves."""
+    path = _lexical_path(path)
+    _secure_private_mkdir(path.parent, private_root)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise StorageSafetyError(
+            f"Cannot inspect private archive artifact {path}: {exc}"
+        ) from exc
+    if not stat.S_ISREG(mode):
+        kind = "symlink" if stat.S_ISLNK(mode) else "non-regular"
+        raise StorageSafetyError(
+            f"Refusing {kind} private archive artifact: {path}"
+        )
+
+
+def _lexists(path: Path) -> bool:
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _private_archive_root(shared_dir: Path) -> Path:
+    shared_dir = _lexical_path(shared_dir)
+    return shared_dir.parent / f".{shared_dir.name}-private"
+
+
+def _storage_component(value: str | None, fallback: str) -> str:
+    component = Path((value or "").strip()).name
+    return component if component not in {"", ".", ".."} else fallback
+
+
+def _private_archive_path(
+    shared_dir: Path,
+    username: str,
+    source: str,
+    project: str,
+    filename: str,
+) -> Path:
+    return (
+        _private_archive_root(shared_dir)
+        / _storage_component(username, "user")
+        / _storage_component(source, "unknown")
+        / _storage_component(project, "unknown")
+        / _storage_component(filename, "session.jsonl")
+    )
+
+
+def _temporary_sibling(path: Path, suffix: str) -> Path:
+    for index in range(1000):
+        candidate = path.with_name(
+            f".{path.name}.{os.getpid()}.{index}.{suffix}"
+        )
+        if not _lexists(candidate):
+            return candidate
+    raise StorageSafetyError(f"Could not reserve temporary storage beside {path}")
+
+
+def _private_quarantine_path(
+    private_root: Path, original: Path, suffix: str
+) -> Path:
+    """Reserve a rollback path outside the shared/public storage tree."""
+    quarantine_dir = private_root / ".transition-quarantine"
+    _secure_private_mkdir(quarantine_dir, private_root)
+    return _temporary_sibling(quarantine_dir / original.name, suffix)
+
+
+def _secure_copy_file(
+    src: Path,
+    dst: Path,
+    *,
+    private_root: Path | None = None,
+    shared_root: Path | None = None,
+) -> None:
+    """Copy bytes to a 0600 staging file and atomically replace lexical dst."""
+    if private_root is not None and shared_root is not None:
+        raise ValueError("A copy destination cannot have two managed roots")
+    if private_root is not None:
+        _validate_private_archive_file(dst, private_root)
+    elif shared_root is not None:
+        _secure_shared_mkdir(dst.parent, shared_root)
+    else:
+        _secure_mkdir(dst.parent)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{dst.name}.", suffix=".tmp-sync", dir=dst.parent
+    )
+    tmp = Path(temp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with src.open("rb") as source_file, os.fdopen(fd, "wb") as target_file:
+            fd = -1
+            shutil.copyfileobj(source_file, target_file)
+            target_file.flush()
+            os.fsync(target_file.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, dst)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def _codex_session_roots(home: Path) -> list[Path]:
     """All Codex rollout roots under a home dir.
 
@@ -93,10 +467,13 @@ def _codex_session_roots(home: Path) -> list[Path]:
     openclaw_agents = home / ".openclaw" / "agents"
     if openclaw_agents.exists():
         roots.extend(sorted(openclaw_agents.glob("*/agent/codex-home/sessions")))
-    return [root for root in roots if root.exists()]
+    # Keep standard roots even when absent at discovery time. Codex can move a
+    # live rollout into a newly-created archived_sessions root while this sync
+    # is hashing it; the later root pass should still pick up that rename.
+    return roots
 
 
-def _unchanged_on_disk(existing_row, jsonl_path: Path) -> bool:
+def _unchanged_on_disk(existing_row, jsonl_path: Path, shared_dir: Path) -> bool:
     """Cheap no-op check for a synced session: same path, same size+mtime,
     and the shared copy (when one is expected) still present.
 
@@ -118,11 +495,14 @@ def _unchanged_on_disk(existing_row, jsonl_path: Path) -> bool:
         return False
     shared_path = existing_row["shared_path"] or ""
     if existing_row["visibility"] == "private":
-        return shared_path == ""
+        if not shared_path:
+            return True
+        return _harden_managed_artifact(
+            Path(shared_path), _private_archive_root(shared_dir)
+        )
     if not shared_path:
         return False
-    shared = Path(shared_path)
-    return shared.exists() or shared.is_symlink()
+    return _harden_managed_artifact(Path(shared_path), shared_dir)
 
 
 def _resolve_sync_username(conn, requested_username: str) -> str:
@@ -135,50 +515,252 @@ def _resolve_sync_username(conn, requested_username: str) -> str:
     if direct:
         return direct["username"]
 
-    rows = conn.execute("SELECT username FROM users ORDER BY updated_at DESC, username").fetchall()
-    if len(rows) == 1:
-        return rows[0]["username"]
     return normalized
 
 
 def _copy_session(src: Path, dst: Path) -> bool:
     """Copy a session file into the shared directory.
 
-    Atomic: writes to a temp file beside dst, then os.replace()s it into
-    place, so the shared copy is always a complete file (old or new) even if
-    sync dies mid-copy. A symlink dst (from an earlier ENOSPC fallback) is
-    upgraded to a real copy once a copy succeeds, and an existing complete
-    copy is never removed in favor of a failed one.
+    Atomic: writes to a 0600 temp file beside dst, then os.replace()s it into
+    place, so the shared copy is always a complete regular file (old or new).
+    ENOSPC and all other write errors fail closed; no source-pointing symlink
+    is ever created.
     """
-    was_symlink = dst.is_symlink()
-    if not was_symlink and dst.exists() and file_hash(dst) == file_hash(src):
+    _secure_shared_mkdir(dst.parent, dst.parent)
+    if _harden_regular_file(dst) and file_hash(dst) == file_hash(src):
         return False
-    # Per-writer tmp name: reconcile_session_storage (publish/visibility paths)
-    # copies without holding the sync lock, so a shared tmp name would let one
-    # writer os.replace() another's half-written file into place.
-    tmp = dst.with_name(f"{dst.name}.{os.getpid()}.tmp-sync")
-    try:
-        shutil.copy2(src, tmp)
-        tmp.replace(dst)
-    except OSError as exc:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        if exc.errno != errno.ENOSPC:
-            raise
-        if was_symlink:
-            try:
-                if dst.resolve() == src.resolve():
-                    return False
-            except OSError:
-                pass
-        elif dst.exists():
-            return False
-        if dst.is_symlink():
-            dst.unlink()
-        dst.symlink_to(src.resolve())
+    _secure_copy_file(src, dst, shared_root=dst.parent)
     return True
+
+
+def _prepare_private_storage(
+    *,
+    src: Path,
+    shared_dir: Path,
+    username: str,
+    source: str,
+    project: str,
+    filename: str,
+    existing_shared_path: str | None,
+) -> PrivateStorageTransition:
+    """Prepare a reversible move from shared storage into private storage."""
+    shared_dir = _lexical_path(shared_dir)
+    _secure_shared_mkdir(shared_dir, shared_dir)
+    private_root = _private_archive_root(shared_dir)
+    _secure_private_mkdir(private_root, private_root)
+    desired_shared = _desired_shared_path(
+        shared_dir, username, source, project, filename
+    )
+    archive = _private_archive_path(
+        shared_dir, username, source, project, filename
+    )
+
+    existing_path = Path(existing_shared_path) if existing_shared_path else None
+    if existing_path and _is_within(existing_path, private_root):
+        archive = _lexical_path(existing_path)
+    elif existing_path and _lexists(existing_path) and not _is_within(
+        existing_path, shared_dir
+    ):
+        raise StorageSafetyError(
+            f"Refusing to privatize transcript outside the configured shared tree: {existing_path}"
+        )
+    _validate_private_archive_file(archive, private_root)
+
+    shared_candidates: list[Path] = []
+    for candidate in (existing_path, desired_shared):
+        if not candidate or not _is_within(candidate, shared_dir):
+            continue
+        lexical = _lexical_path(candidate)
+        if lexical not in shared_candidates and _lexists(lexical):
+            if not _harden_managed_artifact(lexical, shared_dir):
+                raise StorageSafetyError(
+                    f"Refusing non-regular or unsafe shared transcript: {lexical}"
+                )
+            shared_candidates.append(lexical)
+
+    transition = PrivateStorageTransition(archive_path=archive)
+    try:
+        if src.exists():
+            if _lexists(archive):
+                archive_backup = _temporary_sibling(archive, "rollback")
+                os.replace(archive, archive_backup)
+                transition.rollback_moves.append((archive_backup, archive))
+                transition.commit_unlinks.append(archive_backup)
+            _secure_copy_file(src, archive, private_root=private_root)
+            transition.rollback_unlinks.append(archive)
+            transition.changed = True
+
+            for shared_path in shared_candidates:
+                quarantine = _temporary_sibling(archive, "shared-rollback")
+                os.replace(shared_path, quarantine)
+                transition.rollback_moves.append((quarantine, shared_path))
+                transition.commit_unlinks.append(quarantine)
+                transition.changed = True
+        elif _lexists(archive):
+            for shared_path in shared_candidates:
+                quarantine = _temporary_sibling(archive, "shared-rollback")
+                os.replace(shared_path, quarantine)
+                transition.rollback_moves.append((quarantine, shared_path))
+                transition.commit_unlinks.append(quarantine)
+                transition.changed = True
+        elif len(shared_candidates) == 1:
+            shared_path = shared_candidates[0]
+            if shared_path.is_symlink():
+                raise StorageSafetyError(
+                    "Cannot preserve a source-pointing shared symlink after its source disappeared."
+                )
+            _secure_private_mkdir(archive.parent, private_root)
+            os.replace(shared_path, archive)
+            transition.rollback_moves.append((archive, shared_path))
+            transition.changed = True
+        elif len(shared_candidates) > 1:
+            raise StorageSafetyError(
+                "Refusing private transition with multiple surviving shared transcripts."
+            )
+        else:
+            raise StorageSafetyError(
+                "Cannot make session private: no source or shared transcript survives."
+            )
+    except BaseException:
+        transition.rollback()
+        raise
+    return transition
+
+
+def prepare_private_session_storage(
+    row,
+    *,
+    shared_dir: Path,
+) -> PrivateStorageTransition:
+    src = Path(row["source_path"])
+    shared_path = row["shared_path"] or ""
+    filename = src.name or (Path(shared_path).name if shared_path else "session.jsonl")
+    return _prepare_private_storage(
+        src=src,
+        shared_dir=shared_dir,
+        username=row["username"],
+        source=row["source"],
+        project=row["project"] or "unknown",
+        filename=filename,
+        existing_shared_path=shared_path or None,
+    )
+
+
+def _prepare_shared_storage(
+    *,
+    src: Path,
+    shared_dir: Path,
+    username: str,
+    source: str,
+    project: str,
+    filename: str,
+    existing_shared_path: str | None,
+) -> PrivateStorageTransition:
+    """Prepare a reversible materialization into the lexical shared tree."""
+    shared_dir = _lexical_path(shared_dir)
+    _secure_shared_mkdir(shared_dir, shared_dir)
+    desired = _desired_shared_path(
+        shared_dir, username, source, project, filename
+    )
+    _secure_shared_mkdir(desired.parent, shared_dir)
+    existing = Path(existing_shared_path) if existing_shared_path else None
+    private_root = _private_archive_root(shared_dir)
+    _secure_private_mkdir(private_root, private_root)
+    if existing and _lexists(existing) and not (
+        _is_within(existing, shared_dir)
+        or _is_within(existing, private_root)
+    ):
+        raise StorageSafetyError(
+            f"Refusing to publish transcript from outside managed storage: {existing}"
+        )
+
+    copy_src = src
+    if existing and _is_within(existing, private_root):
+        _validate_private_archive_file(existing, private_root)
+    elif existing and _is_within(existing, shared_dir) and _lexists(existing):
+        if not _harden_managed_artifact(existing, shared_dir):
+            raise StorageSafetyError(
+                f"Refusing non-regular or unsafe shared transcript: {existing}"
+            )
+    if (
+        not copy_src.exists()
+        and existing
+        and _is_within(existing, private_root)
+        and _lexists(existing)
+    ):
+        copy_src = existing
+    if not copy_src.exists():
+        raise StorageSafetyError(
+            "Cannot make session non-private: no source or private archive survives."
+        )
+
+    transition = PrivateStorageTransition(
+        archive_path=desired,
+        rollback_quarantine_root=private_root,
+    )
+    try:
+        same_lexical_path = _lexical_path(copy_src) == _lexical_path(desired)
+        identical = (
+            not same_lexical_path
+            and _harden_managed_artifact(desired, shared_dir)
+            and file_hash(desired) == file_hash(copy_src)
+        )
+        if same_lexical_path and not _harden_managed_artifact(desired, shared_dir):
+            raise StorageSafetyError(
+                f"Managed shared transcript is not a regular file: {desired}"
+            )
+        if not same_lexical_path and not identical:
+            if _lexists(desired):
+                backup = _private_quarantine_path(
+                    private_root, desired, "publish-rollback"
+                )
+                os.replace(desired, backup)
+                transition.rollback_moves.append((backup, desired))
+                transition.commit_unlinks.append(backup)
+            _secure_copy_file(copy_src, desired, shared_root=shared_dir)
+            transition.rollback_unlinks.append(desired)
+            transition.changed = True
+
+        if existing and _lexical_path(existing) != _lexical_path(desired) and _lexists(existing):
+            if _is_within(existing, private_root):
+                _validate_private_archive_file(existing, private_root)
+                quarantine = _temporary_sibling(existing, "publish-rollback")
+                os.replace(existing, quarantine)
+                transition.rollback_moves.append((quarantine, existing))
+                transition.commit_unlinks.append(quarantine)
+            else:
+                # A managed shared artifact being renamed within the shared
+                # tree should also remain reversible until the DB commits.
+                quarantine = _private_quarantine_path(
+                    private_root, existing, "shared-rollback"
+                )
+                os.replace(existing, quarantine)
+                transition.rollback_moves.append((quarantine, existing))
+                transition.commit_unlinks.append(quarantine)
+            transition.changed = True
+    except BaseException:
+        transition.rollback()
+        raise
+    return transition
+
+
+def prepare_shared_session_storage(
+    row,
+    *,
+    shared_dir: Path,
+) -> PrivateStorageTransition:
+    src = Path(row["source_path"])
+    existing = row["shared_path"] or ""
+    filename = src.name or (Path(existing).name if existing else "session.jsonl")
+    return _prepare_shared_storage(
+        src=src,
+        shared_dir=shared_dir,
+        username=row["username"],
+        source=row["source"],
+        project=row["project"] or "unknown",
+        filename=filename,
+        existing_shared_path=existing or None,
+    )
 
 
 def _remove_shared_copy(path: Path | None) -> bool:
@@ -197,10 +779,16 @@ def _desired_shared_path(
     project: str,
     filename: str,
 ) -> Path:
-    return shared_dir / username / source / project / filename
+    return (
+        shared_dir
+        / _storage_component(username, "user")
+        / _storage_component(source, "unknown")
+        / _storage_component(project, "unknown")
+        / _storage_component(filename, "session.jsonl")
+    )
 
 
-def _sync_shared_copy(
+def _prepare_sync_shared_copy(
     *,
     src: Path,
     shared_dir: Path,
@@ -210,36 +798,52 @@ def _sync_shared_copy(
     filename: str,
     visibility: str,
     existing_shared_path: str | None = None,
-) -> tuple[str, bool]:
-    desired_path = _desired_shared_path(shared_dir, username, source, project, filename)
-    changed = False
-
-    stale_candidates: list[Path] = []
-    if existing_shared_path:
-        stale_candidates.append(Path(existing_shared_path))
-    stale_candidates.append(desired_path)
-
-    seen: set[str] = set()
-    unique_candidates: list[Path] = []
-    for candidate in stale_candidates:
-        key = str(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_candidates.append(candidate)
-
+) -> PrivateStorageTransition:
     if visibility == "private":
-        for candidate in unique_candidates:
-            changed = _remove_shared_copy(candidate) or changed
-        return "", changed
+        return _prepare_private_storage(
+            src=src,
+            shared_dir=shared_dir,
+            username=username,
+            source=source,
+            project=project,
+            filename=filename,
+            existing_shared_path=existing_shared_path,
+        )
+    return _prepare_shared_storage(
+        src=src,
+        shared_dir=shared_dir,
+        username=username,
+        source=source,
+        project=project,
+        filename=filename,
+        existing_shared_path=existing_shared_path,
+    )
 
-    desired_path.parent.mkdir(parents=True, exist_ok=True)
-    for candidate in unique_candidates:
-        if candidate == desired_path:
-            continue
-        changed = _remove_shared_copy(candidate) or changed
-    changed = _copy_session(src, desired_path) or changed
-    return str(desired_path), changed
+
+def _sync_shared_copy(
+    *,
+    conn,
+    src: Path,
+    shared_dir: Path,
+    username: str,
+    source: str,
+    project: str,
+    filename: str,
+    visibility: str,
+    existing_shared_path: str | None = None,
+) -> tuple[str, bool]:
+    transition = _prepare_sync_shared_copy(
+        src=src,
+        shared_dir=shared_dir,
+        username=username,
+        source=source,
+        project=project,
+        filename=filename,
+        visibility=visibility,
+        existing_shared_path=existing_shared_path,
+    )
+    defer_storage_transition(conn, transition)
+    return str(transition.archive_path), transition.changed
 
 
 def _effective_storage_visibility(
@@ -289,42 +893,65 @@ def reconcile_session_storage(
     ).fetchall()
 
     updated = 0
-    for row in rows:
-        src = Path(row["source_path"])
-        current_shared_path = row["shared_path"] or ""
-        next_shared_path = current_shared_path
-        storage_changed = False
+    transitions: list[PrivateStorageTransition] = []
+    try:
+        for row in rows:
+            src = Path(row["source_path"])
+            current_shared_path = row["shared_path"] or ""
+            transition: PrivateStorageTransition | None = None
 
-        if row["visibility"] == "private":
-            next_shared_path, storage_changed = _sync_shared_copy(
-                src=src,
-                shared_dir=shared_dir,
-                username=row["username"],
-                source=row["source"],
-                project=row["project"] or "unknown",
-                filename=src.name,
-                visibility="private",
-                existing_shared_path=current_shared_path or None,
-            )
-        elif src.exists():
-            next_shared_path, storage_changed = _sync_shared_copy(
-                src=src,
-                shared_dir=shared_dir,
-                username=row["username"],
-                source=row["source"],
-                project=row["project"] or "unknown",
-                filename=src.name,
-                visibility=row["visibility"],
-                existing_shared_path=current_shared_path or None,
-            )
+            if row["visibility"] == "private":
+                transition = _prepare_sync_shared_copy(
+                    src=src,
+                    shared_dir=shared_dir,
+                    username=row["username"],
+                    source=row["source"],
+                    project=row["project"] or "unknown",
+                    filename=src.name,
+                    visibility="private",
+                    existing_shared_path=current_shared_path or None,
+                )
+            elif src.exists() or (
+                current_shared_path
+                and _is_within(
+                    Path(current_shared_path), _private_archive_root(shared_dir)
+                )
+                and _lexists(Path(current_shared_path))
+            ):
+                transition = _prepare_sync_shared_copy(
+                    src=src,
+                    shared_dir=shared_dir,
+                    username=row["username"],
+                    source=row["source"],
+                    project=row["project"] or "unknown",
+                    filename=src.name,
+                    visibility=row["visibility"],
+                    existing_shared_path=current_shared_path or None,
+                )
 
-        if storage_changed or next_shared_path != current_shared_path:
-            conn.execute(
-                "UPDATE sessions SET shared_path = ? WHERE session_id = ?",
-                (next_shared_path, row["session_id"]),
-            )
-            updated += 1
+            if transition is None:
+                continue
+            transitions.append(transition)
+            next_shared_path = str(transition.archive_path)
+            if transition.changed or next_shared_path != current_shared_path:
+                conn.execute(
+                    "UPDATE sessions SET shared_path = ? WHERE session_id = ?",
+                    (next_shared_path, row["session_id"]),
+                )
+                updated += 1
+    except BaseException as operation_error:
+        first_rollback_error: BaseException | None = None
+        for transition in reversed(transitions):
+            try:
+                transition.rollback()
+            except BaseException as rollback_error:
+                if first_rollback_error is None:
+                    first_rollback_error = rollback_error
+        if first_rollback_error is not None:
+            raise first_rollback_error from operation_error
+        raise
 
+    defer_storage_transitions(conn, transitions)
     return updated
 
 
@@ -783,8 +1410,15 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
             if row["source"] == "claudecode"
             else parse_codex_session
         )
-        info = parser(shared_file)
-        if info is None:
+        try:
+            info = parser(shared_file)
+        except OSError as exc:
+            if exc.errno == errno.ENOSPC:
+                raise
+            if verbose:
+                print(f"  Skipped unavailable shared copy {shared_file}: {exc}", file=sys.stderr)
+            continue
+        if info is None or isinstance(info, PrivateSessionMarker):
             continue
         conn.execute(
             """
@@ -826,6 +1460,63 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
     return backfilled, affected
 
 
+def _is_rotation_error(exc: OSError) -> bool:
+    return exc.errno in {errno.ENOENT, getattr(errno, "ESTALE", errno.ENOENT)}
+
+
+def _report_rotation_skip(path: Path, exc: OSError, verbose: bool) -> None:
+    if verbose:
+        print(f"  Skipped rotating session {path}: {exc}", file=sys.stderr)
+
+
+def _tighten_private_marker(
+    conn,
+    *,
+    existing_row,
+    jsonl_path: Path,
+    shared_dir: Path,
+    marker: PrivateSessionMarker,
+    fhash: str,
+    file_stat,
+    now: str,
+) -> None:
+    storage_row = dict(existing_row)
+    storage_row["source_path"] = str(jsonl_path)
+    transition = prepare_private_session_storage(storage_row, shared_dir=shared_dir)
+    try:
+        conn.execute(
+            """
+            UPDATE sessions
+            SET visibility = 'private',
+                visibility_source = 'marker',
+                visibility_rule_id = NULL,
+                visibility_reason = ?,
+                is_private = 1,
+                source_path = ?,
+                shared_path = ?,
+                file_hash = ?,
+                file_size = ?,
+                file_mtime = ?,
+                synced_at = ?
+            WHERE session_id = ?
+            """,
+            (
+                f"inline {marker.marker}",
+                str(jsonl_path),
+                str(transition.archive_path),
+                fhash,
+                file_stat.st_size,
+                file_stat.st_mtime,
+                now,
+                existing_row["session_id"],
+            ),
+        )
+    except BaseException:
+        transition.rollback()
+        raise
+    defer_storage_transition(conn, transition)
+
+
 def sync_sessions(
     shared_dir: Path,
     db_path: Path,
@@ -833,25 +1524,51 @@ def sync_sessions(
     machine: str,
     home: Path,
     verbose: bool = False,
-) -> tuple[int, int, int]:
+) -> SyncResult:
     """
     Discover, parse, and copy sessions.
-    Returns (new, updated, skipped) counts.
+    Returns tuple-compatible counts plus a typed completion status.
 
     Holds an exclusive lock for the duration: a concurrent sync (e.g. the
-    usage-tracker launchd job overlapping a manual run) returns (0, 0, 0)
-    instead of interleaving copies onto the same shared files.
+    usage-tracker launchd job overlapping a manual run) returns a typed
+    lock-contended result instead of interleaving copies onto shared files.
     """
     lock_path = Path(f"{db_path}.sync.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as lock_file:
+    _secure_mkdir(lock_path.parent, harden_existing=False)
+    lock_fd: int | None = None
+    try:
+        lock_flags = os.O_WRONLY | os.O_CREAT
+        lock_flags |= getattr(os, "O_CLOEXEC", 0)
+        lock_flags |= getattr(os, "O_NOFOLLOW", 0)
+        lock_flags |= getattr(os, "O_NONBLOCK", 0)
+        lock_fd = os.open(lock_path, lock_flags, 0o600)
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            raise SyncLockError(
+                f"Refusing non-regular sync lock path: {lock_path}"
+            )
+        os.fchmod(lock_fd, 0o600)
+    except SyncLockError:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        raise
+    except OSError as exc:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        raise SyncLockError(
+            f"Could not safely open sync lock {lock_path}: {exc}"
+        ) from exc
+    with os.fdopen(lock_fd, "w") as lock_file:
         try:
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as exc:
+            if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                raise SyncLockError(
+                    f"Could not acquire sync lock {lock_path}: {exc}"
+                ) from exc
             # Always audible: a silent (0, 0, 0) reads as "synced, all quiet"
             # to humans and scripts checking the summary line.
             print("Skipped: another logpile sync holds the lock.", file=sys.stderr)
-            return (0, 0, 0)
+            return SyncLockContended(0, 0, 0)
         return _sync_sessions(shared_dir, db_path, username, machine, home, verbose)
 
 
@@ -862,9 +1579,10 @@ def _sync_sessions(
     machine: str,
     home: Path,
     verbose: bool = False,
-) -> tuple[int, int, int]:
+) -> SyncResult:
     """Locked body of sync_sessions."""
     init_db(db_path)
+    _secure_shared_mkdir(shared_dir, shared_dir)
     patterns = load_ignore_patterns(home)
     now = datetime.now(timezone.utc).isoformat()
     new_count = updated_count = skipped_count = 0
@@ -885,6 +1603,7 @@ def _sync_sessions(
                 """
                 SELECT
                     session_id,
+                    username,
                     file_hash,
                     visibility,
                     visibility_source,
@@ -964,7 +1683,11 @@ def _sync_sessions(
                     )
                 )
 
-                if existing_row and not needs_structure_backfill and _unchanged_on_disk(existing_row, jsonl_path):
+                if (
+                    existing_row
+                    and not needs_structure_backfill
+                    and _unchanged_on_disk(existing_row, jsonl_path, shared_dir)
+                ):
                     skipped_count += 1
                     continue
 
@@ -973,22 +1696,33 @@ def _sync_sessions(
                     # the stored size/mtime stale, forcing a re-parse next
                     # sync instead of silently skipping the newer content.
                     file_stat = jsonl_path.stat()
-                except OSError:
+                    fhash = file_hash(jsonl_path)
+                except OSError as exc:
+                    if exc.errno == errno.ENOSPC:
+                        raise
+                    _report_rotation_skip(jsonl_path, exc, verbose)
                     skipped_count += 1
                     continue
-                fhash = file_hash(jsonl_path)
 
                 if existing_row and existing_row["file_hash"] == fhash and not needs_structure_backfill:
-                    shared_path, storage_changed = _sync_shared_copy(
-                        src=jsonl_path,
-                        shared_dir=shared_dir,
-                        username=canonical_username,
-                        source=existing_row["source"],
-                        project=existing_row["project"] or project_from_claude_path(jsonl_path),
-                        filename=jsonl_path.name,
-                        visibility=existing_row["visibility"],
-                        existing_shared_path=existing_row["shared_path"],
-                    )
+                    try:
+                        shared_path, storage_changed = _sync_shared_copy(
+                            conn=conn,
+                            src=jsonl_path,
+                            shared_dir=shared_dir,
+                            username=canonical_username,
+                            source=existing_row["source"],
+                            project=existing_row["project"] or project_from_claude_path(jsonl_path),
+                            filename=jsonl_path.name,
+                            visibility=existing_row["visibility"],
+                            existing_shared_path=existing_row["shared_path"],
+                        )
+                    except OSError as exc:
+                        if exc.errno == errno.ENOSPC:
+                            raise
+                        _report_rotation_skip(jsonl_path, exc, verbose)
+                        skipped_count += 1
+                        continue
                     row_moved = (
                         existing_row["source_path"] != str(jsonl_path)
                         or existing_row["file_size"] != file_stat.st_size
@@ -1012,9 +1746,40 @@ def _sync_sessions(
                         skipped_count += 1
                     continue
 
-                info = parse_claudecode_session(jsonl_path)
+                try:
+                    info = parse_claudecode_session(jsonl_path)
+                except OSError as exc:
+                    if exc.errno == errno.ENOSPC:
+                        raise
+                    _report_rotation_skip(jsonl_path, exc, verbose)
+                    skipped_count += 1
+                    continue
                 if info is None:
                     skipped_count += 1
+                    continue
+                if isinstance(info, PrivateSessionMarker):
+                    if existing_row:
+                        try:
+                            _tighten_private_marker(
+                                conn,
+                                existing_row=existing_row,
+                                jsonl_path=jsonl_path,
+                                shared_dir=shared_dir,
+                                marker=info,
+                                fhash=fhash,
+                                file_stat=file_stat,
+                                now=now,
+                            )
+                        except OSError as exc:
+                            if exc.errno == errno.ENOSPC:
+                                raise
+                            _report_rotation_skip(jsonl_path, exc, verbose)
+                            skipped_count += 1
+                            continue
+                        flush_if_needed()
+                        updated_count += 1
+                    else:
+                        skipped_count += 1
                     continue
 
                 project = project_from_claude_path(jsonl_path)
@@ -1066,16 +1831,24 @@ def _sync_sessions(
                     },
                 )
                 storage_visibility = _effective_storage_visibility(existing_row, visibility)
-                shared_path, _ = _sync_shared_copy(
-                    src=jsonl_path,
-                    shared_dir=shared_dir,
-                    username=canonical_username,
-                    source="claudecode",
-                    project=project,
-                    filename=jsonl_path.name,
-                    visibility=storage_visibility,
-                    existing_shared_path=existing_row["shared_path"] if existing_row else None,
-                )
+                try:
+                    shared_path, _ = _sync_shared_copy(
+                        conn=conn,
+                        src=jsonl_path,
+                        shared_dir=shared_dir,
+                        username=canonical_username,
+                        source="claudecode",
+                        project=project,
+                        filename=jsonl_path.name,
+                        visibility=storage_visibility,
+                        existing_shared_path=existing_row["shared_path"] if existing_row else None,
+                    )
+                except OSError as exc:
+                    if exc.errno == errno.ENOSPC:
+                        raise
+                    _report_rotation_skip(jsonl_path, exc, verbose)
+                    skipped_count += 1
+                    continue
 
                 upsert_session(conn, {
                     "session_id": info.session_id,
@@ -1178,29 +1951,46 @@ def _sync_sessions(
                     )
                 )
 
-                if existing_row and not needs_structure_backfill and _unchanged_on_disk(existing_row, jsonl_path):
+                if (
+                    existing_row
+                    and not needs_structure_backfill
+                    and _unchanged_on_disk(existing_row, jsonl_path, shared_dir)
+                ):
                     skipped_count += 1
                     continue
 
                 try:
                     # stat BEFORE hashing — see the Claude loop.
                     file_stat = jsonl_path.stat()
-                except OSError:
+                    fhash = file_hash(jsonl_path)
+                except OSError as exc:
+                    if exc.errno == errno.ENOSPC:
+                        raise
+                    _report_rotation_skip(jsonl_path, exc, verbose)
+                    seen_codex_stems.discard(session_id)
                     skipped_count += 1
                     continue
-                fhash = file_hash(jsonl_path)
 
                 if existing_row and existing_row["file_hash"] == fhash and not needs_structure_backfill:
-                    shared_path, storage_changed = _sync_shared_copy(
-                        src=jsonl_path,
-                        shared_dir=shared_dir,
-                        username=canonical_username,
-                        source=existing_row["source"],
-                        project=existing_row["project"] or "unknown",
-                        filename=jsonl_path.name,
-                        visibility=existing_row["visibility"],
-                        existing_shared_path=existing_row["shared_path"],
-                    )
+                    try:
+                        shared_path, storage_changed = _sync_shared_copy(
+                            conn=conn,
+                            src=jsonl_path,
+                            shared_dir=shared_dir,
+                            username=canonical_username,
+                            source=existing_row["source"],
+                            project=existing_row["project"] or "unknown",
+                            filename=jsonl_path.name,
+                            visibility=existing_row["visibility"],
+                            existing_shared_path=existing_row["shared_path"],
+                        )
+                    except OSError as exc:
+                        if exc.errno == errno.ENOSPC:
+                            raise
+                        _report_rotation_skip(jsonl_path, exc, verbose)
+                        seen_codex_stems.discard(session_id)
+                        skipped_count += 1
+                        continue
                     row_moved = (
                         existing_row["source_path"] != str(jsonl_path)
                         or existing_row["file_size"] != file_stat.st_size
@@ -1224,9 +2014,49 @@ def _sync_sessions(
                         skipped_count += 1
                     continue
 
-                info = parse_codex_session(jsonl_path)
-                if info is None:
+                try:
+                    info = parse_codex_session(jsonl_path)
+                except OSError as exc:
+                    if exc.errno == errno.ENOSPC:
+                        raise
+                    _report_rotation_skip(jsonl_path, exc, verbose)
+                    seen_codex_stems.discard(session_id)
                     skipped_count += 1
+                    continue
+                if info is None:
+                    # _load_jsonl deliberately contains read errors and returns
+                    # no records. If Codex archived the rollout between hashing
+                    # and parsing, let the later archived-root pass retry the
+                    # same stem instead of treating the vanished live path as
+                    # the winning copy for this run.
+                    if not jsonl_path.exists():
+                        seen_codex_stems.discard(session_id)
+                    skipped_count += 1
+                    continue
+                if isinstance(info, PrivateSessionMarker):
+                    if existing_row:
+                        try:
+                            _tighten_private_marker(
+                                conn,
+                                existing_row=existing_row,
+                                jsonl_path=jsonl_path,
+                                shared_dir=shared_dir,
+                                marker=info,
+                                fhash=fhash,
+                                file_stat=file_stat,
+                                now=now,
+                            )
+                        except OSError as exc:
+                            if exc.errno == errno.ENOSPC:
+                                raise
+                            _report_rotation_skip(jsonl_path, exc, verbose)
+                            seen_codex_stems.discard(session_id)
+                            skipped_count += 1
+                            continue
+                        flush_if_needed()
+                        updated_count += 1
+                    else:
+                        skipped_count += 1
                     continue
 
                 # Use leaf of cwd as project name
@@ -1279,16 +2109,25 @@ def _sync_sessions(
                     },
                 )
                 storage_visibility = _effective_storage_visibility(existing_row, visibility)
-                shared_path, _ = _sync_shared_copy(
-                    src=jsonl_path,
-                    shared_dir=shared_dir,
-                    username=canonical_username,
-                    source="codex",
-                    project=project,
-                    filename=jsonl_path.name,
-                    visibility=storage_visibility,
-                    existing_shared_path=existing_row["shared_path"] if existing_row else None,
-                )
+                try:
+                    shared_path, _ = _sync_shared_copy(
+                        conn=conn,
+                        src=jsonl_path,
+                        shared_dir=shared_dir,
+                        username=canonical_username,
+                        source="codex",
+                        project=project,
+                        filename=jsonl_path.name,
+                        visibility=storage_visibility,
+                        existing_shared_path=existing_row["shared_path"] if existing_row else None,
+                    )
+                except OSError as exc:
+                    if exc.errno == errno.ENOSPC:
+                        raise
+                    _report_rotation_skip(jsonl_path, exc, verbose)
+                    seen_codex_stems.discard(session_id)
+                    skipped_count += 1
+                    continue
 
                 # Use file_stem as session_id (unique per file)
                 upsert_session(conn, {
@@ -1363,4 +2202,4 @@ def _sync_sessions(
         refresh_native_usage(conn, None if force_full_refresh else affected_native)
         set_meta(conn, "native_refresh_pending", "0")
 
-    return new_count, updated_count, skipped_count
+    return SyncResult(new_count, updated_count, skipped_count)

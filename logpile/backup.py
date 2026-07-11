@@ -6,9 +6,10 @@ import json
 import mimetypes
 import os
 import re
+import sqlite3
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -187,6 +188,81 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sqlite_readonly_uri(path: Path) -> str:
+    return f"{path.resolve().as_uri()}?mode=ro"
+
+
+@contextmanager
+def _private_umask() -> Iterator[None]:
+    """Keep SQLite-created staging files private from their first write."""
+    previous = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+def verify_sqlite_snapshot(path: Path) -> None:
+    """Raise when *path* is not a self-consistent SQLite database."""
+    try:
+        with sqlite3.connect(_sqlite_readonly_uri(path), uri=True) as conn:
+            results = [str(row[0]) for row in conn.execute("PRAGMA quick_check")]
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeError(f"SQLite snapshot verification failed for {path}: {exc}") from exc
+    if results != ["ok"]:
+        detail = "; ".join(results) if results else "quick_check returned no result"
+        raise RuntimeError(f"SQLite snapshot verification failed for {path}: {detail}")
+
+
+def create_sqlite_snapshot(source: Path, destination: Path) -> Path:
+    """Create and verify a point-in-time SQLite copy with ``VACUUM INTO``.
+
+    SQLite reads the source and its active WAL as one transaction. The
+    verified temporary database is then atomically installed at the lexical
+    destination, so an interrupted backup never leaves a partial output.
+    """
+    source = Path(source)
+    destination = Path(destination)
+    if not source.is_file():
+        raise RuntimeError(f"SQLite database not found: {source}")
+    if source.resolve() == destination.resolve():
+        raise RuntimeError("SQLite backup destination must differ from the source database.")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=str(destination.parent),
+    )
+    os.close(fd)
+    temp_path = Path(temp_name)
+    # VACUUM INTO refuses to write to an existing file. mkstemp reserves a
+    # collision-free lexical path first; unlink only that empty reservation.
+    temp_path.unlink()
+    try:
+        try:
+            with _private_umask():
+                with sqlite3.connect(
+                    _sqlite_readonly_uri(source),
+                    uri=True,
+                    timeout=30,
+                ) as conn:
+                    conn.execute("VACUUM INTO ?", (str(temp_path),))
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"Could not snapshot SQLite database {source}: {exc}") from exc
+
+        os.chmod(temp_path, 0o600)
+        verify_sqlite_snapshot(temp_path)
+        os.replace(temp_path, destination)
+        os.chmod(destination, 0o600)
+        return destination
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def copy_prefix_with_sha256(source: Path, destination: Path, size_bytes: int) -> str:
     digest = hashlib.sha256()
     remaining = size_bytes
@@ -291,7 +367,13 @@ def snapshot_candidate(
     os.close(fd)
     snapshot_path = Path(temp_name)
     try:
-        sha256 = copy_prefix_with_sha256(path, snapshot_path, stat.st_size)
+        if suffix == ".sqlite":
+            snapshot_path.unlink()
+            create_sqlite_snapshot(path, snapshot_path)
+            sha256 = sha256_file(snapshot_path)
+        else:
+            sha256 = copy_prefix_with_sha256(path, snapshot_path, stat.st_size)
+            os.chmod(snapshot_path, 0o600)
         snapshot_size = snapshot_path.stat().st_size
         relative_path = _safe_relative(path, home)
         source = _source_for_path(path, home) or "other"
@@ -325,9 +407,11 @@ def discover_raw_paths(home: Path, *, include_codex_db: bool = True) -> Iterator
             yield from sorted(path for path in root.rglob("*.jsonl") if path.is_file())
 
     if include_codex_db:
-        for path in sorted((home / ".codex").glob("logs_2.sqlite*")):
-            if path.is_file():
-                yield path
+        path = home / ".codex" / "logs_2.sqlite"
+        if path.is_file():
+            # WAL and SHM are deliberately excluded. snapshot_candidate()
+            # folds committed WAL pages into one verified SQLite database.
+            yield path
 
 
 def plan_backup(
@@ -338,7 +422,11 @@ def plan_backup(
 ) -> BackupPlan:
     candidates: list[RawFileCandidate] = []
     for path in discover_raw_paths(home, include_codex_db=include_codex_db):
-        candidates.append(build_candidate(path, home=home))
+        if _raw_suffix(path) == ".sqlite":
+            with snapshot_candidate(path, home=home) as candidate:
+                candidates.append(replace(candidate, upload_path=None))
+        else:
+            candidates.append(build_candidate(path, home=home))
         if limit is not None and len(candidates) >= limit:
             break
     return BackupPlan(candidates=candidates)
@@ -1202,7 +1290,7 @@ def push_backup(
         if limit is not None and index >= limit:
             break
         try:
-            if missing_only:
+            if missing_only and _raw_suffix(path) != ".sqlite":
                 probe = build_candidate(path, home=home)
                 if probe.sha256 in existing_sha256s:
                     skipped_existing += 1

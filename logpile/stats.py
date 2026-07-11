@@ -5,7 +5,7 @@ from __future__ import annotations
 import calendar
 import sqlite3
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime
 
 
 BEHAVIORAL_PATTERNS = (
@@ -348,17 +348,33 @@ def compute_by_period(
         params,
     ).fetchall()
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now().date()
+
+    def _range_date(value: str | None) -> date | None:
+        if not value:
+            return None
+        try:
+            return date.fromisoformat(value[:10])
+        except (TypeError, ValueError):
+            return None
+
+    since_date = _range_date(since)
+    until_date = _range_date(until)
 
     result = []
     for row in rows:
         month_str = row["month"]  # "YYYY-MM"
         try:
             year, month = int(month_str[:4]), int(month_str[5:7])
-            cal_days = calendar.monthrange(year, month)[1]
-            # For the current month, use days elapsed so far
-            if month_str == today[:7]:
-                cal_days = int(today[8:10])
+            month_start = date(year, month, 1)
+            month_end = date(year, month, calendar.monthrange(year, month)[1])
+            # Never project a current-month rate over days that have not
+            # happened yet, even when --until is in the future.
+            if month_start.year == today.year and month_start.month == today.month:
+                month_end = min(month_end, today)
+            included_start = max(month_start, since_date or month_start)
+            included_end = min(month_end, until_date or month_end)
+            cal_days = (included_end - included_start).days + 1
         except (ValueError, IndexError):
             cal_days = 30
         days = max(cal_days, 1)

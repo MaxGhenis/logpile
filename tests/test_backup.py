@@ -1,5 +1,7 @@
 import hashlib
 import json
+import os
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -9,6 +11,8 @@ from logpile.backup import (
     R2Config,
     SUPABASE_SCHEMA_SQL,
     build_candidate,
+    create_sqlite_snapshot,
+    discover_raw_paths,
     infer_jsonl_source,
     iter_text_chunks,
     plan_backup,
@@ -48,7 +52,8 @@ class BackupTests(unittest.TestCase):
             )
             codex_db = home / ".codex" / "logs_2.sqlite"
             codex_db.parent.mkdir(parents=True, exist_ok=True)
-            codex_db.write_bytes(b"sqlite bytes")
+            with sqlite3.connect(codex_db) as conn:
+                conn.execute("CREATE TABLE events (id INTEGER PRIMARY KEY)")
 
             plan = plan_backup(home=home)
 
@@ -59,6 +64,74 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(plan.source_counts["codex_db"], 1)
             self.assertTrue(all(len(candidate.sha256) == 64 for candidate in plan.candidates))
             self.assertTrue(all(candidate.object_key.startswith("raw/sha256/") for candidate in plan.candidates))
+
+    def test_sqlite_snapshot_includes_committed_wal_and_excludes_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            source = home / ".codex" / "logs_2.sqlite"
+            source.parent.mkdir(parents=True)
+            writer = sqlite3.connect(source)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE events (value TEXT)")
+                writer.commit()
+                writer.execute("INSERT INTO events VALUES ('committed in wal')")
+                writer.commit()
+                self.assertTrue(Path(f"{source}-wal").exists())
+
+                paths = list(discover_raw_paths(home, include_codex_db=True))
+                self.assertEqual(paths, [source])
+
+                with snapshot_candidate(source, home=home) as candidate:
+                    with sqlite3.connect(candidate.payload_path) as snapshot:
+                        values = snapshot.execute("SELECT value FROM events").fetchall()
+                        check = snapshot.execute("PRAGMA quick_check").fetchone()[0]
+            finally:
+                writer.close()
+
+        self.assertEqual(values, [("committed in wal",)])
+        self.assertEqual(check, "ok")
+
+    def test_create_sqlite_snapshot_atomically_replaces_verified_output(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "source.db"
+            destination = root / "backup.db"
+            destination.write_bytes(b"old incomplete backup")
+            with sqlite3.connect(source) as conn:
+                conn.execute("CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT)")
+                conn.execute("INSERT INTO settings VALUES ('visibility', 'private')")
+
+            previous_umask = os.umask(0o022)
+            try:
+                result = create_sqlite_snapshot(source, destination)
+            finally:
+                os.umask(previous_umask)
+
+            with sqlite3.connect(destination) as conn:
+                row = conn.execute("SELECT value FROM settings WHERE name = 'visibility'").fetchone()
+                check = conn.execute("PRAGMA quick_check").fetchone()[0]
+            destination_mode = destination.stat().st_mode & 0o777
+
+        self.assertEqual(result, destination)
+        self.assertEqual(row, ("private",))
+        self.assertEqual(check, "ok")
+        self.assertEqual(destination_mode, 0o600)
+
+    def test_failed_sqlite_snapshot_leaves_existing_output_intact(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "corrupt.db"
+            destination = root / "last-good.db"
+            source.write_bytes(b"not a sqlite database")
+            destination.write_bytes(b"last known good backup")
+
+            with self.assertRaisesRegex(RuntimeError, "Could not snapshot SQLite"):
+                create_sqlite_snapshot(source, destination)
+
+            self.assertEqual(destination.read_bytes(), b"last known good backup")
+            self.assertEqual(list(root.glob(".last-good.db.*.tmp")), [])
 
     def test_snapshot_candidate_reads_from_stable_payload_when_source_grows(self) -> None:
         with tempfile.TemporaryDirectory() as td:

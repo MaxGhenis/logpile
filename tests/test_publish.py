@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from logpile.cli import cli
 import logpile.db as db_module
 from logpile.db import ensure_user, init_db, set_session_visibility, update_user
+from logpile.publish import preserve_reviewed_artifact, review_publish_session
 from logpile.sync import sync_sessions
 
 
@@ -470,7 +471,10 @@ class PublishTests(unittest.TestCase):
 
             self.assertEqual(row["visibility"], "private")
             self.assertEqual(row["visibility_source"], "default")
-            self.assertEqual(row["shared_path"], "")
+            private_archive = Path(row["shared_path"])
+            self.assertTrue(private_archive.exists())
+            self.assertFalse(private_archive.is_relative_to(shared))
+            self.assertEqual(private_archive.stat().st_mode & 0o777, 0o600)
             self.assertFalse((shared / "alice" / "claudecode" / "demo" / "session-1.jsonl").exists())
 
     def test_review_does_not_flag_local_home_paths_from_metadata_alone(self) -> None:
@@ -614,6 +618,66 @@ class PublishTests(unittest.TestCase):
             shared_path = shared / "alice" / "claudecode" / "demo" / "session-1.jsonl"
             self.assertTrue(shared_path.exists())
             self.assertNotIn("sk-ant-", shared_path.read_text(encoding="utf-8"))
+
+    def test_preserve_reviewed_artifact_rejects_shared_symlink_without_touching_source(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+            with open_sqlite(db_path) as conn:
+                update_user(conn, "alice", default_session_visibility="unlisted")
+                conn.commit()
+            source = self._write_session(home, body="reviewed bytes")
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            with open_sqlite(db_path) as conn:
+                review = review_publish_session(conn, "session-1")
+                assert review is not None
+                shared_path = Path(
+                    conn.execute(
+                        "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
+                    ).fetchone()[0]
+                )
+                shared_path.unlink()
+                shared_path.symlink_to(source)
+                source.write_text('{"newer": "source bytes"}\n', encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, "symlinked artifact"):
+                    preserve_reviewed_artifact(
+                        conn, review, shared_dir=shared
+                    )
+
+            self.assertEqual(source.read_text(encoding="utf-8"), '{"newer": "source bytes"}\n')
+            self.assertTrue(shared_path.is_symlink())
+
+    def test_preserve_reviewed_artifact_rejects_non_directory_shared_root_without_chmod(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_db(db_path)
+            with open_sqlite(db_path) as conn:
+                update_user(conn, "alice", default_session_visibility="unlisted")
+                conn.commit()
+            self._write_session(home, body="reviewed bytes")
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            with open_sqlite(db_path) as conn:
+                review = review_publish_session(conn, "session-1")
+                assert review is not None
+                moved = root / "original-shared"
+                shared.rename(moved)
+                shared.write_text("not a directory", encoding="utf-8")
+                shared.chmod(0o600)
+
+                with self.assertRaisesRegex(ValueError, "not a directory"):
+                    preserve_reviewed_artifact(conn, review, shared_dir=shared)
+
+            self.assertEqual(shared.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(shared.read_text(encoding="utf-8"), "not a directory")
 
     def test_approve_keeps_reviewed_source_artifact_on_first_publish(self) -> None:
         with tempfile.TemporaryDirectory() as td:

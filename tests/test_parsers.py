@@ -5,6 +5,10 @@ from unittest import mock
 from pathlib import Path
 
 from logpile.parsers import (
+    JsonlLoadStats,
+    PrivateSessionMarker,
+    _day_of,
+    _load_jsonl,
     _normalize_session_path,
     file_hash,
     parse_claudecode_session,
@@ -19,6 +23,280 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
         for record in records:
             fh.write(json.dumps(record))
             fh.write("\n")
+
+
+class JsonlLoadingTests(unittest.TestCase):
+    def test_loader_keeps_only_objects_and_counts_malformed_types(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "mixed.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "valid", "id": 1}),
+                        "null",
+                        json.dumps(["not", "an", "object"]),
+                        json.dumps("text"),
+                        json.dumps({"type": "assistant", "message": []}),
+                        "{invalid json",
+                        json.dumps({"type": "valid", "id": 2}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stats = JsonlLoadStats()
+
+            records = _load_jsonl(path, stats=stats)
+
+        self.assertEqual([record["id"] for record in records], [1, 2])
+        self.assertEqual(stats.invalid_json_lines, 1)
+        self.assertEqual(
+            stats.malformed_record_types,
+            {"null": 1, "array": 1, "string": 1},
+        )
+        self.assertEqual(stats.malformed_fields, {"message:array": 1})
+        self.assertEqual(stats.malformed_record_count, 5)
+
+    def test_loader_contains_unexpected_exception_to_one_record(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "exception.jsonl"
+            path.write_text(
+                '{"id": 1}\n{"explode": true}\n{"id": 2}\n',
+                encoding="utf-8",
+            )
+            stats = JsonlLoadStats()
+            real_loads = json.loads
+
+            def flaky_loads(line: str):
+                if "explode" in line:
+                    raise RuntimeError("one bad record")
+                return real_loads(line)
+
+            with mock.patch("logpile.parsers.json.loads", side_effect=flaky_loads):
+                records = _load_jsonl(path, stats=stats)
+
+        self.assertEqual([record["id"] for record in records], [1, 2])
+        self.assertEqual(stats.record_exceptions, {"RuntimeError": 1})
+
+    def test_loader_discards_partial_records_after_midstream_io_error(self) -> None:
+        class FailingReader:
+            def __init__(self) -> None:
+                self._lines = iter(['{"type": "user", "message": {"content": "partial"}}\n'])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                try:
+                    return next(self._lines)
+                except StopIteration:
+                    raise OSError("transcript rotated during read")
+
+        stats = JsonlLoadStats()
+        with mock.patch("builtins.open", return_value=FailingReader()):
+            records = _load_jsonl(Path("rotating.jsonl"), stats=stats)
+
+        self.assertEqual(records, [])
+        self.assertEqual(stats.io_errors, 1)
+
+        with mock.patch("builtins.open", return_value=FailingReader()):
+            self.assertIsNone(parse_claudecode_session(Path("rotating.jsonl")))
+
+    def test_claude_parser_skips_non_string_tool_name_and_continues(self) -> None:
+        records = [
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-01T10:00:00Z",
+                "message": {
+                    "id": "malformed-tool",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": ["Edit"],
+                            "input": {"file_path": "bad.py"},
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-01T10:00:01Z",
+                "message": {
+                    "id": "valid-tool",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Edit",
+                            "id": "call-1",
+                            "input": {"file_path": "good.py"},
+                        }
+                    ],
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "claude-tool-name.jsonl"
+            write_jsonl(path, records)
+            stats = JsonlLoadStats()
+
+            loaded = _load_jsonl(path, stats=stats)
+            info = parse_claudecode_session(path)
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(stats.malformed_fields, {"message.content.name:array": 1})
+        self.assertIsNotNone(info)
+        assert info is not None
+        self.assertEqual([call.tool_name for call in info.tool_calls], ["Edit"])
+
+    def test_codex_parser_skips_non_string_tool_name_and_continues(self) -> None:
+        records = [
+            {
+                "timestamp": "2026-07-01T10:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "codex-tool-name", "cwd": "/tmp/project"},
+            },
+            {
+                "timestamp": "2026-07-01T10:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": {"bad": "exec_command"},
+                    "arguments": "{}",
+                },
+            },
+            {
+                "timestamp": "2026-07-01T10:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call-1",
+                    "arguments": json.dumps({"cmd": "ls"}),
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "codex-tool-name.jsonl"
+            write_jsonl(path, records)
+            stats = JsonlLoadStats()
+
+            loaded = _load_jsonl(path, stats=stats)
+            info = parse_codex_session(path)
+
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(stats.malformed_fields, {"payload.name:object": 1})
+        self.assertIsNotNone(info)
+        assert info is not None
+        self.assertEqual([call.tool_name for call in info.tool_calls], ["exec_command"])
+
+    def test_loader_rejects_downstream_bound_non_scalar_fields(self) -> None:
+        records = [
+            {
+                "type": "user",
+                "timestamp": "2026-07-01T10:00:00Z",
+                "cwd": ["bad"],
+                "message": {"content": "unsafe workspace"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-01T10:00:01Z",
+                "message": {
+                    "id": "bad-model",
+                    "model": {"bad": 1},
+                    "content": [],
+                },
+            },
+            {
+                "type": "turn_context",
+                "timestamp": "2026-07-01T10:00:02Z",
+                "payload": {"model": ["bad"]},
+            },
+            {
+                "type": "session_meta",
+                "timestamp": "2026-07-01T10:00:03Z",
+                "payload": {
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {"parent_thread_id": {"bad": 1}}
+                        }
+                    }
+                },
+            },
+            {
+                "type": "user",
+                "timestamp": "2026-07-01T10:00:04Z",
+                "cwd": "/tmp/good",
+                "message": {"content": "valid later record"},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "bound-fields.jsonl"
+            write_jsonl(path, records)
+            stats = JsonlLoadStats()
+
+            loaded = _load_jsonl(path, stats=stats)
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(
+            stats.malformed_fields,
+            {
+                "cwd:array": 1,
+                "message.model:object": 1,
+                "payload.model:array": 1,
+                "payload.source.subagent.thread_spawn.parent_thread_id:object": 1,
+            },
+        )
+
+    def test_parser_skips_malformed_dict_fields_and_continues(self) -> None:
+        records = [
+            {
+                "type": "user",
+                "timestamp": "2026-07-01T10:00:00Z",
+                "message": {"content": "valid question"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-01T10:00:01Z",
+                "message": [],
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-07-01T10:00:02Z",
+                "message": {
+                    "id": "valid-answer",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                    "content": [{"type": "text", "text": "valid answer"}],
+                },
+            },
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "malformed-field.jsonl"
+            write_jsonl(path, records)
+
+            info = parse_claudecode_session(path)
+
+        self.assertIsNotNone(info)
+        assert info is not None
+        self.assertEqual(info.user_message_count, 1)
+        self.assertEqual(info.assistant_message_count, 1)
+        self.assertEqual(info.total_output_tokens, 5)
+
+
+class UtcDayTests(unittest.TestCase):
+    def test_offset_timestamp_is_bucketed_by_utc_day(self) -> None:
+        self.assertEqual(_day_of("2026-07-01T00:30:00+02:00"), "2026-06-30")
+        self.assertEqual(_day_of("2026-06-30T21:30:00-03:00"), "2026-07-01")
+
+    def test_malformed_timestamp_is_rejected(self) -> None:
+        self.assertIsNone(_day_of("2026-02-30T12:00:00Z"))
+        self.assertIsNone(_day_of("not-a-timestamp"))
+        self.assertIsNone(_day_of(None))
 
 
 class CodexParserTests(unittest.TestCase):
@@ -364,7 +642,7 @@ class CodexParserTests(unittest.TestCase):
             self.assertEqual(info.tool_calls[0].command, "ls")
             self.assertFalse(info.tool_calls[0].is_error)
 
-    def test_private_marker_skips_modern_codex_session(self) -> None:
+    def test_private_marker_returns_structured_modern_codex_result(self) -> None:
         records = [
             {
                 "timestamp": "2026-04-10T10:00:00Z",
@@ -385,7 +663,13 @@ class CodexParserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "private.jsonl"
             write_jsonl(path, records)
-            self.assertIsNone(parse_codex_session(path))
+            result = parse_codex_session(path)
+
+            self.assertIsInstance(result, PrivateSessionMarker)
+            assert isinstance(result, PrivateSessionMarker)
+            self.assertEqual(result.session_id, "private")
+            self.assertEqual(result.source, "codex")
+            self.assertEqual(result.marker, "logpile:private")
 
     def test_file_hash_reads_past_old_prefix_limit(self) -> None:
         prefix = b"a" * (600 * 1024)

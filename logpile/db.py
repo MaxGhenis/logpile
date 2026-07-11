@@ -1,4 +1,5 @@
 """SQLite database for the Logpile session index."""
+import os
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -665,26 +666,40 @@ def set_session_visibility(
     session_id = resolve_session_id(conn, session_id_prefix)
     if not session_id:
         return 0
-    cur = conn.execute(
-        """
-        UPDATE sessions
-        SET visibility = ?,
-            visibility_source = 'manual',
-            visibility_rule_id = NULL,
-            visibility_reason = 'manual override',
-            is_private = CASE WHEN ? = 'private' THEN 1 ELSE 0 END
-        WHERE session_id = ?
-        """,
-        (normalized, normalized, session_id),
-    )
-    if cur.rowcount:
-        from .sync import reconcile_session_storage
+    row = conn.execute(
+        "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    if normalized == "private":
+        from .sync import prepare_private_session_storage
 
-        reconcile_session_storage(
-            conn,
-            shared_dir=Path(shared_dir),
-            session_id=session_id,
+        transition = prepare_private_session_storage(row, shared_dir=Path(shared_dir))
+    else:
+        from .sync import prepare_shared_session_storage
+
+        transition = prepare_shared_session_storage(row, shared_dir=Path(shared_dir))
+    try:
+        cur = conn.execute(
+            """
+            UPDATE sessions
+            SET visibility = ?,
+                visibility_source = 'manual',
+                visibility_rule_id = NULL,
+                visibility_reason = 'manual override',
+                is_private = CASE WHEN ? = 'private' THEN 1 ELSE 0 END,
+                shared_path = ?
+            WHERE session_id = ?
+            """,
+            (
+                normalized,
+                normalized,
+                str(transition.archive_path),
+                session_id,
+            ),
         )
+    except BaseException:
+        transition.rollback()
+        raise
+    defer_storage_transition(conn, transition)
     return cur.rowcount
 
 
@@ -1579,21 +1594,172 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     conn.executescript(VIEWS)
 
 
+class _StorageTransactionConnection(sqlite3.Connection):
+    """SQLite connection that commits filesystem transitions with the DB.
+
+    A visibility change prepares reversible filesystem operations before it
+    updates SQLite.  Keeping those operations registered on the connection
+    means an explicit commit (including the periodic commits used by sync)
+    finalizes them only after SQLite has durably committed, while any rollback
+    restores the previous storage layout.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._storage_transitions: list[object] = []
+
+    def defer_storage_transition(self, transition: object) -> None:
+        self._storage_transitions.append(transition)
+
+    def _take_storage_transitions(self) -> list[object]:
+        transitions = self._storage_transitions
+        self._storage_transitions = []
+        return transitions
+
+    @staticmethod
+    def _finish_storage_transitions(
+        transitions: list[object], method: str, *, reverse: bool = False
+    ) -> None:
+        first_error: BaseException | None = None
+        ordered = reversed(transitions) if reverse else transitions
+        for transition in ordered:
+            try:
+                getattr(transition, method)()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
+
+    def _commit_database(self) -> None:
+        """Separate seam for deterministic commit-failure tests."""
+        super().commit()
+
+    def commit(self) -> None:
+        try:
+            self._commit_database()
+        except BaseException:
+            transitions = self._take_storage_transitions()
+            try:
+                super().rollback()
+            finally:
+                self._finish_storage_transitions(
+                    transitions, "rollback", reverse=True
+                )
+            raise
+
+        transitions = self._take_storage_transitions()
+        self._finish_storage_transitions(transitions, "commit")
+
+    def rollback(self) -> None:
+        transitions = self._take_storage_transitions()
+        try:
+            super().rollback()
+        finally:
+            self._finish_storage_transitions(
+                transitions, "rollback", reverse=True
+            )
+
+
+def defer_storage_transitions(
+    conn: sqlite3.Connection, transitions: list[object]
+) -> None:
+    """Bind reversible filesystem transitions to one SQLite commit.
+
+    Logpile's managed connections defer cleanup until their next durable
+    commit. A raw sqlite3 connection cannot expose commit hooks, so commit the
+    complete prepared batch here before finalizing any filesystem cleanup.
+    """
+    if not transitions:
+        return
+    defer = getattr(conn, "defer_storage_transition", None)
+    if defer is not None:
+        for transition in transitions:
+            defer(transition)
+        return
+
+    try:
+        conn.commit()
+    except BaseException:
+        try:
+            conn.rollback()
+        finally:
+            first_error: BaseException | None = None
+            for transition in reversed(transitions):
+                try:
+                    transition.rollback()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+        raise
+    for transition in transitions:
+        transition.commit()
+
+
+def defer_storage_transition(conn: sqlite3.Connection, transition: object) -> None:
+    """Bind one reversible filesystem transition to a SQLite transaction."""
+    defer_storage_transitions(conn, [transition])
+
+
 @contextmanager
 def get_db(db_path: Path):
-    conn = sqlite3.connect(db_path)
+    db_path = Path(db_path)
+    if not db_path.exists():
+        try:
+            fd = os.open(db_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(fd)
+    os.chmod(db_path, 0o600)
+    conn = sqlite3.connect(db_path, factory=_StorageTransactionConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+
+    def harden_database_files() -> None:
+        for path in (
+            db_path,
+            Path(f"{db_path}-wal"),
+            Path(f"{db_path}-shm"),
+        ):
+            if path.exists() and not path.is_symlink():
+                path.chmod(0o600)
+
+    harden_database_files()
     try:
         yield conn
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
         conn.commit()
     finally:
+        harden_database_files()
         conn.close()
+        harden_database_files()
 
 
 def init_db(db_path: Path):
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path = Path(db_path)
+    if not db_path.parent.exists():
+        missing: list[Path] = []
+        cursor = db_path.parent
+        while not cursor.exists():
+            missing.append(cursor)
+            cursor = cursor.parent
+        for directory in reversed(missing):
+            directory.mkdir(mode=0o700)
+    unsafe_shared_parents = {
+        Path("/"),
+        Path("/tmp"),
+        Path("/private/tmp"),
+        Path.home(),
+    }
+    if db_path.parent not in unsafe_shared_parents and not db_path.parent.is_symlink():
+        db_path.parent.chmod(0o700)
     with get_db(db_path) as conn:
         migrate_db(conn)
 

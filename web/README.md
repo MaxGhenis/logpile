@@ -7,9 +7,9 @@ Next.js 16 + Tailwind 4 + better-sqlite3. This is the product surface for Logpil
 The canonical way is from the product root, which handles the `bun install` bootstrap and env-var wiring:
 
 ```bash
-logpile serve             # production build, port 5002
-logpile serve --dev       # Next.js dev server with HMR
-logpile serve --public    # public read-only mode
+./logpile.sh serve             # production build, port 5002
+./logpile.sh serve --dev       # Next.js dev server with HMR
+./logpile.sh serve --public    # public read-only mode
 ```
 
 Direct `bun dev` works too if the env vars are set:

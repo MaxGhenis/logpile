@@ -72,7 +72,7 @@ def build() -> None:
 
     stats_line = (
         f"{ov['sessions']:,} sessions · {fmt_b(ov['out_tokens'])} output tokens · "
-        f"{ov['repos']:,} repo checkouts — the author's index, as of {today}."
+        f"{ov['repos']:,} repos — the author's index, as of {today}."
     )
 
     page = f"""<!doctype html>

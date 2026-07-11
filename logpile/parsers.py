@@ -1,11 +1,16 @@
 """Parse Claude Code and Codex JSONL session files."""
 import hashlib
 import json
+import logging
 import re
 import shlex
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -108,6 +113,61 @@ class SessionInfo:
     message_usage: list = field(default_factory=list)  # MessageUsage, claudecode only
 
 
+@dataclass(frozen=True)
+class PrivateSessionMarker:
+    """A valid transcript that explicitly opts out of shared indexing."""
+
+    session_id: str
+    source: str
+    marker: str
+
+
+@dataclass
+class JsonlLoadStats:
+    """Structured counts for records skipped while loading one JSONL file."""
+
+    invalid_json_lines: int = 0
+    malformed_record_types: dict[str, int] = field(default_factory=dict)
+    malformed_fields: dict[str, int] = field(default_factory=dict)
+    record_exceptions: dict[str, int] = field(default_factory=dict)
+    io_errors: int = 0
+
+    @property
+    def malformed_record_count(self) -> int:
+        return (
+            self.invalid_json_lines
+            + sum(self.malformed_record_types.values())
+            + sum(self.malformed_fields.values())
+            + sum(self.record_exceptions.values())
+        )
+
+    def count_record_type(self, value: Any) -> None:
+        record_type = _json_type_name(value)
+        self.malformed_record_types[record_type] = (
+            self.malformed_record_types.get(record_type, 0) + 1
+        )
+
+    def count_exception(self, exc: Exception) -> None:
+        exception_type = type(exc).__name__
+        self.record_exceptions[exception_type] = (
+            self.record_exceptions.get(exception_type, 0) + 1
+        )
+
+    def count_malformed_field(self, field_name: str, value: Any) -> None:
+        key = f"{field_name}:{_json_type_name(value)}"
+        self.malformed_fields[key] = self.malformed_fields.get(key, 0) + 1
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "invalid_json_lines": self.invalid_json_lines,
+            "malformed_record_types": dict(self.malformed_record_types),
+            "malformed_fields": dict(self.malformed_fields),
+            "record_exceptions": dict(self.record_exceptions),
+            "io_errors": self.io_errors,
+            "malformed_record_count": self.malformed_record_count,
+        }
+
+
 _USER_CONTEXT_PREAMBLE_RE = re.compile(
     r"#\s*Context from my IDE setup:.*?## My request for Codex:\n",
     flags=re.DOTALL,
@@ -158,6 +218,189 @@ _COMMON_FILE_NAMES = {
 _SHELL_CONTROL_TOKENS = {"&&", "||", "|", ";", ">", ">>", "<", "2>", "2>>", "1>", "1>>"}
 
 
+def _json_type_name(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def _malformed_record_field(record: dict) -> tuple[str, Any] | None:
+    """Return the first field shape that would make a parser record unsafe."""
+    for field_name in ("type", "record_type", "timestamp"):
+        value = record.get(field_name)
+        if field_name in record and not isinstance(value, str):
+            return field_name, value
+    cwd = record.get("cwd")
+    if "cwd" in record and cwd is not None and not isinstance(cwd, str):
+        return "cwd", cwd
+    record_id = record.get("id")
+    if "id" in record and record_id is not None and not isinstance(
+        record_id, (str, int)
+    ):
+        return "id", record_id
+    for field_name in ("message", "payload"):
+        value = record.get(field_name)
+        if field_name in record and not isinstance(value, dict):
+            return field_name, value
+
+    message = record.get("message")
+    if isinstance(message, dict):
+        message_id = message.get("id")
+        if "id" in message and not isinstance(message_id, (str, int)):
+            return "message.id", message_id
+        content = message.get("content")
+        if "content" in message and not isinstance(content, (str, list, dict)):
+            return "message.content", content
+        usage = message.get("usage")
+        if "usage" in message and not isinstance(usage, dict):
+            return "message.usage", usage
+        if isinstance(usage, dict):
+            for key in (
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "output_tokens",
+            ):
+                value = usage.get(key)
+                if value is None:
+                    continue
+                try:
+                    int(value)
+                except (TypeError, ValueError, OverflowError):
+                    return f"message.usage.{key}", value
+            cache_creation = usage.get("cache_creation")
+            if isinstance(cache_creation, dict):
+                for key in (
+                    "ephemeral_5m_input_tokens",
+                    "ephemeral_1h_input_tokens",
+                ):
+                    value = cache_creation.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        int(value)
+                    except (TypeError, ValueError, OverflowError):
+                        return f"message.usage.cache_creation.{key}", value
+        message_model = message.get("model")
+        if (
+            "model" in message
+            and message_model is not None
+            and not isinstance(message_model, str)
+        ):
+            return "message.model", message_model
+
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                if "type" in block and not isinstance(block_type, str):
+                    return "message.content.type", block_type
+                for key in ("id", "tool_use_id"):
+                    value = block.get(key)
+                    if key in block and not isinstance(value, (str, int)):
+                        return f"message.content.{key}", value
+                if block_type == "tool_use":
+                    tool_name = block.get("name")
+                    if "name" in block and not isinstance(tool_name, str):
+                        return "message.content.name", tool_name
+
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        payload_type = payload.get("type")
+        if "type" in payload and not isinstance(payload_type, str):
+            return "payload.type", payload_type
+        for key in ("id", "call_id"):
+            value = payload.get(key)
+            if key in payload and not isinstance(value, (str, int)):
+                return f"payload.{key}", value
+        content = payload.get("content")
+        if "content" in payload and not isinstance(content, (str, list, dict)):
+            return "payload.content", content
+        for key in ("cwd", "model", "timestamp"):
+            value = payload.get(key)
+            if key in payload and value is not None and not isinstance(value, str):
+                return f"payload.{key}", value
+
+        source = payload.get("source")
+        if isinstance(source, dict):
+            subagent = source.get("subagent")
+            if isinstance(subagent, dict):
+                thread_spawn = subagent.get("thread_spawn")
+                if isinstance(thread_spawn, dict):
+                    parent_thread_id = thread_spawn.get("parent_thread_id")
+                    if (
+                        "parent_thread_id" in thread_spawn
+                        and parent_thread_id is not None
+                        and not isinstance(parent_thread_id, (str, int))
+                    ):
+                        return (
+                            "payload.source.subagent.thread_spawn.parent_thread_id",
+                            parent_thread_id,
+                        )
+                    depth = thread_spawn.get("depth")
+                    if depth is not None:
+                        try:
+                            int(depth)
+                        except (TypeError, ValueError, OverflowError):
+                            return "payload.source.subagent.thread_spawn.depth", depth
+
+    if isinstance(payload, dict) and payload.get("type") == "token_count":
+        info = payload.get("info")
+        if "info" in payload and not isinstance(info, dict):
+            return "payload.info", info
+        if isinstance(info, dict):
+            totals = info.get("total_token_usage")
+            if "total_token_usage" in info and not isinstance(totals, dict):
+                return "payload.info.total_token_usage", totals
+            if isinstance(totals, dict):
+                for key in (
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "output_tokens",
+                    "reasoning_output_tokens",
+                ):
+                    value = totals.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        int(value)
+                    except (TypeError, ValueError, OverflowError):
+                        return f"payload.info.total_token_usage.{key}", value
+
+    # Codex function calls occur both as legacy top-level records and as
+    # response_item payloads.  _infer_operation calls .lower() on this value,
+    # so reject a malformed tool name here instead of letting one record abort
+    # parsing the rest of the transcript (or later files in a sync).
+    record_type = record.get("type", record.get("record_type", ""))
+    function_call = None
+    field_prefix = ""
+    if record_type == "function_call":
+        function_call = record
+    elif (
+        record_type == "response_item"
+        and isinstance(payload, dict)
+        and payload.get("type") == "function_call"
+    ):
+        function_call = payload
+        field_prefix = "payload."
+    if function_call is not None:
+        tool_name = function_call.get("name")
+        if "name" in function_call and not isinstance(tool_name, str):
+            return f"{field_prefix}name", tool_name
+    return None
+
+
 def _extract_text(content: Any) -> str:
     """Extract plain text from content (string or list of blocks)."""
     if isinstance(content, str):
@@ -179,8 +422,14 @@ def _extract_text(content: Any) -> str:
     return ""
 
 
-def _load_jsonl(path: Path) -> list:
-    records = []
+def _load_jsonl(
+    path: Path,
+    *,
+    stats: JsonlLoadStats | None = None,
+) -> list[dict]:
+    """Load object records and isolate malformed lines from the rest of a file."""
+    load_stats = stats if stats is not None else JsonlLoadStats()
+    records: list[dict] = []
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -188,11 +437,42 @@ def _load_jsonl(path: Path) -> list:
                 if not line:
                     continue
                 try:
-                    records.append(json.loads(line))
+                    record = json.loads(line)
                 except json.JSONDecodeError:
+                    load_stats.invalid_json_lines += 1
                     continue
-    except OSError:
-        pass
+                except Exception as exc:
+                    # A pathological record (for example excessive nesting)
+                    # must not discard the valid records around it.
+                    load_stats.count_exception(exc)
+                    continue
+                if not isinstance(record, dict):
+                    load_stats.count_record_type(record)
+                    continue
+                try:
+                    malformed_field = _malformed_record_field(record)
+                except Exception as exc:
+                    load_stats.count_exception(exc)
+                    continue
+                if malformed_field is not None:
+                    load_stats.count_malformed_field(*malformed_field)
+                    continue
+                records.append(record)
+    except OSError as exc:
+        load_stats.io_errors += 1
+        # A read that fails after yielding records is not a valid snapshot.
+        # Discard the partial load so callers cannot commit a truncated
+        # SessionInfo while a live transcript is being rotated or rewritten.
+        records.clear()
+        logger.warning("Could not read JSONL file %s: %s", path, exc)
+
+    if load_stats.malformed_record_count:
+        logger.warning(
+            "Skipped %d malformed JSONL record(s) in %s: %s",
+            load_stats.malformed_record_count,
+            path,
+            load_stats.as_dict(),
+        )
     return records
 
 
@@ -242,9 +522,18 @@ def _extract_codex_token_totals(record_type: str, payload: dict) -> tuple[int, i
 
 
 def _day_of(timestamp: Optional[str]) -> Optional[str]:
-    if not timestamp or len(timestamp) < 10:
+    if not isinstance(timestamp, str) or not timestamp.strip():
         return None
-    return timestamp[:10]
+    value = timestamp.strip()
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).date().isoformat()
 
 
 def _daily_bucket(daily: dict, timestamp: Optional[str]) -> Optional[DailyUsage]:
@@ -579,8 +868,8 @@ def _extract_codex_project(records: list[dict]) -> str:
     return "unknown"
 
 
-def _is_private(records: list) -> bool:
-    """Check if a session contains a privacy marker."""
+def _private_marker(records: list) -> str | None:
+    """Return the first explicit privacy marker in a session, if present."""
     for record in records:
         record_type, payload, _ = _normalize_codex_record(record)
         texts = []
@@ -596,18 +885,20 @@ def _is_private(records: list) -> bool:
             texts.append(_extract_text(payload.get(key)))
             texts.append(_extract_text(record.get(key)))
 
-        if any(marker in text for marker in _PRIVATE_MARKERS for text in texts if text):
-            return True
-    return False
+        for marker in _PRIVATE_MARKERS:
+            if any(marker in text for text in texts if text):
+                return marker
+    return None
 
 
-def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
+def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessionMarker]:
     """Parse a Claude Code JSONL file and return a SessionInfo."""
     records = _load_jsonl(path)
     if not records:
         return None
-    if _is_private(records):
-        return None
+    private_marker = _private_marker(records)
+    if private_marker:
+        return PrivateSessionMarker(path.stem, "claudecode", private_marker)
 
     session_id = path.stem
 
@@ -696,7 +987,7 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
                 cw1 = int(breakdown.get("ephemeral_1h_input_tokens", 0) or 0)
             if cw5 + cw1 == 0:
                 cw5 = cache_creation  # no breakdown -> assume 5m
-            out = usage.get("output_tokens", 0)
+            out = int(usage.get("output_tokens", 0) or 0)
             mdl = msg.get("model")
 
             if msg_id:
@@ -822,13 +1113,14 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
     )
 
 
-def parse_codex_session(path: Path) -> Optional[SessionInfo]:
+def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMarker]:
     """Parse a Codex JSONL file and return a SessionInfo."""
     records = _load_jsonl(path)
     if not records:
         return None
-    if _is_private(records):
-        return None
+    private_marker = _private_marker(records)
+    if private_marker:
+        return PrivateSessionMarker(path.stem, "codex", private_marker)
 
     first_rec = records[0]
     session_id = first_rec.get("id") or path.stem

@@ -1,5 +1,6 @@
 """Click CLI for Logpile."""
 import json
+import ipaddress
 import os
 import socket
 from pathlib import Path
@@ -31,6 +32,17 @@ DEFAULT_ROOT = _default_root()
 DEFAULT_SHARED = DEFAULT_ROOT / "shared"
 DEFAULT_DB = _default_db(DEFAULT_ROOT)
 BACKEND_CHOICES = ["auto", "local", "cloud"]
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return whether a bind host is explicitly limited to loopback."""
+    normalized = host.strip().lower()
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 def _backend_default() -> str:
@@ -222,21 +234,35 @@ def _prepare_db(db: str | Path) -> Path:
 
 
 def _resolve_sync_username(db: str | Path, requested_username: str | None) -> str:
-    from .db import get_db, normalize_username
+    from .db import normalize_username
 
     explicit = requested_username or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
-    normalized = normalize_username(explicit)
-    db_path = _prepare_db(db)
-    with get_db(db_path) as conn:
-        rows = conn.execute("SELECT username FROM users ORDER BY updated_at DESC, username").fetchall()
-    if requested_username is None and len(rows) == 1:
-        return rows[0]["username"]
-    return normalized
+    return normalize_username(explicit)
 
 
 @click.group()
 def cli():
     """Logpile — searchable Claude Code and Codex session logs."""
+
+
+@cli.command(name="db-backup")
+@click.argument("output", type=click.Path(path_type=Path, dir_okay=False))
+@click.option(
+    "--db",
+    default=str(DEFAULT_DB),
+    show_default=True,
+    type=click.Path(path_type=Path, dir_okay=False),
+    help="Live Logpile SQLite database to snapshot.",
+)
+def db_backup(output: Path, db: Path):
+    """Create a verified point-in-time SQLite backup at OUTPUT."""
+    from .backup import create_sqlite_snapshot
+
+    try:
+        destination = create_sqlite_snapshot(db, output)
+    except (OSError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"Verified SQLite backup: {destination}")
 
 
 @cli.command(name="status")
@@ -485,19 +511,25 @@ def sync(
 ):
     """Index local sessions, upload raw logs to cloud storage, or both."""
     if backend in {"local", "both"}:
-        from .sync import sync_sessions
+        from .sync import SyncLockError, SyncStatus, sync_sessions
 
         username = _resolve_sync_username(db, username)
         machine = machine or socket.gethostname()
         click.echo(f"Syncing local sessions for {username}@{machine}…")
-        new, updated, skipped = sync_sessions(
-            shared_dir=Path(shared),
-            db_path=Path(db),
-            username=username,
-            machine=machine,
-            home=Path.home(),
-            verbose=verbose,
-        )
+        try:
+            local_result = sync_sessions(
+                shared_dir=Path(shared),
+                db_path=Path(db),
+                username=username,
+                machine=machine,
+                home=Path.home(),
+                verbose=verbose,
+            )
+        except SyncLockError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if local_result.status == SyncStatus.LOCK_CONTENDED:
+            raise click.exceptions.Exit(75)
+        new, updated, skipped = local_result
         click.echo(f"Local done: {new} new, {updated} updated, {skipped} unchanged/skipped")
 
     if backend in {"cloud", "both"}:
@@ -529,20 +561,31 @@ def sync(
 @cli.command()
 @click.option("--shared", default=str(DEFAULT_SHARED), show_default=True)
 @click.option("--db", default=str(DEFAULT_DB), show_default=True)
-@click.option("--host", default="0.0.0.0", show_default=True)
+@click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=5002, show_default=True, type=int)
 @click.option("--public", is_flag=True,
               help="Serve a public read-only view (no auth required). "
                    "Private/redacted sessions are still hidden.")
+@click.option(
+    "--unsafe-network",
+    is_flag=True,
+    help="Allow unauthenticated private mode to bind beyond loopback.",
+)
 @click.option("--dev", is_flag=True, help="Run Next.js dev server with HMR (default: production)")
 @click.option("--flask", is_flag=True, hidden=True,
               help="Use the legacy Flask server instead of Next.js")
-def serve(shared, db, host, port, public, dev, flask):
+def serve(shared, db, host, port, public, unsafe_network, dev, flask):
     """Start the Logpile web viewer.
 
     Uses the Next.js frontend (web/) by default.
     Falls back to the legacy Flask server with --flask.
     """
+    if not public and not unsafe_network and not _is_loopback_host(host):
+        raise click.ClickException(
+            "Private mode is unauthenticated and may only bind to loopback. "
+            "Use --unsafe-network to allow a non-loopback --host explicitly."
+        )
+
     db_path = Path(db)
     if not db_path.exists():
         click.echo("Database not found. Run 'logpile sync' first.", err=True)
@@ -584,10 +627,15 @@ def serve(shared, db, host, port, public, dev, flask):
         )
         raise SystemExit(1)
 
-    # Bootstrap: install deps if node_modules missing
+    # Reconcile dependencies on every direct invocation. An existing
+    # node_modules directory can still predate a patched lockfile.
     if not (web_dir / "node_modules").exists():
         click.echo("Installing Next.js dependencies…")
-        subprocess.run([bun, "install"], cwd=str(web_dir), check=True)
+    subprocess.run(
+        [bun, "install", "--frozen-lockfile", "--silent"],
+        cwd=str(web_dir),
+        check=True,
+    )
 
     # Build for production mode
     if not dev:
@@ -646,6 +694,8 @@ def serve(shared, db, host, port, public, dev, flask):
 def private(session_id, db, shared):
     """Mark a session as private (content hidden from all viewers)."""
     from .db import get_db, set_session_visibility
+    from .sync import StorageSafetyError
+
     with get_db(_prepare_db(db)) as conn:
         try:
             count = set_session_visibility(
@@ -654,7 +704,7 @@ def private(session_id, db, shared):
                 "private",
                 shared_dir=Path(shared),
             )
-        except ValueError as exc:
+        except (ValueError, StorageSafetyError) as exc:
             click.echo(str(exc), err=True)
             raise SystemExit(1)
         click.echo(
@@ -672,6 +722,7 @@ def private(session_id, db, shared):
 def visibility(session_id, level, db, shared):
     """Set session visibility."""
     from .db import get_db, set_session_visibility
+    from .sync import StorageSafetyError
 
     with get_db(_prepare_db(db)) as conn:
         try:
@@ -681,7 +732,7 @@ def visibility(session_id, level, db, shared):
                 level,
                 shared_dir=Path(shared),
             )
-        except ValueError as exc:
+        except (ValueError, StorageSafetyError) as exc:
             click.echo(str(exc), err=True)
             raise SystemExit(1)
         click.echo(
@@ -1490,7 +1541,7 @@ def _publish_apply_impl(session_id, db, shared, visibility, force):
         if not count:
             click.echo(f"No session found matching '{session_id}'")
             raise SystemExit(1)
-        preserve_reviewed_artifact(conn, review)
+        preserve_reviewed_artifact(conn, review, shared_dir=Path(shared))
         click.echo(f"Updated {count} session(s) to visibility={visibility}")
 
 

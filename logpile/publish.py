@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import errno
+import os
 from pathlib import Path
 import re
+import secrets
+import shutil
 import sqlite3
+import stat
 from typing import Pattern
 
 
@@ -339,6 +344,8 @@ def review_publish_session(
 def preserve_reviewed_artifact(
     conn: sqlite3.Connection,
     review: PublishReview,
+    *,
+    shared_dir: Path,
 ) -> None:
     if review.inspected_bytes is None:
         return
@@ -348,11 +355,86 @@ def preserve_reviewed_artifact(
     ).fetchone()
     if not row or row["visibility"] == "private":
         return
-    shared_path = _normalize_path(row["shared_path"])
-    if not shared_path:
+    raw_shared_path = row["shared_path"]
+    if not raw_shared_path:
         return
-    shared_path.parent.mkdir(parents=True, exist_ok=True)
-    shared_path.write_bytes(review.inspected_bytes)
+    shared_root = Path(os.path.abspath(os.path.expanduser(str(shared_dir))))
+    shared_path = Path(os.path.abspath(os.path.expanduser(str(raw_shared_path))))
+    try:
+        relative_parent = shared_path.parent.relative_to(shared_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Refusing to replace reviewed artifact outside shared root: {shared_path}"
+        ) from exc
+
+    current = shared_root
+    if not current.exists():
+        current.mkdir(mode=0o700)
+    root_mode = current.lstat().st_mode
+    if stat.S_ISLNK(root_mode):
+        raise ValueError(f"Refusing symlinked shared root: {current}")
+    if not stat.S_ISDIR(root_mode):
+        raise ValueError(f"Shared root is not a directory: {current}")
+    current.chmod(0o700)
+    for component in relative_parent.parts:
+        current = current / component
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            current.mkdir(mode=0o700)
+        else:
+            if stat.S_ISLNK(mode):
+                raise ValueError(f"Refusing symlinked shared parent: {current}")
+            if not stat.S_ISDIR(mode):
+                raise ValueError(f"Shared artifact parent is not a directory: {current}")
+            current.chmod(0o700)
+
+    open_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    open_flags |= getattr(os, "O_NOFOLLOW", 0)
+    parent_fd = os.open(shared_path.parent, open_flags)
+    temp_name = f".{shared_path.name}.{secrets.token_hex(8)}.tmp-review"
+    temp_fd = -1
+    try:
+        try:
+            target_stat = os.stat(
+                shared_path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            target_stat = None
+        if target_stat and stat.S_ISLNK(target_stat.st_mode):
+            raise ValueError(f"Refusing to replace symlinked artifact: {shared_path}")
+        if target_stat and not stat.S_ISREG(target_stat.st_mode):
+            raise ValueError(f"Shared artifact is not a regular file: {shared_path}")
+        if shutil.disk_usage(shared_path.parent).free < len(review.inspected_bytes):
+            raise OSError(errno.ENOSPC, "not enough free space for reviewed artifact")
+
+        temp_fd = os.open(
+            temp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        with os.fdopen(temp_fd, "wb") as temp_file:
+            temp_fd = -1
+            temp_file.write(review.inspected_bytes)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(
+            temp_name,
+            shared_path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+    finally:
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        try:
+            os.unlink(temp_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.close(parent_fd)
 
 
 def serialize_publish_review(review: PublishReview) -> dict:

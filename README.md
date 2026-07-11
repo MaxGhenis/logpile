@@ -11,16 +11,23 @@ Source: **[github.com/MaxGhenis/logpile](https://github.com/MaxGhenis/logpile)**
 
 ## Quick start
 
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and
+[Bun](https://bun.sh/docs/installation), then use the checkout wrapper as the
+canonical entry point:
+
 ```bash
 git clone https://github.com/MaxGhenis/logpile ~/logpile && cd ~/logpile
-uv venv --python 3.11 && uv pip install -e .
-
-logpile sync          # index your local CC and Codex sessions
-logpile search "thing I asked about"
-logpile serve         # open http://127.0.0.1:5002
+./logpile.sh sync          # bootstrap and index local CC and Codex sessions
+./logpile.sh search "thing I asked about"
+./logpile.sh serve         # open http://127.0.0.1:5002
 ```
 
-`logpile serve` builds and starts the Next.js app. Add `--dev` for HMR during development. Add `--public` to expose only public sessions and profiles (safe for hosted instances).
+`logpile.sh` checks its prerequisites, creates `.venv`, installs the Python
+package, and uses `web/bun.lock` when it installs web dependencies. It also
+resolves symlink chains, so you can optionally link it into a directory already
+on `PATH` (for example, `ln -s ~/logpile/logpile.sh ~/bin/logpile`).
+
+`./logpile.sh serve` builds and starts the Next.js app. Add `--dev` for HMR during development. Add `--public` to expose only public sessions and profiles (safe for hosted instances).
 
 Logpile is local-first by default. Nothing leaves your machine unless you opt into the cloud backend with `LOGPILE_BACKEND=cloud`, `--backend cloud`, or the `logpile backup` commands.
 
@@ -164,6 +171,25 @@ LOGPILE_SUPABASE_DB_URL="postgresql://..." logpile search "specific thing x" --b
 
 Local mode is the privacy-preserving path: it reads only your local SQLite database and local JSONL files. Cloud mode reads Supabase/Postgres search chunks and links those chunks back to immutable raw objects in R2/S3.
 
+### `logpile db-backup`
+
+Creates a snapshot-consistent copy of the local SQLite metadata database with
+SQLite `VACUUM INTO`, then verifies the result with `quick_check`:
+
+```bash
+mkdir -p ~/backups
+./logpile.sh db-backup ~/backups/logpile-$(date +%F).db
+
+# Back up a non-default database.
+./logpile.sh db-backup ~/backups/team.db --db /path/to/logpile.db
+```
+
+This preserves the catalog metadata that cannot be rebuilt from transcripts,
+including profiles, visibility and review decisions, and rules. It does not
+copy transcript JSONL files. Preserve those separately with the cloud backup
+workflow below or an appropriate filesystem backup; do not copy or commit the
+live `logpile.db` while WAL mode is active.
+
 ### `logpile backup`
 
 Backs up immutable raw logs to object storage and indexes exact searchable chunks in Supabase/Postgres. This is not a summarization path: message text, tool inputs, and tool outputs are chunked from the original JSONL so searches can link back to exact raw records.
@@ -210,11 +236,16 @@ Starts the Next.js web app.
 Options:
   --shared PATH     Shared directory
   --db PATH         SQLite database
-  --host TEXT       Bind address        [default: 0.0.0.0]
+  --host TEXT       Bind address        [default: 127.0.0.1]
   --port INTEGER    Port                [default: 5002]
   --public          Public read-only mode
+  --unsafe-network  Allow private mode beyond loopback
   --dev             Next.js dev server with HMR
 ```
+
+Private mode is unauthenticated and refuses non-loopback bind addresses unless
+you explicitly pass `--unsafe-network`. Public mode may bind to a network
+interface without that override.
 
 `--public` mode enforces the hosted contract:
 - only `public` sessions appear in listings and aggregate APIs
@@ -342,27 +373,25 @@ One-click to `/publish/review/<id>` for full findings with evidence and line num
 
 ## Multi-user setup
 
-Point each machine at the same shared folder and DB path:
+Keep each SQLite database, its WAL/SHM files, and the sync lock on local storage
+owned by one host. SQLite WAL relies on same-host shared memory, so multiple
+machines must not open one `logpile.db` over NFS, SMB, or another network
+filesystem.
 
-```bash
-# On each team member's machine:
-logpile sync --shared /Volumes/team-share/logpile/shared \
-             --db     /Volumes/team-share/logpile/logpile.db
-
-# One person runs the public viewer:
-logpile serve --shared /Volumes/team-share/logpile/shared \
-              --db     /Volumes/team-share/logpile/logpile.db \
-              --host 0.0.0.0 --public
-```
-
-Or commit the shared directory + SQLite to a private git repo. The DB uses WAL so concurrent readers work fine while someone else is syncing.
+For several operators, either keep an independent local index per machine
+(using an explicit `--username` for each operator) or run sync and the viewer
+on one DB-owning host. The cloud backup/search backend uses R2-compatible object
+storage and Postgres when a shared raw-log archive is needed. Back up local
+metadata with `logpile db-backup`; do not commit the live database or generated
+`shared/` tree to Git.
 
 ---
 
 ## Requirements
 
 - Python 3.11+ (for the sync CLI and publish scanner)
-- [bun](https://bun.sh) ≥ 1.3 (for the Next.js app — installed automatically on first `logpile serve`)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (for Python environment bootstrap)
+- [Bun](https://bun.sh/docs/installation) ≥ 1.3 (for the Next.js app)
 - Everything else is local. No external services, no accounts required.
 
 ## Legacy compatibility

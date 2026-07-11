@@ -34,6 +34,12 @@ def open_sqlite(path: Path):
 
 
 class SessionRuleTests(unittest.TestCase):
+    def _assert_private_archive(self, value: str, shared: Path) -> None:
+        archive = Path(value)
+        self.assertTrue(archive.exists())
+        self.assertFalse(archive.is_relative_to(shared))
+        self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
+
     def _write_claude_session(
         self,
         home: Path,
@@ -114,7 +120,7 @@ class SessionRuleTests(unittest.TestCase):
             self.assertEqual(row["visibility_source"], "rule")
             self.assertIsNotNone(row["visibility_rule_id"])
             self.assertIn("project contains", row["visibility_reason"])
-            self.assertEqual(row["shared_path"], "")
+            self._assert_private_archive(row["shared_path"], shared)
             self.assertFalse((shared / "alice" / "claudecode" / "demo" / "session-1.jsonl").exists())
 
     def test_fuzzy_rule_applies_during_sync(self) -> None:
@@ -315,7 +321,56 @@ class SessionRuleTests(unittest.TestCase):
             self.assertFalse(copied_path.exists())
             self.assertEqual(row["visibility"], "private")
             self.assertEqual(row["visibility_source"], "rule")
-            self.assertEqual(row["shared_path"], "")
+            self._assert_private_archive(row["shared_path"], shared)
+
+    def test_raw_recompute_rolls_back_storage_when_shared_path_update_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            shared_copy = shared / "alice" / "claudecode" / "demo" / source.name
+            expected = shared_copy.read_bytes()
+            source.unlink()
+
+            with open_sqlite(db_path) as conn:
+                create_visibility_rule(
+                    conn,
+                    "alice",
+                    field="project",
+                    match_mode="contains",
+                    pattern="demo",
+                    visibility="private",
+                )
+                conn.execute(
+                    """
+                    CREATE TRIGGER reject_shared_path BEFORE UPDATE OF shared_path ON sessions
+                    BEGIN SELECT RAISE(ABORT, 'forced shared path failure'); END
+                    """
+                )
+                conn.commit()
+                with self.assertRaisesRegex(
+                    sqlite3.IntegrityError, "forced shared path failure"
+                ):
+                    recompute_session_visibility(
+                        conn, identifier="alice", shared_dir=shared
+                    )
+                conn.rollback()
+
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    "SELECT visibility, shared_path FROM sessions "
+                    "WHERE session_id = 'session-1'"
+                ).fetchone()
+            self.assertEqual(row["visibility"], "unlisted")
+            self.assertEqual(Path(row["shared_path"]), shared_copy)
+            self.assertEqual(shared_copy.read_bytes(), expected)
+            private_root = root / ".shared-private"
+            self.assertFalse(
+                private_root.exists() and any(private_root.rglob("*.jsonl"))
+            )
 
     def test_rules_apply_reconciles_shared_copy_for_new_private_rule(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -376,7 +431,7 @@ class SessionRuleTests(unittest.TestCase):
 
             self.assertEqual(row["visibility"], "private")
             self.assertEqual(row["visibility_source"], "rule")
-            self.assertEqual(row["shared_path"], "")
+            self._assert_private_archive(row["shared_path"], shared)
 
     def test_rules_apply_with_unknown_user_exits_without_touching_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -490,7 +545,7 @@ class SessionRuleTests(unittest.TestCase):
 
             self.assertEqual(row["visibility"], "private")
             self.assertEqual(row["visibility_source"], "default")
-            self.assertEqual(row["shared_path"], "")
+            self._assert_private_archive(row["shared_path"], shared)
 
 
 if __name__ == "__main__":

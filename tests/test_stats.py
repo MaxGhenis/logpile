@@ -567,6 +567,42 @@ class TestComputeByPeriod:
         assert by_month["2026-01"]["cache_creation_input_tokens"] == 4_000
         assert by_month["2026-01"]["total_input_tokens"] == 5_000
 
+    def test_tokens_per_day_uses_bounded_partial_month_days(self):
+        conn = _make_db()
+        _insert_session(
+            conn,
+            session_id="january",
+            first_timestamp="2026-01-15T10:00:00Z",
+        )
+        _insert_daily(
+            conn,
+            session_id="january",
+            day="2026-01-15",
+            total_output_tokens=1_700,
+        )
+        _insert_session(
+            conn,
+            session_id="march",
+            first_timestamp="2026-03-10T10:00:00Z",
+        )
+        _insert_daily(
+            conn,
+            session_id="march",
+            day="2026-03-10",
+            total_output_tokens=1_000,
+        )
+
+        result = compute_by_period(
+            conn,
+            since="2026-01-15",
+            until="2026-03-10",
+        )
+        by_month = {row["month"]: row for row in result}
+
+        # Jan 15-31 is 17 included days; Mar 1-10 is 10.
+        assert by_month["2026-01"]["tokens_per_day"] == 100
+        assert by_month["2026-03"]["tokens_per_day"] == 100
+
 
 # ── compute_stats (end-to-end) ────────────────────────────────────────
 

@@ -21,7 +21,7 @@ from logpile.db import (
     refresh_native_usage,
 )
 from logpile.parsers import parse_claudecode_session
-from logpile.sync import sync_sessions
+from logpile.sync import SESSION_TOKEN_VERSION, sync_sessions
 
 
 def write_jsonl(path: Path, records: list[dict]) -> None:
@@ -518,7 +518,7 @@ class SyncClaimsIntegrationTests(unittest.TestCase):
                     " FROM sessions WHERE session_id = 'zzz-parent'"
                 ).fetchone()
                 self.assertEqual(parent["native_total_input_tokens"], 360)
-                self.assertEqual(parent["token_version"], CLAIMS_TOKEN_VERSION)
+                self.assertEqual(parent["token_version"], SESSION_TOKEN_VERSION)
 
     def test_interrupted_sync_flag_forces_full_heal(self) -> None:
         with tempfile.TemporaryDirectory() as td:

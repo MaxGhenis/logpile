@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -11,7 +12,14 @@ from unittest import mock
 from click.testing import CliRunner
 
 from logpile.cli import cli
-from logpile.db import ensure_user, init_db, set_session_visibility, update_user
+import logpile.db as db_module
+from logpile.db import (
+    ensure_user,
+    get_db,
+    init_db,
+    set_session_visibility,
+    update_user,
+)
 from logpile.origins import derive_session_origin
 from logpile.sync import SESSION_TOKEN_VERSION, sync_sessions
 from logpile.web.app import create_app
@@ -32,6 +40,14 @@ def open_sqlite(path: Path):
 
 
 class SyncTests(unittest.TestCase):
+    def _assert_private_archive(self, value: str, shared: Path) -> Path:
+        archive = Path(value)
+        self.assertTrue(archive.exists())
+        self.assertFalse(archive.is_symlink())
+        self.assertFalse(archive.is_relative_to(shared))
+        self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
+        return archive
+
     def _write_claude_session(
         self,
         home: Path,
@@ -277,8 +293,51 @@ class SyncTests(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(visibility, "private")
             self.assertEqual(is_private, 1)
-            self.assertEqual(shared_path, "")
+            self._assert_private_archive(shared_path, shared)
             self.assertFalse(copied_path.exists())
+
+    def test_malformed_bound_fields_do_not_abort_later_files(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            project = home / ".claude" / "projects" / "-Users-alice-demo"
+            malformed = project / "aaa-malformed.jsonl"
+            write_jsonl(
+                malformed,
+                [
+                    {
+                        "timestamp": "2026-07-11T10:00:00Z",
+                        "type": "user",
+                        "cwd": ["bad"],
+                        "message": {"content": "unsafe workspace"},
+                    },
+                    {
+                        "timestamp": "2026-07-11T10:00:01Z",
+                        "type": "assistant",
+                        "message": {
+                            "id": "bad-model",
+                            "model": {"bad": 1},
+                            "content": [],
+                        },
+                    },
+                ],
+            )
+            self._write_claude_session(home, session_id="zzz-valid")
+            db_path = root / "logpile.db"
+
+            result = sync_sessions(
+                root / "shared", db_path, "alice", "machine-1", home
+            )
+
+            self.assertEqual((result.new, result.skipped), (1, 1))
+            with open_sqlite(db_path) as conn:
+                session_ids = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT session_id FROM sessions ORDER BY session_id"
+                    )
+                ]
+            self.assertEqual(session_ids, ["zzz-valid"])
 
     def test_manual_private_reconciles_shared_copy_even_if_file_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -320,7 +379,7 @@ class SyncTests(unittest.TestCase):
                 ).fetchone()
 
             self.assertEqual(row["visibility"], "private")
-            self.assertEqual(row["shared_path"], "")
+            self._assert_private_archive(row["shared_path"], shared)
 
     def test_set_session_visibility_clears_shared_copy_without_cli(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -354,7 +413,7 @@ class SyncTests(unittest.TestCase):
                 ).fetchone()
 
             self.assertEqual(row["visibility"], "private")
-            self.assertEqual(row["shared_path"], "")
+            self._assert_private_archive(row["shared_path"], shared)
 
     def test_visibility_command_reconciles_shared_copy_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -398,7 +457,684 @@ class SyncTests(unittest.TestCase):
                 ).fetchone()
 
             self.assertEqual(row["visibility"], "private")
-            self.assertEqual(row["shared_path"], "")
+            self._assert_private_archive(row["shared_path"], shared)
+
+    def test_private_transition_moves_rotated_only_transcript_to_private_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            shared_copy = shared / "alice" / "claudecode" / "demo" / source.name
+            expected = shared_copy.read_bytes()
+            source.unlink()
+
+            with open_sqlite(db_path) as conn:
+                count = set_session_visibility(
+                    conn, "session-1", "private", shared_dir=shared
+                )
+                conn.commit()
+                row = conn.execute(
+                    "SELECT visibility, shared_path FROM sessions WHERE session_id = 'session-1'"
+                ).fetchone()
+
+            self.assertEqual(count, 1)
+            self.assertFalse(shared_copy.exists())
+            archive = self._assert_private_archive(row["shared_path"], shared)
+            self.assertEqual(archive.read_bytes(), expected)
+
+    def test_private_transition_rolls_storage_back_when_db_update_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            shared_copy = shared / "alice" / "claudecode" / "demo" / source.name
+            expected = shared_copy.read_bytes()
+
+            with open_sqlite(db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TRIGGER reject_private BEFORE UPDATE OF visibility ON sessions
+                    WHEN NEW.visibility = 'private'
+                    BEGIN SELECT RAISE(ABORT, 'forced visibility failure'); END
+                    """
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    set_session_visibility(
+                        conn, "session-1", "private", shared_dir=shared
+                    )
+                row = conn.execute(
+                    "SELECT visibility, shared_path FROM sessions WHERE session_id = 'session-1'"
+                ).fetchone()
+
+            self.assertEqual(row["visibility"], "unlisted")
+            self.assertEqual(Path(row["shared_path"]), shared_copy)
+            self.assertEqual(shared_copy.read_bytes(), expected)
+            private_root = root / ".shared-private"
+            self.assertFalse(private_root.exists() and any(private_root.rglob("*.jsonl")))
+
+    def test_private_transition_rolls_storage_back_on_explicit_db_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            shared_copy = shared / "alice" / "claudecode" / "demo" / source.name
+            expected = shared_copy.read_bytes()
+
+            with get_db(db_path) as conn:
+                set_session_visibility(
+                    conn, "session-1", "private", shared_dir=shared
+                )
+                archive = Path(
+                    conn.execute(
+                        "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
+                    ).fetchone()[0]
+                )
+                self.assertTrue(archive.exists())
+                self.assertFalse(shared_copy.exists())
+                conn.rollback()
+
+                row = conn.execute(
+                    "SELECT visibility, shared_path FROM sessions WHERE session_id = 'session-1'"
+                ).fetchone()
+                self.assertEqual(row["visibility"], "unlisted")
+                self.assertEqual(Path(row["shared_path"]), shared_copy)
+
+            self.assertEqual(shared_copy.read_bytes(), expected)
+            self.assertFalse(archive.exists())
+
+    def test_private_transition_rolls_storage_back_when_db_commit_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            shared_copy = shared / "alice" / "claudecode" / "demo" / source.name
+            expected = shared_copy.read_bytes()
+
+            with mock.patch.object(
+                db_module._StorageTransactionConnection,
+                "_commit_database",
+                side_effect=sqlite3.OperationalError("forced commit failure"),
+            ):
+                with self.assertRaisesRegex(
+                    sqlite3.OperationalError, "forced commit failure"
+                ):
+                    with get_db(db_path) as conn:
+                        set_session_visibility(
+                            conn, "session-1", "private", shared_dir=shared
+                        )
+                        archive = Path(
+                            conn.execute(
+                                "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
+                            ).fetchone()[0]
+                        )
+
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    "SELECT visibility, shared_path FROM sessions WHERE session_id = 'session-1'"
+                ).fetchone()
+            self.assertEqual(row["visibility"], "unlisted")
+            self.assertEqual(Path(row["shared_path"]), shared_copy)
+            self.assertEqual(shared_copy.read_bytes(), expected)
+            self.assertFalse(archive.exists())
+
+    def test_private_marker_storage_rolls_back_after_late_sync_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            shared_copy = shared / "alice" / "claudecode" / "demo" / source.name
+            expected = shared_copy.read_bytes()
+            with source.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-04-10T10:00:06Z",
+                            "type": "user",
+                            "message": {"content": "# logpile:private"},
+                        }
+                    )
+                    + "\n"
+                )
+
+            with mock.patch(
+                "logpile.sync.refresh_native_usage",
+                side_effect=RuntimeError("forced late sync failure"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "forced late sync failure"
+                ):
+                    sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    "SELECT visibility, shared_path FROM sessions WHERE session_id = 'session-1'"
+                ).fetchone()
+            self.assertEqual(row["visibility"], "unlisted")
+            self.assertEqual(Path(row["shared_path"]), shared_copy)
+            self.assertEqual(shared_copy.read_bytes(), expected)
+            private_root = root / ".shared-private"
+            self.assertFalse(
+                private_root.exists() and any(private_root.rglob("*.jsonl"))
+            )
+
+    def test_private_archive_rejects_symlink_and_non_directory_components(self) -> None:
+        attacks = ("root-symlink", "nested-symlink", "nested-file")
+        for attack in attacks:
+            with self.subTest(attack=attack), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                home = root / "home"
+                shared = root / "shared"
+                db_path = root / "logpile.db"
+                source = self._write_claude_session(home)
+                sync_sessions(shared, db_path, "alice", "machine-1", home)
+                shared_copy = (
+                    shared / "alice" / "claudecode" / "demo" / source.name
+                )
+                expected = shared_copy.read_bytes()
+                private_root = root / ".shared-private"
+                # Sync eagerly claims the private root; the attacker removes
+                # and replaces it before the visibility transition runs.
+                shutil.rmtree(private_root)
+                attacker = root / "attacker"
+                attacker.mkdir()
+
+                if attack == "root-symlink":
+                    private_root.symlink_to(attacker, target_is_directory=True)
+                else:
+                    private_root.mkdir(mode=0o700)
+                    nested = private_root / "alice"
+                    if attack == "nested-symlink":
+                        nested.symlink_to(attacker, target_is_directory=True)
+                    else:
+                        nested.write_text("not a directory", encoding="utf-8")
+
+                with get_db(db_path) as conn:
+                    with self.assertRaisesRegex(
+                        _sync_module.StorageSafetyError,
+                        "private archive component",
+                    ):
+                        set_session_visibility(
+                            conn, "session-1", "private", shared_dir=shared
+                        )
+
+                with open_sqlite(db_path) as conn:
+                    row = conn.execute(
+                        "SELECT visibility, shared_path FROM sessions WHERE session_id = 'session-1'"
+                    ).fetchone()
+                self.assertEqual(row["visibility"], "unlisted")
+                self.assertEqual(Path(row["shared_path"]), shared_copy)
+                self.assertEqual(shared_copy.read_bytes(), expected)
+                self.assertFalse(any(attacker.iterdir()))
+
+    def test_private_archive_can_be_promoted_when_source_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            source.unlink()
+
+            with open_sqlite(db_path) as conn:
+                set_session_visibility(conn, "session-1", "private", shared_dir=shared)
+                private_path = Path(
+                    conn.execute(
+                        "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
+                    ).fetchone()[0]
+                )
+                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
+                conn.commit()
+                row = conn.execute(
+                    "SELECT visibility, shared_path FROM sessions WHERE session_id = 'session-1'"
+                ).fetchone()
+
+            public_copy = Path(row["shared_path"])
+            self.assertEqual(row["visibility"], "unlisted")
+            self.assertTrue(public_copy.is_relative_to(shared))
+            self.assertTrue(public_copy.exists())
+            self.assertFalse(private_path.exists())
+
+    def test_multiple_visibility_changes_keep_final_private_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            expected = source.read_bytes()
+            source.unlink()
+
+            with get_db(db_path) as conn:
+                set_session_visibility(
+                    conn, "session-1", "private", shared_dir=shared
+                )
+
+            with get_db(db_path) as conn:
+                set_session_visibility(
+                    conn, "session-1", "unlisted", shared_dir=shared
+                )
+                set_session_visibility(
+                    conn, "session-1", "private", shared_dir=shared
+                )
+
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    "SELECT visibility, shared_path FROM sessions "
+                    "WHERE session_id = 'session-1'"
+                ).fetchone()
+            archive = self._assert_private_archive(row["shared_path"], shared)
+            self.assertEqual(row["visibility"], "private")
+            self.assertEqual(archive.read_bytes(), expected)
+            self.assertFalse(
+                (shared / "alice" / "claudecode" / "demo" / source.name).exists()
+            )
+
+    def test_failed_cleanup_never_leaves_rollback_artifact_in_shared_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            original = source.read_bytes()
+            with source.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-04-10T10:00:06Z",
+                            "type": "user",
+                            "message": {"content": "updated transcript"},
+                        }
+                    )
+                    + "\n"
+                )
+
+            real_unlink = Path.unlink
+
+            def fail_rollback_cleanup(path, *args, **kwargs):
+                if path.name.endswith("publish-rollback"):
+                    raise OSError("forced private cleanup failure")
+                return real_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(
+                Path, "unlink", autospec=True, side_effect=fail_rollback_cleanup
+            ):
+                sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            private_root = root / ".shared-private"
+            leftovers = list(private_root.rglob("*publish-rollback"))
+            self.assertEqual(len(leftovers), 1)
+            self.assertEqual(leftovers[0].read_bytes(), original)
+            self.assertEqual(list(shared.rglob("*publish-rollback")), [])
+
+            with source.open("a", encoding="utf-8") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "timestamp": "2026-04-10T10:00:07Z",
+                            "type": "user",
+                            "message": {"content": "# logpile:private"},
+                        }
+                    )
+                    + "\n"
+                )
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    "SELECT visibility, shared_path FROM sessions "
+                    "WHERE session_id = 'session-1'"
+                ).fetchone()
+            self.assertEqual(row["visibility"], "private")
+            self._assert_private_archive(row["shared_path"], shared)
+            shared_files = [
+                path
+                for path in shared.rglob("*")
+                if path.is_file() or path.is_symlink()
+            ]
+            self.assertEqual(shared_files, [])
+
+    def test_failed_promotion_quarantines_shared_copy_if_unlink_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            source.unlink()
+            with get_db(db_path) as conn:
+                set_session_visibility(
+                    conn, "session-1", "private", shared_dir=shared
+                )
+            with open_sqlite(db_path) as conn:
+                archive = Path(
+                    conn.execute(
+                        "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
+                    ).fetchone()[0]
+                )
+
+            shared_copy = shared / "alice" / "claudecode" / "demo" / source.name
+            real_unlink = Path.unlink
+
+            def fail_shared_unlink(path, *args, **kwargs):
+                if path == shared_copy:
+                    raise OSError("forced shared unlink failure")
+                return real_unlink(path, *args, **kwargs)
+
+            with get_db(db_path) as conn:
+                conn.execute(
+                    """
+                    CREATE TRIGGER reject_promotion BEFORE UPDATE OF visibility ON sessions
+                    WHEN NEW.visibility != 'private'
+                    BEGIN SELECT RAISE(ABORT, 'forced promotion failure'); END
+                    """
+                )
+                with mock.patch.object(
+                    Path, "unlink", autospec=True, side_effect=fail_shared_unlink
+                ):
+                    with self.assertRaisesRegex(
+                        sqlite3.IntegrityError, "forced promotion failure"
+                    ):
+                        set_session_visibility(
+                            conn, "session-1", "unlisted", shared_dir=shared
+                        )
+
+            self.assertFalse(shared_copy.exists())
+            self.assertTrue(archive.exists())
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    "SELECT visibility, shared_path FROM sessions "
+                    "WHERE session_id = 'session-1'"
+                ).fetchone()
+            self.assertEqual(row["visibility"], "private")
+            self.assertEqual(Path(row["shared_path"]), archive)
+
+    def test_private_transition_rejects_nonregular_only_shared_copy(self) -> None:
+        for kind in ("directory", "fifo"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                home = root / "home"
+                shared = root / "shared"
+                db_path = root / "logpile.db"
+                source = self._write_claude_session(home)
+                sync_sessions(shared, db_path, "alice", "machine-1", home)
+                shared_copy = (
+                    shared / "alice" / "claudecode" / "demo" / source.name
+                )
+                source.unlink()
+                shared_copy.unlink()
+                if kind == "directory":
+                    shared_copy.mkdir()
+                else:
+                    os.mkfifo(shared_copy)
+
+                with get_db(db_path) as conn:
+                    with self.assertRaisesRegex(
+                        _sync_module.StorageSafetyError,
+                        "non-regular or unsafe shared transcript",
+                    ):
+                        set_session_visibility(
+                            conn, "session-1", "private", shared_dir=shared
+                        )
+
+                self.assertTrue(shared_copy.exists())
+                with open_sqlite(db_path) as conn:
+                    visibility = conn.execute(
+                        "SELECT visibility FROM sessions WHERE session_id = 'session-1'"
+                    ).fetchone()[0]
+                self.assertEqual(visibility, "unlisted")
+
+    def test_sync_and_private_transition_reject_symlinked_shared_ancestry(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            outside = root / "outside"
+            outside.mkdir()
+            shared.symlink_to(outside, target_is_directory=True)
+            self._write_claude_session(home)
+
+            with self.assertRaisesRegex(
+                _sync_module.StorageSafetyError, "symlink shared storage component"
+            ):
+                sync_sessions(
+                    shared, root / "symlink.db", "alice", "machine-1", home
+                )
+            self.assertEqual(list(outside.iterdir()), [])
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            real_user_dir = root / "real-user-dir"
+            user_dir = shared / "alice"
+            user_dir.rename(real_user_dir)
+            user_dir.symlink_to(real_user_dir, target_is_directory=True)
+
+            with get_db(db_path) as conn:
+                with self.assertRaisesRegex(
+                    _sync_module.StorageSafetyError,
+                    "non-regular or unsafe shared transcript",
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "private", shared_dir=shared
+                    )
+
+            outside_copy = real_user_dir / "claudecode" / "demo" / source.name
+            self.assertTrue(outside_copy.exists())
+
+    def test_reconcile_attempts_every_rollback_after_one_rollback_fails(self) -> None:
+        rows = [
+            {
+                "session_id": session_id,
+                "username": "alice",
+                "source": "claudecode",
+                "project": "demo",
+                "source_path": f"/missing/{session_id}.jsonl",
+                "shared_path": f"/shared/{session_id}.jsonl",
+                "visibility": "private",
+            }
+            for session_id in ("first", "second")
+        ]
+        cursor = mock.Mock()
+        cursor.fetchall.return_value = rows
+        conn = mock.Mock()
+        update_count = 0
+
+        def execute(sql, *_args):
+            nonlocal update_count
+            if "SELECT" in sql:
+                return cursor
+            update_count += 1
+            if update_count == 2:
+                raise sqlite3.IntegrityError("forced second update failure")
+            return mock.Mock()
+
+        conn.execute.side_effect = execute
+        first = mock.Mock(
+            archive_path=Path("/private/first.jsonl"), changed=True
+        )
+        second = mock.Mock(
+            archive_path=Path("/private/second.jsonl"), changed=True
+        )
+        second.rollback.side_effect = _sync_module.StorageSafetyError(
+            "forced rollback failure"
+        )
+
+        with mock.patch(
+            "logpile.sync._prepare_sync_shared_copy",
+            side_effect=[first, second],
+        ):
+            with self.assertRaisesRegex(
+                _sync_module.StorageSafetyError, "forced rollback failure"
+            ):
+                _sync_module.reconcile_session_storage(
+                    conn, shared_dir=Path("/shared")
+                )
+
+        second.rollback.assert_called_once_with()
+        first.rollback.assert_called_once_with()
+
+    def test_private_transition_refuses_when_no_transcript_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            source = self._write_claude_session(home)
+            sync_sessions(shared, db_path, "alice", "machine-1", home)
+            with open_sqlite(db_path) as conn:
+                shared_copy = Path(
+                    conn.execute(
+                        "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
+                    ).fetchone()[0]
+                )
+            source.unlink()
+            shared_copy.unlink()
+
+            with open_sqlite(db_path) as conn:
+                with self.assertRaisesRegex(
+                    _sync_module.StorageSafetyError,
+                    "no source or shared transcript survives",
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "private", shared_dir=shared
+                    )
+                visibility = conn.execute(
+                    "SELECT visibility FROM sessions WHERE session_id = 'session-1'"
+                ).fetchone()[0]
+
+            self.assertEqual(visibility, "unlisted")
+
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "private",
+                    "session-1",
+                    "--db",
+                    str(db_path),
+                    "--shared",
+                    str(shared),
+                ],
+            )
+            self.assertEqual(result.exit_code, 1, result.output)
+            self.assertIn(
+                "no source or shared transcript survives", result.output
+            )
+
+    def test_private_marker_tightens_existing_claude_and_codex_rows(self) -> None:
+        for source_name in ("claudecode", "codex"):
+            with self.subTest(source=source_name), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                home = root / "home"
+                shared = root / "shared"
+                db_path = root / "logpile.db"
+                if source_name == "claudecode":
+                    path = self._write_claude_session(home, session_id="marker-session")
+                else:
+                    path = self._write_codex_session(home, session_id="marker-session")
+                sync_sessions(shared, db_path, "alice", "machine-1", home)
+                with open_sqlite(db_path) as conn:
+                    old_shared = Path(
+                        conn.execute(
+                            "SELECT shared_path FROM sessions WHERE session_id = 'marker-session'"
+                        ).fetchone()[0]
+                    )
+
+                with path.open("a", encoding="utf-8") as stream:
+                    if source_name == "claudecode":
+                        stream.write(
+                            json.dumps(
+                                {
+                                    "timestamp": "2026-04-10T10:00:06Z",
+                                    "type": "user",
+                                    "message": {"content": "# logpile:private"},
+                                }
+                            )
+                            + "\n"
+                        )
+                    else:
+                        stream.write(
+                            json.dumps(
+                                {
+                                    "timestamp": "2026-04-10T10:00:06Z",
+                                    "type": "response_item",
+                                    "payload": {
+                                        "type": "message",
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "input_text", "text": "# logpile:private"}
+                                        ],
+                                    },
+                                }
+                            )
+                            + "\n"
+                        )
+
+                result = sync_sessions(shared, db_path, "alice", "machine-1", home)
+                with open_sqlite(db_path) as conn:
+                    row = conn.execute(
+                        """
+                        SELECT visibility, visibility_source, visibility_reason, shared_path
+                        FROM sessions WHERE session_id = 'marker-session'
+                        """
+                    ).fetchone()
+
+                self.assertEqual(result.updated, 1)
+                self.assertEqual(row["visibility"], "private")
+                self.assertEqual(row["visibility_source"], "marker")
+                self.assertIn("logpile:private", row["visibility_reason"])
+                self.assertFalse(old_shared.exists())
+                archive = self._assert_private_archive(row["shared_path"], shared)
+                self.assertIn(b"logpile:private", archive.read_bytes())
+
+    def test_sequential_syncs_keep_distinct_users(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "logpile.db"
+            shared = root / "shared"
+            alice_home = root / "alice-home"
+            bob_home = root / "bob-home"
+            self._write_claude_session(
+                alice_home, session_id="alice-session", message="Alice"
+            )
+            self._write_claude_session(
+                bob_home, session_id="bob-session", message="Bob"
+            )
+
+            sync_sessions(shared, db_path, "alice", "alice-machine", alice_home)
+            sync_sessions(shared, db_path, "bob", "bob-machine", bob_home)
+
+            with open_sqlite(db_path) as conn:
+                rows = conn.execute(
+                    "SELECT session_id, username FROM sessions ORDER BY session_id"
+                ).fetchall()
+            self.assertEqual(
+                [(row["session_id"], row["username"]) for row in rows],
+                [("alice-session", "alice"), ("bob-session", "bob")],
+            )
 
     def test_sync_populates_workspace_root_and_session_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -985,7 +1721,9 @@ class SyncTests(unittest.TestCase):
             )
 
             self.assertEqual(counts, (0, 0, 1))
-            self.assertFalse(shared.exists())
+            self.assertTrue(shared.is_dir())
+            self.assertEqual(shared.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(list(shared.iterdir()), [])
 
     def test_user_profile_page_renders_from_slug(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1149,11 +1887,39 @@ class CopySessionAtomicityTests(unittest.TestCase):
     def test_copies_new_file_and_leaves_no_temp(self) -> None:
         self.assertTrue(_copy_session(self.src, self.dst))
         self.assertEqual(self.dst.read_text(), self.src.read_text())
+        self.assertEqual(self.dst.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self._tmp_leftovers(), [])
+
+    def test_staging_file_is_0600_under_umask_022(self) -> None:
+        observed_modes: list[int] = []
+        original = _sync_module.shutil.copyfileobj
+
+        def inspect_mode(source, target):
+            observed_modes.append(os.fstat(target.fileno()).st_mode & 0o777)
+            return original(source, target)
+
+        old_umask = os.umask(0o022)
+        try:
+            with _mock.patch.object(
+                _sync_module.shutil, "copyfileobj", side_effect=inspect_mode
+            ):
+                _copy_session(self.src, self.dst)
+        finally:
+            os.umask(old_umask)
+
+        self.assertEqual(observed_modes, [0o600])
 
     def test_skips_identical_existing_copy(self) -> None:
         _shutil.copy2(self.src, self.dst)
-        self.assertFalse(_copy_session(self.src, self.dst))
+        self.dst.parent.chmod(0o755)
+        self.dst.chmod(0o644)
+        old_umask = os.umask(0o022)
+        try:
+            self.assertFalse(_copy_session(self.src, self.dst))
+        finally:
+            os.umask(old_umask)
+        self.assertEqual(self.dst.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.dst.stat().st_mode & 0o777, 0o600)
 
     def test_replaces_stale_copy(self) -> None:
         self.dst.write_text("stale\n")
@@ -1171,34 +1937,39 @@ class CopySessionAtomicityTests(unittest.TestCase):
         self.dst.write_text("previous complete copy\n")
 
         def boom(src, dst):
-            Path(dst).write_text("partial")
+            dst.write(b"partial")
             raise OSError(_errno.EIO, "boom")
 
-        with _mock.patch.object(_sync_module.shutil, "copy2", side_effect=boom):
+        with _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=boom):
             with self.assertRaises(OSError):
                 _copy_session(self.src, self.dst)
         self.assertEqual(self.dst.read_text(), "previous complete copy\n")
         self.assertEqual(self._tmp_leftovers(), [])
 
-    def test_enospc_keeps_existing_complete_copy_over_symlink(self) -> None:
+    def test_enospc_fails_closed_and_keeps_existing_complete_copy(self) -> None:
         self.dst.write_text("previous complete copy\n")
 
         def full(src, dst):
             raise OSError(_errno.ENOSPC, "disk full")
 
-        with _mock.patch.object(_sync_module.shutil, "copy2", side_effect=full):
-            self.assertFalse(_copy_session(self.src, self.dst))
+        with _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=full):
+            with self.assertRaises(OSError) as raised:
+                _copy_session(self.src, self.dst)
+        self.assertEqual(raised.exception.errno, _errno.ENOSPC)
         self.assertFalse(self.dst.is_symlink())
         self.assertEqual(self.dst.read_text(), "previous complete copy\n")
 
-    def test_enospc_without_existing_copy_falls_back_to_symlink(self) -> None:
+    def test_enospc_without_existing_copy_never_creates_symlink(self) -> None:
         def full(src, dst):
             raise OSError(_errno.ENOSPC, "disk full")
 
-        with _mock.patch.object(_sync_module.shutil, "copy2", side_effect=full):
-            self.assertTrue(_copy_session(self.src, self.dst))
-        self.assertTrue(self.dst.is_symlink())
-        self.assertEqual(self.dst.resolve(), self.src.resolve())
+        with _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=full):
+            with self.assertRaises(OSError) as raised:
+                _copy_session(self.src, self.dst)
+        self.assertEqual(raised.exception.errno, _errno.ENOSPC)
+        self.assertFalse(self.dst.exists())
+        self.assertFalse(self.dst.is_symlink())
+        self.assertEqual(self._tmp_leftovers(), [])
 
 
 class SyncCoverageAndFastPathTests(unittest.TestCase):
@@ -1346,6 +2117,84 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             self.assertEqual(effective["out_tokens"], 47)
             self.assertEqual(effective["approximated"], 0)
 
+    def test_token_version_migrates_existing_daily_buckets_to_utc(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            session_path = (
+                home
+                / ".claude"
+                / "projects"
+                / "-Users-alice-demo"
+                / "utc-migration.jsonl"
+            )
+            write_jsonl(
+                session_path,
+                [
+                    {
+                        "timestamp": "2026-04-10T23:30:00-02:00",
+                        "type": "user",
+                        "cwd": "/tmp/demo",
+                        "message": {"content": "cross midnight in UTC"},
+                    },
+                    {
+                        "timestamp": "2026-04-10T23:30:05-02:00",
+                        "type": "assistant",
+                        "message": {
+                            "id": "utc-msg",
+                            "model": "claude-3.7",
+                            "usage": {"input_tokens": 1, "output_tokens": 2},
+                            "content": [{"type": "text", "text": "done"}],
+                        },
+                    },
+                ],
+            )
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            sync_sessions(shared, db_path, "alice", "m1", home)
+
+            self.assertEqual(SESSION_TOKEN_VERSION, 6)
+            with open_sqlite(db_path) as conn:
+                conn.execute(
+                    "UPDATE sessions SET token_version = 5 "
+                    "WHERE session_id = 'utc-migration'"
+                )
+                conn.execute(
+                    "UPDATE session_daily_usage SET day = '2026-04-10' "
+                    "WHERE session_id = 'utc-migration'"
+                )
+                conn.execute(
+                    "UPDATE message_claims SET day = '2026-04-10' "
+                    "WHERE owner_session_id = 'utc-migration'"
+                )
+                conn.commit()
+
+            result = sync_sessions(shared, db_path, "alice", "m1", home)
+            self.assertEqual((result.new, result.updated), (0, 1))
+            with open_sqlite(db_path) as conn:
+                session = conn.execute(
+                    "SELECT token_version FROM sessions "
+                    "WHERE session_id = 'utc-migration'"
+                ).fetchone()
+                daily_days = [
+                    row["day"]
+                    for row in conn.execute(
+                        "SELECT day FROM session_daily_usage "
+                        "WHERE session_id = 'utc-migration' ORDER BY day"
+                    )
+                ]
+                claim_days = [
+                    row["day"]
+                    for row in conn.execute(
+                        "SELECT day FROM message_claims "
+                        "WHERE owner_session_id = 'utc-migration' ORDER BY day"
+                    )
+                ]
+
+            self.assertEqual(session["token_version"], SESSION_TOKEN_VERSION)
+            self.assertEqual(daily_days, ["2026-04-11"])
+            self.assertEqual(claim_days, ["2026-04-11"])
+
     def test_sync_persists_cache_creation_on_session_row(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1475,6 +2324,66 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             self.assertEqual(row["source_path"], str(archived))
             self.assertEqual(row["total_input_tokens"], 1200)
 
+    def test_live_to_archive_rename_between_stat_and_hash_is_retried_in_archive_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            live = self._write_codex_session(home, session_id="rollout-race")
+            archived = home / ".codex" / "archived_sessions" / live.name
+            original_hash = _sync_module.file_hash
+            rotated = False
+
+            def rotate_before_hash(path: Path) -> str:
+                nonlocal rotated
+                if path == live and not rotated:
+                    rotated = True
+                    archived.parent.mkdir(parents=True, exist_ok=True)
+                    live.replace(archived)
+                return original_hash(path)
+
+            with mock.patch("logpile.sync.file_hash", side_effect=rotate_before_hash):
+                result = sync_sessions(
+                    root / "shared", root / "logpile.db", "alice", "m1", home
+                )
+
+            self.assertEqual(result.new, 1)
+            with open_sqlite(root / "logpile.db") as conn:
+                row = conn.execute(
+                    "SELECT source_path FROM sessions WHERE session_id = 'rollout-race'"
+                ).fetchone()
+            self.assertEqual(row["source_path"], str(archived))
+
+    def test_live_to_archive_rename_between_hash_and_parse_is_retried_in_archive_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            live = self._write_codex_session(home, session_id="rollout-parse-race")
+            archived = home / ".codex" / "archived_sessions" / live.name
+            original_parse = _sync_module.parse_codex_session
+            rotated = False
+
+            def rotate_before_parse(path: Path):
+                nonlocal rotated
+                if path == live and not rotated:
+                    rotated = True
+                    archived.parent.mkdir(parents=True, exist_ok=True)
+                    live.replace(archived)
+                return original_parse(path)
+
+            with mock.patch(
+                "logpile.sync.parse_codex_session", side_effect=rotate_before_parse
+            ):
+                result = sync_sessions(
+                    root / "shared", root / "logpile.db", "alice", "m1", home
+                )
+
+            self.assertEqual(result.new, 1)
+            with open_sqlite(root / "logpile.db") as conn:
+                row = conn.execute(
+                    "SELECT source_path FROM sessions WHERE session_id = 'rollout-parse-race'"
+                ).fetchone()
+            self.assertEqual(row["source_path"], str(archived))
+
 
 class SyncLockTests(unittest.TestCase):
     def test_concurrent_sync_skips_instead_of_interleaving(self) -> None:
@@ -1489,8 +2398,182 @@ class SyncLockTests(unittest.TestCase):
                 _fcntl.flock(holder, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
                 result = sync_sessions(shared, db_path, "alice", "test-machine", home)
             self.assertEqual(result, (0, 0, 0))
+            self.assertIsInstance(result, _sync_module.SyncLockContended)
+            self.assertEqual(result.status, _sync_module.SyncStatus.LOCK_CONTENDED)
+            self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
             # Skipped before init_db: no database was created.
             self.assertFalse(db_path.exists())
+
+    def test_eacces_from_flock_is_typed_contention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            with _mock.patch.object(
+                _sync_module.fcntl,
+                "flock",
+                side_effect=OSError(_errno.EACCES, "contended"),
+            ):
+                result = sync_sessions(
+                    root / "shared", root / "logpile.db", "alice", "m1", home
+                )
+            self.assertIsInstance(result, _sync_module.SyncLockContended)
+
+    def test_unsupported_flock_error_is_not_reported_as_contention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            with _mock.patch.object(
+                _sync_module.fcntl,
+                "flock",
+                side_effect=OSError(_errno.ENOTSUP, "locking unsupported"),
+            ):
+                with self.assertRaises(_sync_module.SyncLockError):
+                    sync_sessions(
+                        root / "shared", root / "logpile.db", "alice", "m1", home
+                    )
+
+    def test_sync_lock_rejects_symlink_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            db_path = root / "logpile.db"
+            lock_path = Path(f"{db_path}.sync.lock")
+            target = root / "unmanaged-target"
+            target.write_text("leave me alone\n", encoding="utf-8")
+            target.chmod(0o644)
+            lock_path.symlink_to(target)
+
+            with self.assertRaisesRegex(
+                _sync_module.SyncLockError, "safely open sync lock"
+            ):
+                sync_sessions(root / "shared", db_path, "alice", "m1", home)
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "leave me alone\n")
+            self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+            self.assertFalse(db_path.exists())
+
+    def test_sync_lock_rejects_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            db_path = root / "logpile.db"
+            lock_path = Path(f"{db_path}.sync.lock")
+            os.mkfifo(lock_path)
+
+            with self.assertRaisesRegex(
+                _sync_module.SyncLockError, "safely open sync lock"
+            ):
+                sync_sessions(root / "shared", db_path, "alice", "m1", home)
+
+            self.assertFalse(db_path.exists())
+
+    def test_sync_lock_fstat_rejects_nonregular_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            home.mkdir()
+            fake_stat = _mock.Mock(st_mode=0o010600)
+            with _mock.patch.object(
+                _sync_module.os, "fstat", return_value=fake_stat
+            ):
+                with self.assertRaisesRegex(
+                    _sync_module.SyncLockError, "non-regular sync lock"
+                ):
+                    sync_sessions(
+                        root / "shared",
+                        root / "logpile.db",
+                        "alice",
+                        "m1",
+                        home,
+                    )
+
+
+class RuntimePermissionTests(unittest.TestCase):
+    _write_claude_session = SyncTests._write_claude_session
+
+    def test_runtime_storage_is_private_under_umask_022(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = root / "runtime"
+            home = root / "home"
+            source = self._write_claude_session(home)
+            db_path = runtime / "logpile.db"
+            shared = runtime / "shared"
+
+            old_umask = os.umask(0o022)
+            try:
+                sync_sessions(shared, db_path, "alice", "m1", home)
+                with _sync_module.get_db(db_path) as conn:
+                    conn.execute(
+                        "UPDATE users SET updated_at = updated_at WHERE username = 'alice'"
+                    )
+                    mode_paths = [
+                        db_path,
+                        Path(f"{db_path}-wal"),
+                        Path(f"{db_path}-shm"),
+                    ]
+                    for path in mode_paths:
+                        self.assertTrue(path.exists(), path)
+                        self.assertEqual(path.stat().st_mode & 0o777, 0o600, path)
+            finally:
+                os.umask(old_umask)
+
+            copied = shared / "alice" / "claudecode" / "demo" / source.name
+            lock_path = Path(f"{db_path}.sync.lock")
+            self.assertEqual(runtime.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(shared.stat().st_mode & 0o777, 0o700)
+            for directory in (copied.parent, copied.parent.parent, copied.parent.parent.parent):
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o700, directory)
+            self.assertEqual(db_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(copied.stat().st_mode & 0o777, 0o600)
+
+    def test_unchanged_sync_upgrades_existing_managed_storage_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = root / "runtime"
+            home = root / "home"
+            source = self._write_claude_session(home)
+            db_path = runtime / "logpile.db"
+            shared = runtime / "shared"
+            sync_sessions(shared, db_path, "alice", "m1", home)
+
+            copied = shared / "alice" / "claudecode" / "demo" / source.name
+            lock_path = Path(f"{db_path}.sync.lock")
+            managed_directories = [
+                runtime,
+                shared,
+                shared / "alice",
+                shared / "alice" / "claudecode",
+                copied.parent,
+            ]
+            for directory in managed_directories:
+                directory.chmod(0o755)
+            for artifact in (db_path, lock_path, copied):
+                artifact.chmod(0o644)
+
+            old_umask = os.umask(0o022)
+            try:
+                with _mock.patch.object(
+                    _sync_module,
+                    "file_hash",
+                    side_effect=AssertionError(
+                        "unchanged permission upgrade must retain the no-hash fast path"
+                    ),
+                ):
+                    result = sync_sessions(shared, db_path, "alice", "m1", home)
+            finally:
+                os.umask(old_umask)
+
+            self.assertEqual(result, (0, 0, 1))
+            for directory in managed_directories:
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o700, directory)
+            for artifact in (db_path, lock_path, copied):
+                self.assertEqual(artifact.stat().st_mode & 0o777, 0o600, artifact)
 
 
 if __name__ == "__main__":
