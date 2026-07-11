@@ -81,10 +81,10 @@ export function getDashboardStats(origin?: string): DashboardStats {
       `SELECT
         COUNT(*)                               AS total_sessions,
         SUM(user_message_count)                AS total_user_msgs,
-        SUM(assistant_message_count)           AS total_assistant_msgs,
+        SUM(native_assistant_message_count)    AS total_assistant_msgs,
         SUM(tool_call_count)                   AS total_tool_calls,
-        SUM(total_input_tokens)                AS total_input_tokens,
-        SUM(total_output_tokens)               AS total_output_tokens,
+        SUM(native_total_input_tokens)         AS total_input_tokens,
+        SUM(native_total_output_tokens)        AS total_output_tokens,
         COUNT(DISTINCT username)              AS active_users,
         COUNT(DISTINCT project)                AS total_projects
       FROM session_catalog s
@@ -108,13 +108,33 @@ export function getRecentSessions(limit = 10, origin?: string): SessionRow[] {
         s.first_timestamp,
         s.user_message_count, s.assistant_message_count,
         s.total_input_tokens + s.total_output_tokens AS tokens,
-        s.first_user_message, s.duration_seconds, s.model
+        s.first_user_message, s.duration_seconds, s.model,
+        s.write_path_count, s.test_run_count, s.test_failure_count,
+        s.build_run_count, s.build_failure_count, s.git_commit_count
       FROM session_catalog s
       WHERE ${clauses.join(" AND ")}
       ORDER BY s.first_timestamp DESC
       LIMIT ?`
     )
     .all(...params, limit) as SessionRow[];
+}
+
+/** True per-day session totals for the record's day headers (newest first). */
+export function getDayCounts(dayLimit = 7, origin?: string): Array<{ day: string; sessions: number }> {
+  const db = getDb();
+  const clauses = [listedSessionClause("s"), "s.first_timestamp IS NOT NULL"];
+  const params: unknown[] = [];
+  appendOriginClause(clauses, params, origin);
+  return db
+    .prepare(
+      `SELECT substr(s.first_timestamp, 1, 10) AS day, COUNT(*) AS sessions
+      FROM session_catalog s
+      WHERE ${clauses.join(" AND ")}
+      GROUP BY day
+      ORDER BY day DESC
+      LIMIT ?`
+    )
+    .all(...params, dayLimit) as Array<{ day: string; sessions: number }>;
 }
 
 /* ── Chart data ───────────────────────────────────────────────────── */
@@ -135,7 +155,7 @@ export function getMessagesPerDay(days = 30, origin?: string) {
         s.username AS user_key,
         s.username,
         s.user_display_name,
-        SUM(d.user_message_count + d.assistant_message_count) AS msgs
+        SUM(d.user_message_count + d.native_assistant_message_count) AS msgs
       FROM session_daily_effective d
       JOIN session_catalog s ON s.session_id = d.session_id
       WHERE ${clauses.join(" AND ")}
@@ -163,7 +183,7 @@ export function getMessagesByTool(days = 30, origin?: string) {
       `SELECT
         d.day AS day,
         s.source AS source,
-        SUM(d.user_message_count + d.assistant_message_count) AS msgs
+        SUM(d.user_message_count + d.native_assistant_message_count) AS msgs
       FROM session_daily_effective d
       JOIN session_catalog s ON s.session_id = d.session_id
       WHERE ${clauses.join(" AND ")}
@@ -463,9 +483,9 @@ export function getUsers(): UserListRow[] {
         COALESCE(u.display_name, u.username) AS display_name,
         u.bio,
         COUNT(s.session_id) AS sessions,
-        SUM(s.user_message_count + s.assistant_message_count) AS messages,
+        SUM(s.user_message_count + s.native_assistant_message_count) AS messages,
         SUM(s.tool_call_count) AS tool_calls,
-        SUM(s.total_input_tokens + s.total_output_tokens) AS tokens,
+        SUM(s.native_total_input_tokens + s.native_total_output_tokens) AS tokens,
         MIN(s.first_timestamp) AS first_seen,
         MAX(s.last_timestamp) AS last_seen
       FROM user_catalog u
@@ -669,9 +689,9 @@ export function getApiUsers() {
         u.avatar_url,
         u.profile_visibility,
         COUNT(s.session_id) AS sessions,
-        SUM(s.user_message_count + s.assistant_message_count) AS messages,
+        SUM(s.user_message_count + s.native_assistant_message_count) AS messages,
         SUM(s.tool_call_count) AS tool_calls,
-        SUM(s.total_input_tokens + s.total_output_tokens) AS tokens,
+        SUM(s.native_total_input_tokens + s.native_total_output_tokens) AS tokens,
         MAX(s.last_timestamp) AS last_seen
       FROM user_catalog u
       LEFT JOIN session_catalog s ON s.username = u.username AND ${listedSessionClause("s", "u")}
@@ -909,9 +929,9 @@ export function getUserSummary(username: string, origin?: string): UserSummary |
     .prepare(
       `SELECT
         COUNT(*) AS total_sessions,
-        SUM(user_message_count + assistant_message_count) AS total_messages,
+        SUM(user_message_count + native_assistant_message_count) AS total_messages,
         SUM(tool_call_count) AS total_tool_calls,
-        SUM(total_input_tokens + total_output_tokens) AS total_tokens,
+        SUM(native_total_input_tokens + native_total_output_tokens) AS total_tokens,
         COUNT(DISTINCT CASE
           WHEN project IS NOT NULL AND project != '' AND project != 'unknown'
           THEN project
@@ -962,7 +982,7 @@ export function getUserActivity(username: string, days = 60, origin?: string) {
       `SELECT
         d.day AS day,
         COUNT(DISTINCT d.session_id) AS sessions,
-        SUM(d.user_message_count + d.assistant_message_count) AS messages,
+        SUM(d.user_message_count + d.native_assistant_message_count) AS messages,
         SUM(d.tool_call_count) AS tool_calls
       FROM session_daily_effective d
       JOIN session_catalog s ON s.session_id = d.session_id
@@ -1048,7 +1068,7 @@ export function getUserSourceBreakdown(username: string, origin?: string) {
       `SELECT
         s.source,
         COUNT(*) AS sessions,
-        SUM(s.user_message_count + s.assistant_message_count) AS messages
+        SUM(s.user_message_count + s.native_assistant_message_count) AS messages
       FROM session_catalog s
       WHERE ${clauses.join(" AND ")}
       GROUP BY s.source
@@ -1085,7 +1105,7 @@ export function getUserModels(username: string, limit = 8, origin?: string) {
       `SELECT
         CASE WHEN s.model IS NULL OR s.model = '' THEN 'unknown' ELSE s.model END AS model_name,
         COUNT(*) AS sessions,
-        SUM(s.user_message_count + s.assistant_message_count) AS messages
+        SUM(s.user_message_count + s.native_assistant_message_count) AS messages
       FROM session_catalog s
       WHERE ${clauses.join(" AND ")}
       GROUP BY model_name
@@ -1182,7 +1202,7 @@ export function getUserStats(origin?: string) {
         SUM(s.user_message_count) AS user_msgs,
         SUM(s.tool_call_count) AS tool_calls,
         SUM(s.error_count) AS errors,
-        SUM(s.total_input_tokens + s.total_output_tokens) AS tokens,
+        SUM(s.native_total_input_tokens + s.native_total_output_tokens) AS tokens,
         MIN(s.first_timestamp) AS first_seen,
         MAX(s.last_timestamp) AS last_seen
       FROM session_catalog s
@@ -1649,7 +1669,7 @@ export function getRepos(opts?: { user?: string; limit?: number }): RepoRow[] {
           s.worktree_root,
           s.git_branch,
           s.user_message_count,
-          s.assistant_message_count,
+          s.native_assistant_message_count,
           s.tool_call_count,
           s.last_timestamp
         FROM session_catalog s
@@ -1670,7 +1690,7 @@ export function getRepos(opts?: { user?: string; limit?: number }): RepoRow[] {
         COUNT(*) AS sessions,
         COUNT(DISTINCT fs.worktree_root) AS worktrees,
         COUNT(DISTINCT fs.git_branch) AS branches,
-        SUM(fs.user_message_count + fs.assistant_message_count) AS messages,
+        SUM(fs.user_message_count + fs.native_assistant_message_count) AS messages,
         SUM(fs.tool_call_count) AS tool_calls,
         COALESCE(MAX(pc.unique_paths), 0) AS unique_paths,
         MAX(fs.last_timestamp) AS last_seen
@@ -1713,7 +1733,7 @@ export function getUserTopRepos(username: string, limit = 8, origin?: string): R
         COUNT(*) AS sessions,
         COUNT(DISTINCT s.worktree_root) AS worktrees,
         COUNT(DISTINCT s.git_branch) AS branches,
-        SUM(s.user_message_count + s.assistant_message_count) AS messages,
+        SUM(s.user_message_count + s.native_assistant_message_count) AS messages,
         SUM(s.tool_call_count) AS tool_calls,
         0 AS unique_paths,
         MAX(s.last_timestamp) AS last_seen

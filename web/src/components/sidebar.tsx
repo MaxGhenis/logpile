@@ -3,23 +3,23 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
-  IconLayoutDashboard,
+  IconNotebook,
   IconList,
   IconUsers,
-  IconChartBar,
+  IconBook,
   IconApi,
   IconGitBranch,
   IconShieldCheck,
 } from "@tabler/icons-react";
 
-type NavItem = { href: string; label: string; icon: typeof IconLayoutDashboard; privateOnly?: boolean };
+type NavItem = { href: string; label: string; icon: typeof IconNotebook; privateOnly?: boolean };
 
 const NAV: readonly NavItem[] = [
-  { href: "/", label: "Dashboard", icon: IconLayoutDashboard },
+  { href: "/", label: "Record", icon: IconNotebook },
   { href: "/sessions", label: "Sessions", icon: IconList },
   { href: "/repos", label: "Repos", icon: IconGitBranch },
-  { href: "/u", label: "People", icon: IconUsers },
-  { href: "/analysis", label: "Analysis", icon: IconChartBar },
+  { href: "/u", label: "Operators", icon: IconUsers },
+  { href: "/analysis", label: "Ledger", icon: IconBook },
   { href: "/publish", label: "Publish", icon: IconShieldCheck, privateOnly: true },
 ] as const;
 
@@ -66,7 +66,7 @@ export function Sidebar({ publicMode = false }: { publicMode?: boolean }) {
       {/* Footer */}
       <div className="px-[18px] py-3.5 border-t border-lp-border-dim">
         <div className="text-[0.68rem] text-lp-text-faint tracking-wide mb-1.5 italic">
-          stacked session memory
+          the record of agentic work
         </div>
         <Link
           href="/api/sessions"

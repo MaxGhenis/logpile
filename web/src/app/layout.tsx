@@ -31,7 +31,8 @@ const mono = JetBrains_Mono({
 
 export const metadata: Metadata = {
   title: "Logpile",
-  description: "Stacked session memory — browse and analyze CC and Codex sessions",
+  description:
+    "The record of agentic work — a local-first archive of Claude Code and Codex sessions: indexed, readable, publishable.",
 };
 
 export default function RootLayout({
