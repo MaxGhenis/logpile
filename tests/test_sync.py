@@ -1346,6 +1346,52 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             self.assertEqual(effective["out_tokens"], 47)
             self.assertEqual(effective["approximated"], 0)
 
+    def test_sync_persists_cache_creation_on_session_row(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            write_jsonl(
+                home / ".claude" / "projects" / "-Users-alice-demo" / "cache-writes.jsonl",
+                [
+                    {
+                        "timestamp": "2026-07-02T10:00:00Z",
+                        "type": "user",
+                        "cwd": "/tmp/demo",
+                        "message": {"content": "hello"},
+                    },
+                    {
+                        "timestamp": "2026-07-02T10:00:05Z",
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg-1",
+                            "model": "claude-fable-5",
+                            "usage": {
+                                "input_tokens": 10,
+                                "cache_creation_input_tokens": 9_000,
+                                "cache_creation": {
+                                    "ephemeral_5m_input_tokens": 1_000,
+                                    "ephemeral_1h_input_tokens": 8_000,
+                                },
+                                "cache_read_input_tokens": 20_000,
+                                "output_tokens": 50,
+                            },
+                            "content": [{"type": "text", "text": "hi"}],
+                        },
+                    },
+                ],
+            )
+
+            sync_sessions(root / "shared", root / "logpile.db", "alice", "m1", home)
+
+            with open_sqlite(root / "logpile.db") as conn:
+                row = conn.execute(
+                    "SELECT * FROM sessions WHERE session_id = 'cache-writes'"
+                ).fetchone()
+            self.assertEqual(row["cache_creation_input_tokens"], 9_000)
+            self.assertEqual(row["cache_creation_5m_input_tokens"], 1_000)
+            self.assertEqual(row["cache_creation_1h_input_tokens"], 8_000)
+            self.assertEqual(row["total_input_tokens"], 10 + 9_000 + 20_000)
+
     def test_second_sync_skips_without_rehashing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
