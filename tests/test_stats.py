@@ -33,9 +33,12 @@ def _insert_session(
     conn: sqlite3.Connection,
     *,
     session_id: str,
+    source: str = "claudecode",
     username: str = "alice",
     repo_name: str | None = "my-repo",
     spawn_depth: int = 0,
+    parent_session_id: str | None = None,
+    source_path: str | None = None,
     user_message_count: int = 1,
     tool_call_count: int = 0,
     total_input_tokens: int = 1000,
@@ -49,19 +52,21 @@ def _insert_session(
         """
         INSERT INTO sessions (
             session_id, source, username, repo_name,
-            spawn_depth, user_message_count, tool_call_count,
+            spawn_depth, parent_session_id,
+            user_message_count, tool_call_count,
             total_input_tokens, total_output_tokens, cached_input_tokens,
             native_total_input_tokens, native_total_output_tokens,
             native_cached_input_tokens,
             first_timestamp, last_timestamp, source_path, shared_path
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
-            "claudecode",
+            source,
             username,
             repo_name,
             spawn_depth,
+            parent_session_id,
             user_message_count,
             tool_call_count,
             total_input_tokens,
@@ -72,7 +77,7 @@ def _insert_session(
             cached_input_tokens,
             first_timestamp,
             first_timestamp,
-            f"/tmp/{session_id}.jsonl",
+            source_path or f"/tmp/{session_id}.jsonl",
             "",
         ),
     )
@@ -125,10 +130,12 @@ def _insert_tool_call(
     session_id: str,
     command: str,
     tool_name: str = "Bash",
+    timestamp: str | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO tool_calls (session_id, tool_name, command) VALUES (?, ?, ?)",
-        (session_id, tool_name, command),
+        "INSERT INTO tool_calls (session_id, tool_name, command, timestamp) "
+        "VALUES (?, ?, ?, ?)",
+        (session_id, tool_name, command, timestamp),
     )
 
 
@@ -168,6 +175,10 @@ class TestClassifySession:
 
     def test_boundary_subagent_beats_everything(self):
         assert classify_session(1, 200, 1000) == "subagent"
+        assert (
+            classify_session(0, 200, 1000, subagent_evidence=True)
+            == "subagent"
+        )
 
     def test_boundary_long_vs_medium(self):
         assert classify_session(0, 19, 400) == "medium-conversation"
@@ -321,6 +332,32 @@ class TestComputeByPattern:
         total_pct = sum(p["pct_of_total"] for p in result)
         assert abs(total_pct - 100.0) < 0.2
 
+    def test_claude_parent_and_subagent_path_are_defensive_evidence(self):
+        conn = _make_db()
+        _insert_session(
+            conn,
+            session_id="parent-evidence",
+            spawn_depth=0,
+            parent_session_id="root-session",
+            source_path="/tmp/demo/parent-evidence.jsonl",
+            total_output_tokens=100,
+        )
+        _insert_session(
+            conn,
+            session_id="path-evidence",
+            spawn_depth=0,
+            source_path=(
+                "/tmp/.claude/projects/-tmp-demo/root-session/"
+                "subagents/agent-worker.jsonl"
+            ),
+            total_output_tokens=200,
+        )
+
+        by_name = {row["pattern"]: row for row in compute_by_pattern(conn)}
+        assert by_name["subagent"]["session_count"] == 2
+        assert by_name["subagent"]["total_output_tokens"] == 300
+        assert by_name["short-task"]["session_count"] == 0
+
 
 # ── compute_subagent_breakdown ────────────────────────────────────────
 
@@ -373,6 +410,61 @@ class TestComputeSubagentBreakdown:
         by_cat = {r["category"]: r for r in result}
         assert by_cat["git"]["pct_of_total"] == 75.0
         assert by_cat["testing"]["pct_of_total"] == 25.0
+
+    def test_bounded_rows_use_each_tool_timestamp_in_utc(self):
+        conn = _make_db()
+        # This is the minimized shape of a real Claude sidechain path.  Its
+        # stale depth and pre-period session start must not suppress tools
+        # that actually ran in the requested UTC day.
+        _insert_session(
+            conn,
+            session_id="agent-worker",
+            spawn_depth=0,
+            source_path=(
+                "/tmp/.claude/projects/-tmp-demo/root-session/"
+                "subagents/agent-worker.jsonl"
+            ),
+            first_timestamp="2026-06-01T10:00:00Z",
+        )
+        _insert_tool_call(
+            conn,
+            session_id="agent-worker",
+            command="git status",
+            timestamp="2026-07-01T23:30:00-02:00",  # July 2 UTC
+        )
+        _insert_tool_call(
+            conn,
+            session_id="agent-worker",
+            command="pytest tests/",
+            timestamp="2026-07-03T00:30:00+02:00",  # July 2 UTC
+        )
+        _insert_tool_call(
+            conn,
+            session_id="agent-worker",
+            command="gh pr list",
+            timestamp="2026-07-02T23:30:00-02:00",  # July 3 UTC
+        )
+        _insert_tool_call(
+            conn,
+            session_id="agent-worker",
+            command="rg missing timestamp",
+        )
+        _insert_tool_call(
+            conn,
+            session_id="agent-worker",
+            command="python malformed.py",
+            timestamp="not-a-timestamp",
+        )
+
+        result = compute_subagent_breakdown(
+            conn,
+            since="2026-07-02",
+            until="2026-07-02",
+        )
+        by_cat = {row["category"]: row for row in result}
+        assert set(by_cat) == {"git", "testing"}
+        assert by_cat["git"]["command_count"] == 1
+        assert by_cat["testing"]["command_count"] == 1
 
 
 # ── compute_by_repo ───────────────────────────────────────────────────
@@ -445,6 +537,143 @@ class TestComputeByRepo:
         )
         result = compute_by_repo(conn)
         assert result[0]["repo_name"] == "big"
+
+
+# ── bounded event-period semantics ───────────────────────────────────
+
+
+class TestBoundedEventPeriodSemantics:
+    def test_all_sections_use_daily_usage_and_count_active_sessions_once(self):
+        conn = _make_db()
+
+        # Started before the range, but active on two in-range days.
+        _insert_session(
+            conn,
+            session_id="pre-range-active",
+            repo_name="repo-a",
+            first_timestamp="2026-06-01T10:00:00Z",
+            total_input_tokens=10_000,
+            total_output_tokens=1_000,
+            cached_input_tokens=1_000,
+        )
+        _insert_daily(
+            conn,
+            session_id="pre-range-active",
+            day="2026-06-30",
+            total_input_tokens=100,
+            total_output_tokens=10,
+            cached_input_tokens=10,
+        )
+        _insert_daily(
+            conn,
+            session_id="pre-range-active",
+            day="2026-07-05",
+            total_input_tokens=1_000,
+            total_output_tokens=100,
+            cached_input_tokens=100,
+            cache_creation_input_tokens=50,
+        )
+        _insert_daily(
+            conn,
+            session_id="pre-range-active",
+            day="2026-07-06",
+            total_input_tokens=2_000,
+            total_output_tokens=200,
+            cached_input_tokens=200,
+            cache_creation_input_tokens=60,
+        )
+        _insert_daily(
+            conn,
+            session_id="pre-range-active",
+            day="2026-07-20",
+            total_input_tokens=6_900,
+            total_output_tokens=690,
+            cached_input_tokens=690,
+        )
+
+        # Started in range, but most of its lifetime usage happened after it.
+        _insert_session(
+            conn,
+            session_id="starts-inside",
+            repo_name="repo-b",
+            spawn_depth=1,
+            first_timestamp="2026-07-08T10:00:00Z",
+            total_input_tokens=4_000,
+            total_output_tokens=400,
+            cached_input_tokens=400,
+        )
+        _insert_daily(
+            conn,
+            session_id="starts-inside",
+            day="2026-07-08",
+            total_input_tokens=400,
+            total_output_tokens=40,
+            cached_input_tokens=40,
+            cache_creation_input_tokens=10,
+        )
+        _insert_daily(
+            conn,
+            session_id="starts-inside",
+            day="2026-08-01",
+            total_input_tokens=3_600,
+            total_output_tokens=360,
+            cached_input_tokens=360,
+        )
+
+        # No event in the requested range, so this session is not active.
+        _insert_session(
+            conn,
+            session_id="outside-only",
+            repo_name="repo-c",
+            first_timestamp="2026-05-01T10:00:00Z",
+            total_input_tokens=500,
+            total_output_tokens=50,
+        )
+        _insert_daily(
+            conn,
+            session_id="outside-only",
+            day="2026-06-15",
+            total_input_tokens=500,
+            total_output_tokens=50,
+        )
+
+        kwargs = {"since": "2026-07-01", "until": "2026-07-10"}
+        overview = compute_overview(conn, **kwargs)
+        patterns = compute_by_pattern(conn, **kwargs)
+        repos = compute_by_repo(conn, **kwargs)
+        by_pattern = {row["pattern"]: row for row in patterns}
+        by_repo = {row["repo_name"]: row for row in repos}
+
+        assert overview == {
+            "total_sessions": 2,
+            "first_date": "2026-07-05",
+            "last_date": "2026-07-08",
+            "total_input_tokens": 3_400,
+            "total_output_tokens": 340,
+            "cached_input_tokens": 340,
+            "cache_creation_input_tokens": 120,
+            "repos_touched": 2,
+        }
+        # The two days for repo-a still represent one active session.
+        assert by_pattern["short-task"]["session_count"] == 1
+        assert by_pattern["short-task"]["total_output_tokens"] == 300
+        assert by_pattern["subagent"]["session_count"] == 1
+        assert by_pattern["subagent"]["total_output_tokens"] == 40
+        assert by_repo["repo-a"]["session_count"] == 1
+        assert by_repo["repo-a"]["total_output_tokens"] == 300
+        assert by_repo["repo-b"]["session_count"] == 1
+        assert by_repo["repo-b"]["total_output_tokens"] == 40
+
+        assert sum(row["session_count"] for row in patterns) == overview["total_sessions"]
+        assert sum(row["total_output_tokens"] for row in patterns) == overview["total_output_tokens"]
+        assert sum(row["session_count"] for row in repos) == overview["total_sessions"]
+        assert sum(row["total_output_tokens"] for row in repos) == overview["total_output_tokens"]
+
+        # Supplying no date bounds intentionally retains whole-session rows.
+        unbounded = compute_overview(conn)
+        assert unbounded["total_sessions"] == 3
+        assert unbounded["total_input_tokens"] == 14_500
+        assert unbounded["total_output_tokens"] == 1_450
 
 
 # ── compute_by_period ─────────────────────────────────────────────────
@@ -566,6 +795,42 @@ class TestComputeByPeriod:
         by_month = {r["month"]: r for r in result}
         assert by_month["2026-01"]["cache_creation_input_tokens"] == 4_000
         assert by_month["2026-01"]["total_input_tokens"] == 5_000
+
+    def test_tokens_per_day_uses_bounded_partial_month_days(self):
+        conn = _make_db()
+        _insert_session(
+            conn,
+            session_id="january",
+            first_timestamp="2026-01-15T10:00:00Z",
+        )
+        _insert_daily(
+            conn,
+            session_id="january",
+            day="2026-01-15",
+            total_output_tokens=1_700,
+        )
+        _insert_session(
+            conn,
+            session_id="march",
+            first_timestamp="2026-03-10T10:00:00Z",
+        )
+        _insert_daily(
+            conn,
+            session_id="march",
+            day="2026-03-10",
+            total_output_tokens=1_000,
+        )
+
+        result = compute_by_period(
+            conn,
+            since="2026-01-15",
+            until="2026-03-10",
+        )
+        by_month = {row["month"]: row for row in result}
+
+        # Jan 15-31 is 17 included days; Mar 1-10 is 10.
+        assert by_month["2026-01"]["tokens_per_day"] == 100
+        assert by_month["2026-03"]["tokens_per_day"] == 100
 
 
 # ── compute_stats (end-to-end) ────────────────────────────────────────

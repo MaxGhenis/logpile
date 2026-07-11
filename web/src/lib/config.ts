@@ -13,6 +13,6 @@ export const config = {
     process.env.LOGPILE_SHARED_DIR ||
     path.resolve(process.cwd(), "..", "shared"),
 
-  /** When true, hide unlisted/private content, show only public profiles */
+  /** When true, serve only reviewed public sessions; unlisted stays local-only. */
   publicMode: process.env.LOGPILE_PUBLIC_MODE === "true",
 };

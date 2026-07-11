@@ -1,5 +1,8 @@
 # Token Forensics: Codex vs Claude Code
 
+> Quoted session prompts and the session id were redacted 2026-07-11 ahead of publication; all figures and analysis are unchanged.
+
+
 Date: 2026-04-13
 
 ## Question
@@ -193,7 +196,7 @@ In other words:
 
 ### Concrete example
 
-One April 8 child session (`019d6d47-465a-7321-a4a4-6c6d42b3ef4f`) matched its immediate parent's cumulative totals for 14,104 token-count events out of 14,122.
+One April 8 child session (`(session id redacted)`) matched its immediate parent's cumulative totals for 14,104 token-count events out of 14,122.
 
 So replay stripping is doing real work there.
 
@@ -203,9 +206,9 @@ But after that near-complete replay, the child still accumulated roughly another
 
 For April 8-14, 2026, the biggest deduped root workstreams were:
 
-- `check out mark sarneys email to me ... crfb-tob-impacts`: ~32.69B across 28 sessions
-- `check on policyengine-uk and uk-data repos ...`: ~12.82B across 38 sessions
-- `think i made a pe project simulating bbce repeal ...`: ~12.63B across 25 sessions
+- `(email-triage → tax-policy analysis root)`: ~32.69B across 28 sessions
+- `(multi-repo triage root)`: ~12.82B across 38 sessions
+- `(benefit-reform simulation root)`: ~12.63B across 25 sessions
 
 Those top three roots alone account for ~58.14B tokens, about 72% of the week's deduped total.
 
@@ -229,35 +232,35 @@ So the operational problem is less "fix the parser" and more:
 
 The biggest fork-heavy workstreams for April 8-14, 2026 looked like this:
 
-- `check out mark sarneys email to me ... crfb-tob-impacts`
+- `(email-triage → tax-policy analysis root)`
   - root total: ~32.69B across 28 sessions
   - biggest children:
     - `Locke` explorer: ~1.63B, cached/input share ~94.4%
     - `Faraday` explorer: ~1.41B, cached/input share ~94.4%
     - `Nash` explorer: ~1.41B, cached/input share ~94.5%
 
-- `think i made a pe project simulating bbce repeal ...`
+- `(benefit-reform simulation root)`
   - root total: ~14.29B across 27 sessions
   - biggest children:
     - `Feynman` explorer: ~826M, cached/input share ~94.8%
     - `Kant` explorer: ~825M, cached/input share ~94.8%
     - `Mendel` explorer: ~750M, cached/input share ~94.7%
 
-- `check on policyengine-uk and uk-data repos ...`
+- `(multi-repo triage root)`
   - root total: ~14.16B across 40 sessions
   - biggest children:
     - `Hooke` explorer: ~657M, cached/input share ~96.0%
     - `Dirac` explorer: ~655M, cached/input share ~96.0%
     - `Ohm` explorer: ~589M, cached/input share ~95.9%
 
-- `review policyengine-us-data's calibration ...`
+- `(data-calibration review root)`
   - root total: ~3.85B across 25 sessions
   - biggest children:
     - `Archimedes` explorer: ~369M, cached/input share ~96.3%
     - `Gibbs` explorer: ~367M, cached/input share ~96.4%
     - `Kepler` explorer: ~305M, cached/input share ~96.5%
 
-- `wdyt of the axiom foundation proposal?`
+- `(org proposal review root)`
   - root total: ~3.62B across 8 sessions
   - biggest children:
     - `Huygens` explorer: ~556M, cached/input share ~91.3%

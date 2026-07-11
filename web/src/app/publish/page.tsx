@@ -104,7 +104,7 @@ export default async function PublishQueuePage({
           </div>
           <div className="flex items-center gap-2 text-xs text-lp-text-faint">
             <IconShieldCheck size={14} stroke={1.5} />
-            private — local only
+            unlisted stays local/link-only; public requires review
           </div>
         </div>
 

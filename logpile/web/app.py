@@ -55,7 +55,15 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
 
     def _listed_profile_clause(alias: str = "u") -> str:
         if _is_public_mode():
-            return f"{alias}.listed_public = 1"
+            return f"""(
+                {alias}.listed_public = 1
+                AND EXISTS (
+                    SELECT 1
+                    FROM session_catalog profile_visible_session
+                    WHERE profile_visible_session.username = {alias}.username
+                      AND profile_visible_session.direct_public = 1
+                )
+            )"""
         return f"{alias}.listed_private = 1"
 
     def _direct_profile_clause(alias: str = "u") -> str:
@@ -80,8 +88,28 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         if not _is_public_mode():
             return True
         if "direct_public" in row.keys():
-            return bool(row["direct_public"])
-        return row["profile_visibility"] in ("public", "unlisted")
+            profile_allows_direct = bool(row["direct_public"])
+        else:
+            profile_allows_direct = row["profile_visibility"] in (
+                "public",
+                "unlisted",
+            )
+        if not profile_allows_direct:
+            return False
+        # Profile free text is reviewed with a published session. A profile
+        # edit revokes those sessions, so do not expose the edit on an empty
+        # public profile page or API response.
+        return bool(
+            _db().execute(
+                """
+                SELECT 1
+                FROM session_catalog s
+                WHERE s.username = ? AND s.direct_public = 1
+                LIMIT 1
+                """,
+                (row["username"],),
+            ).fetchone()
+        )
 
     def _parse_int_arg(
         name: str,
@@ -1057,6 +1085,8 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             SELECT
                 s.*,
                 COALESCE(u.display_name, s.username) AS user_display_name,
+                u.bio AS user_bio,
+                u.avatar_url AS user_avatar_url,
                 u.direct_public AS user_direct_public,
                 u.direct_private AS user_direct_private
             FROM session_catalog s
@@ -1072,25 +1102,55 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         if _is_public_mode() and not row["user_direct_public"]:
             abort(404)
 
-        candidate_paths = []
-        if row["shared_path"]:
-            candidate_paths.append(Path(row["shared_path"]))
-            shared_root = app.config.get("SHARED_DIR")
-            if shared_root:
-                candidate_paths.append(
-                    Path(shared_root)
-                    / row["username"]
-                    / row["source"]
-                    / row["project"]
-                    / Path(row["shared_path"]).name
-                )
-        if row["source_path"]:
-            candidate_paths.append(Path(row["source_path"]))
-
-        path = next((candidate for candidate in candidate_paths if candidate.exists()), None)
-
+        path = None
         turns = []
-        if path:
+        if _is_public_mode():
+            if row["visibility"] != "public":
+                abort(404)
+            from ..publish import open_verified_public_artifact
+
+            shared_root = app.config.get("SHARED_DIR")
+            if not shared_root:
+                abort(404)
+            with open_verified_public_artifact(
+                row,
+                shared_dir=Path(shared_root),
+            ) as artifact_stream:
+                if artifact_stream is None:
+                    abort(404)
+                try:
+                    if row["source"] == "claudecode":
+                        turns = render_claudecode_transcript(artifact_stream)
+                    else:
+                        turns = render_codex_transcript(artifact_stream)
+                except Exception as exc:
+                    turns = [{
+                        "type": "error",
+                        "content": f"Failed to parse transcript: {exc}",
+                    }]
+        else:
+            candidate_paths = []
+            if row["shared_path"]:
+                candidate_paths.append(Path(row["shared_path"]))
+                shared_root = app.config.get("SHARED_DIR")
+                if shared_root:
+                    candidate_paths.append(
+                        Path(shared_root)
+                        / row["username"]
+                        / row["source"]
+                        / row["project"]
+                        / Path(row["shared_path"]).name
+                    )
+            if row["source_path"]:
+                candidate_paths.append(
+                    Path(row["source_path"])
+                )
+            path = next(
+                (candidate for candidate in candidate_paths if candidate.exists()),
+                None,
+            )
+
+        if not _is_public_mode() and path:
             try:
                 if row["source"] == "claudecode":
                     turns = render_claudecode_transcript(path)
@@ -1228,8 +1288,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                   AND (
                     s.parent_session_id IS NOT NULL
                     OR EXISTS (
-                      SELECT 1 FROM sessions child
+                      SELECT 1 FROM session_catalog child
                       WHERE child.parent_session_id = s.session_id
+                        AND { _listed_session_clause("child") }
                     )
                   )
                   AND (COALESCE(s.total_input_tokens, 0) + COALESCE(s.total_output_tokens, 0)) > 0
@@ -1246,7 +1307,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                     parent.session_id AS current_session_id,
                     parent.parent_session_id AS parent_session_id
                 FROM lineage
-                JOIN sessions parent ON parent.session_id = lineage.parent_session_id
+                JOIN session_catalog parent
+                  ON parent.session_id = lineage.parent_session_id
+                 AND { _listed_session_clause("parent") }
                 WHERE lineage.parent_session_id IS NOT NULL
             ),
             roots AS (
@@ -1285,8 +1348,12 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 root.objective_label AS root_objective_label
             FROM recent
             JOIN roots ON roots.leaf_session_id = recent.session_id
-            JOIN session_catalog s ON s.session_id = recent.session_id
-            JOIN session_catalog root ON root.session_id = roots.root_session_id
+            JOIN session_catalog s
+              ON s.session_id = recent.session_id
+             AND { _listed_session_clause("s") }
+            JOIN session_catalog root
+              ON root.session_id = roots.root_session_id
+             AND { _listed_session_clause("root") }
             ORDER BY root.first_timestamp DESC, s.first_timestamp DESC
             """,
             ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),),

@@ -5,6 +5,12 @@ Bakes real aggregates from logpile.db (the author's live index) into a
 self-contained HTML file. No fabricated numbers: every figure is queried at
 build time and the page is stamped with the as-of date. Deploy with
 scripts/deploy_landing.sh (Cloudflare Worker).
+
+This is intentionally an aggregate publication, independent of per-session
+visibility: totals and daily cadence include the author's private, unlisted,
+and public sessions, while no transcript content or session metadata is
+emitted.  Keep the landing page's existing fine-print disclosure in sync with
+that policy.
 """
 
 from __future__ import annotations
@@ -72,7 +78,7 @@ def build() -> None:
 
     stats_line = (
         f"{ov['sessions']:,} sessions · {fmt_b(ov['out_tokens'])} output tokens · "
-        f"{ov['repos']:,} repo checkouts — the author's index, as of {today}."
+        f"{ov['repos']:,} repos — the author's index, as of {today}."
     )
 
     page = f"""<!doctype html>

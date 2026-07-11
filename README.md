@@ -11,16 +11,23 @@ Source: **[github.com/MaxGhenis/logpile](https://github.com/MaxGhenis/logpile)**
 
 ## Quick start
 
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and
+[Bun](https://bun.sh/docs/installation), then use the checkout wrapper as the
+canonical entry point:
+
 ```bash
 git clone https://github.com/MaxGhenis/logpile ~/logpile && cd ~/logpile
-uv venv --python 3.11 && uv pip install -e .
-
-logpile sync          # index your local CC and Codex sessions
-logpile search "thing I asked about"
-logpile serve         # open http://127.0.0.1:5002
+./logpile.sh sync          # bootstrap and index local CC and Codex sessions
+./logpile.sh search "thing I asked about"
+./logpile.sh serve         # open http://127.0.0.1:5002
 ```
 
-`logpile serve` builds and starts the Next.js app. Add `--dev` for HMR during development. Add `--public` to expose only public sessions and profiles (safe for hosted instances).
+`logpile.sh` checks its prerequisites, creates `.venv`, installs the Python
+package, and uses `web/bun.lock` when it installs web dependencies. It also
+resolves symlink chains, so you can optionally link it into a directory already
+on `PATH` (for example, `ln -s ~/logpile/logpile.sh ~/bin/logpile`).
+
+`./logpile.sh serve` builds and starts the Next.js app. Add `--dev` for HMR during development. Add `--public` to expose only public sessions and profiles (safe for hosted instances).
 
 Logpile is local-first by default. Nothing leaves your machine unless you opt into the cloud backend with `LOGPILE_BACKEND=cloud`, `--backend cloud`, or the `logpile backup` commands.
 
@@ -35,7 +42,11 @@ Not just a JSONL viewer — filter by repo, git branch, activity (wrote files, r
 Every analytics page splits by *how the session started*: your direct work, delegated sub-agents, pipeline evals, meta-scaffolding, or system-generated. Stop mixing "what I coded this week" with what your test runners did overnight.
 
 ### Publish queue with secret/PII scanning
-Before anything leaves `private` → `unlisted` → `public`, Logpile scans the transcript and flags findings by severity. You get a recommended visibility and a list of evidence, per session, so the triage step is actual review, not guesswork.
+`unlisted` is a local/link-only state and does not require review. Before a session can become `public`, Logpile scans its transcript and rendered metadata, stores the reviewed transcript and metadata hashes plus an immutable artifact, and flags findings by severity. Transcript or public-metadata drift revokes and requeues the publication. You get a recommended visibility and a list of evidence, per session, so the public gate is an actual review, not guesswork.
+
+Rendered operator metadata (display name, bio, and avatar URL) is part of that
+review fingerprint. Editing it revokes affected public sessions, and the public
+profile stays hidden until at least one current session is reviewed again.
 
 ### Context explosion analysis
 For Codex: detects fork-swarm roots whose children are carrying large inherited-context burden. Surfaces cached-input share, child-token share, spawn depth, and warnings like "mostly inherited context", "fork swarm", "giant child sessions". Tells you where your token budget is actually going.
@@ -91,43 +102,54 @@ activity counts, narrative fields, and origin classification, then writes to
 SQLite. If a rollout stem exists in more than one root (mid-archive race),
 the live `sessions/` copy wins. Unchanged files are skipped on a size+mtime
 fast path, so multi-GB immutable archives are hashed once, not every sync.
+Logpile intentionally keeps archival shared copies. Before copying, sync prints
+the planned copy count/volume and available free space; it refuses an
+insufficient-space plan. A source hash/mtime is committed only after the shared
+copy matches that hash, and failed verification is persisted for retry.
 
 #### Token accounting
 
 - **Codex** `token_count` events carry *cumulative* counters, and resuming or
   forking a session writes a new rollout file that replays the whole prior
-  history re-stamped into a single wall-clock second under a fresh session
-  id. Sync detects that leading same-second burst (two `token_count` events
-  can never share a second live), folds it into a delta baseline, and
-  accumulates clamped per-event deltas — so each file contributes only its
-  live continuation, and replayed messages/tool calls are not re-counted
-  either. (`first_user_message` is still taken from the replay so resumed
-  sessions keep their topic.)
+  history under a fresh session id. Sync requires the structural fork prefix
+  (the leaf metadata followed by its exact `forked_from_id`) and finds the
+  first native task from Codex's task clocks; it does not infer replay from
+  same-second timestamps. The terminal inherited counter state becomes the
+  baseline, while explicit all-zero resets start new billing epochs whose
+  deltas are summed. Replayed messages/tool calls are not re-counted, fresh
+  files retain all live work, and multi-second copied prefixes stay inherited.
+  (`first_user_message` is still taken from the replay so resumed sessions
+  keep their topic.)
 - **Claude Code** assistant records are deduplicated by `message.id` within a
-  file, and cache writes (`cache_creation_input_tokens`, split 5m/1h) are
-  captured alongside fresh input and cache reads.
+  file, and cache writes (`cache_creation_input_tokens`, split 5m/1h/unknown)
+  are captured alongside fresh input and cache reads. Fallback records use the
+  usage iteration whose complete token tuple matches the top-level result;
+  contradictory or incomplete subtype data is retained as an explicit unknown
+  remainder, so the subtype sum always equals total cache creation.
   `total_input_tokens = fresh + cache_creation + cache_read`.
 - **Per-day usage** (`session_daily_usage`) buckets tokens, messages, and
   tool calls by the UTC day of the underlying events. Date-bucketed rollups
   (`logpile stats` by-month, the per-day charts in both web UIs) read the
   `session_daily_effective` view, which falls back to start-date attribution
   for sessions not yet re-synced — a session spanning weeks no longer dumps
-  all its usage on its start date.
+  all its usage on its start date. Usage without an attributable timestamp is
+  persisted on a deterministic residual day with `approximated = 1`, and every
+  daily component is required to sum to its session total.
 
 ##### Cross-session dedup (`native_*` columns)
 
 Resuming a *Claude Code* session copies prior history into a new file and
 re-stamps each record's `sessionId`, so replayed Claude messages are locally
 indistinguishable from native ones — but they keep their original
-`message.id`, `requestId`, `uuid`, and timestamps. Sync claims each parsed
-assistant message in the `message_claims` table under the same key the
+`message.id`, `requestId`, `uuid`, and timestamps. Sync stores every parsed
+assistant-message occurrence in `message_claims` under the same key the
 usage-tracker pipeline uses (`message.id:requestId`); among the sessions
 containing a message, the owner is the one with the smallest
 `(last_timestamp, first_timestamp, session_id)` — the earliest-ending
 transcript, i.e. the session where the message actually ran (a resume copy
 always ends at or after its source). That min-rule is order-independent, so
-re-parsing files in any order, or rebuilding the database from scratch,
-converges to the same owners.
+re-parsing files in any order, changing a session's rank, or removing a prior
+winner immediately derives the same owner from all remaining occurrences.
 
 Every token column therefore exists in two flavors:
 
@@ -163,6 +185,25 @@ LOGPILE_SUPABASE_DB_URL="postgresql://..." logpile search "specific thing x" --b
 ```
 
 Local mode is the privacy-preserving path: it reads only your local SQLite database and local JSONL files. Cloud mode reads Supabase/Postgres search chunks and links those chunks back to immutable raw objects in R2/S3.
+
+### `logpile db-backup`
+
+Creates a snapshot-consistent copy of the local SQLite metadata database with
+SQLite `VACUUM INTO`, then verifies the result with `quick_check`:
+
+```bash
+mkdir -p ~/backups
+./logpile.sh db-backup ~/backups/logpile-$(date +%F).db
+
+# Back up a non-default database.
+./logpile.sh db-backup ~/backups/team.db --db /path/to/logpile.db
+```
+
+This preserves the catalog metadata that cannot be rebuilt from transcripts,
+including profiles, visibility and review decisions, and rules. It does not
+copy transcript JSONL files. Preserve those separately with the cloud backup
+workflow below or an appropriate filesystem backup; do not copy or commit the
+live `logpile.db` while WAL mode is active.
 
 ### `logpile backup`
 
@@ -200,26 +241,46 @@ logpile backup index --from-r2 --missing --defer-search-index
 logpile backup search-index
 ```
 
-Install cloud support with `uv pip install -e '.[cloud]'`. Raw objects are stored under content-addressed keys such as `raw/sha256/ab/<sha256>.jsonl`; Postgres stores object manifests, source paths, byte ranges, and exact searchable text chunks. Full-text search is indexed by default, while substring search falls back to a direct scan so bulk imports do not create a very large trigram index unless a deployment chooses to add one later. The backup command never deletes local files.
+Install cloud support with `uv pip install -e '.[cloud]'`. Backup uses the same
+Claude, Codex, alternate Codex-home, and OpenClaw discovery roots as sync. Pass
+`--db` and `--shared` when they differ from the defaults so sole-survivor shared
+artifacts whose native source rotated away are included too; byte-identical
+files are deduplicated by SHA-256. Raw objects are stored under
+content-addressed keys such as `raw/sha256/ab/<sha256>.jsonl`; Postgres stores
+object manifests, source paths, byte ranges, and exact searchable text chunks.
+Full-text search is indexed by default, while substring search falls back to a
+direct scan so bulk imports do not create a very large trigram index unless a
+deployment chooses to add one later. The backup command never deletes local
+files.
 
 ### `logpile serve`
 
-Starts the Next.js web app.
+Starts the Next.js web app. Serving is intentionally source-checkout-only: the
+Python wheel does not package either web UI. From a wheel install, `logpile
+serve` exits with instructions to clone the source checkout. The Python-only
+core commands (`sync`, `stats`, `search`, and `db-backup`) continue to work from
+the wheel.
 
 ```
 Options:
   --shared PATH     Shared directory
   --db PATH         SQLite database
-  --host TEXT       Bind address        [default: 0.0.0.0]
+  --host TEXT       Bind address        [default: 127.0.0.1]
   --port INTEGER    Port                [default: 5002]
   --public          Public read-only mode
+  --unsafe-network  Allow private mode beyond loopback
   --dev             Next.js dev server with HMR
 ```
 
+Private mode is unauthenticated and refuses non-loopback bind addresses unless
+you explicitly pass `--unsafe-network`. Public mode may bind to a network
+interface without that override.
+
 `--public` mode enforces the hosted contract:
 - only `public` sessions appear in listings and aggregate APIs
-- `unlisted` sessions remain direct-link only
+- `unlisted` sessions are local/link artifacts and are never served
 - `private` sessions are hidden entirely
+- public transcripts come only from hash-verified immutable reviewed artifacts
 - `/publish` queue is unavailable
 
 ### `logpile publish queue`
@@ -243,11 +304,14 @@ Scans one session's transcript for secrets/PII and prints a recommendation + fin
 
 ### `logpile publish approve <session-id>` / `logpile publish apply <session-id>`
 
-Apply a reviewed visibility decision. Defaults to `--visibility unlisted`. `--force` overrides the review recommendation.
+Apply a reviewed visibility decision. Defaults to `--visibility unlisted`. `--force` overrides the review recommendation. A `public` decision records the reviewed SHA-256 and immutable artifact; later source drift revokes and requeues that revision.
 
 ### `logpile private <session-id>` / `logpile visibility <session-id> <level>`
 
-Set session visibility manually. Manual settings win over rules.
+Set session visibility manually. Manual settings win over rules. Moving to
+`unlisted` is allowed without review, emits an explicit local/link-only
+warning, and is audited. Moving to `public` is rejected until the current
+revision has a successful publish review.
 
 ### `logpile users` / `logpile user <username>`
 
@@ -266,7 +330,7 @@ Three session visibility levels:
 | Level | In listings | Direct-link | Profile totals | Public mode |
 |---|---|---|---|---|
 | `public` | ✓ | ✓ | ✓ | ✓ visible |
-| `unlisted` | hidden | ✓ | ✓ | direct-link only |
+| `unlisted` | hidden | ✓ (local/private mode) | ✓ (local/private mode) | hidden entirely |
 | `private` | hidden | hidden | — | hidden entirely |
 
 Plus matching profile visibility at `/u/<username>`.
@@ -342,27 +406,25 @@ One-click to `/publish/review/<id>` for full findings with evidence and line num
 
 ## Multi-user setup
 
-Point each machine at the same shared folder and DB path:
+Keep each SQLite database, its WAL/SHM files, and the sync lock on local storage
+owned by one host. SQLite WAL relies on same-host shared memory, so multiple
+machines must not open one `logpile.db` over NFS, SMB, or another network
+filesystem.
 
-```bash
-# On each team member's machine:
-logpile sync --shared /Volumes/team-share/logpile/shared \
-             --db     /Volumes/team-share/logpile/logpile.db
-
-# One person runs the public viewer:
-logpile serve --shared /Volumes/team-share/logpile/shared \
-              --db     /Volumes/team-share/logpile/logpile.db \
-              --host 0.0.0.0 --public
-```
-
-Or commit the shared directory + SQLite to a private git repo. The DB uses WAL so concurrent readers work fine while someone else is syncing.
+For several operators, either keep an independent local index per machine
+(using an explicit `--username` for each operator) or run sync and the viewer
+on one DB-owning host. The cloud backup/search backend uses R2-compatible object
+storage and Postgres when a shared raw-log archive is needed. Back up local
+metadata with `logpile db-backup`; do not commit the live database or generated
+`shared/` tree to Git.
 
 ---
 
 ## Requirements
 
 - Python 3.11+ (for the sync CLI and publish scanner)
-- [bun](https://bun.sh) ≥ 1.3 (for the Next.js app — installed automatically on first `logpile serve`)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (for Python environment bootstrap)
+- [Bun](https://bun.sh/docs/installation) ≥ 1.3 (for the Next.js app)
 - Everything else is local. No external services, no accounts required.
 
 ## Legacy compatibility

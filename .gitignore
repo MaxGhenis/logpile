@@ -14,6 +14,7 @@ __pycache__/
 # Local runtime data
 /logpile.db*
 /shared/
+/.shared-private/
 /web-history.bundle
 
 # Next app build/runtime
@@ -35,3 +36,4 @@ __pycache__/
 # sync artifacts
 *.sync.lock
 *.tmp-sync
+/supabase/.temp/
