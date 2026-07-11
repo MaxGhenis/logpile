@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
+from logpile.db import migrate_db
 from logpile.stats import (
     classify_session,
     compute_by_pattern,
@@ -19,34 +20,12 @@ from logpile.stats import (
 
 
 def _make_db() -> sqlite3.Connection:
+    # Real schema (including session_daily_usage and the
+    # session_daily_effective view) so stats queries run against what
+    # production runs against.
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    conn.executescript(
-        """
-        CREATE TABLE sessions (
-            session_id TEXT PRIMARY KEY,
-            source TEXT NOT NULL,
-            username TEXT NOT NULL,
-            repo_name TEXT,
-            spawn_depth INTEGER DEFAULT 0,
-            user_message_count INTEGER DEFAULT 0,
-            tool_call_count INTEGER DEFAULT 0,
-            total_input_tokens INTEGER DEFAULT 0,
-            total_output_tokens INTEGER DEFAULT 0,
-            cached_input_tokens INTEGER DEFAULT 0,
-            first_timestamp TEXT,
-            last_timestamp TEXT
-        );
-        CREATE TABLE tool_calls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            tool_name TEXT NOT NULL,
-            command TEXT,
-            timestamp TEXT,
-            is_error INTEGER DEFAULT 0
-        );
-        """
-    )
+    migrate_db(conn)
     return conn
 
 
@@ -70,8 +49,8 @@ def _insert_session(
             session_id, source, username, repo_name,
             spawn_depth, user_message_count, tool_call_count,
             total_input_tokens, total_output_tokens, cached_input_tokens,
-            first_timestamp, last_timestamp
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            first_timestamp, last_timestamp, source_path, shared_path
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
@@ -86,6 +65,43 @@ def _insert_session(
             cached_input_tokens,
             first_timestamp,
             first_timestamp,
+            f"/tmp/{session_id}.jsonl",
+            "",
+        ),
+    )
+
+
+def _insert_daily(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    day: str,
+    total_input_tokens: int = 0,
+    total_output_tokens: int = 0,
+    cached_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
+    user_message_count: int = 0,
+    assistant_message_count: int = 0,
+    tool_call_count: int = 0,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO session_daily_usage (
+            session_id, day, total_input_tokens, total_output_tokens,
+            cached_input_tokens, cache_creation_input_tokens,
+            user_message_count, assistant_message_count, tool_call_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            day,
+            total_input_tokens,
+            total_output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+            user_message_count,
+            assistant_message_count,
+            tool_call_count,
         ),
     )
 
@@ -468,6 +484,75 @@ class TestComputeByPeriod:
         conn = _make_db()
         result = compute_by_period(conn)
         assert result == []
+
+    def test_long_session_lands_on_event_months_not_start_month(self):
+        # A session spanning Apr->Jun used to dump everything on April
+        # (that direction-flipped the Apr-Jun 2026 dashboard rollup).
+        conn = _make_db()
+        _insert_session(
+            conn,
+            session_id="marathon",
+            first_timestamp="2026-04-01T10:00:00Z",
+            total_output_tokens=900,
+        )
+        _insert_daily(
+            conn, session_id="marathon", day="2026-04-01", total_output_tokens=100
+        )
+        _insert_daily(
+            conn, session_id="marathon", day="2026-06-20", total_output_tokens=800
+        )
+        result = compute_by_period(conn)
+        by_month = {r["month"]: r for r in result}
+        assert by_month["2026-04"]["total_output_tokens"] == 100
+        assert by_month["2026-06"]["total_output_tokens"] == 800
+        assert "2026-05" not in by_month
+
+    def test_sessions_without_daily_rows_fall_back_to_start_month(self):
+        conn = _make_db()
+        _insert_session(
+            conn,
+            session_id="with-daily",
+            first_timestamp="2026-01-10T10:00:00Z",
+            total_output_tokens=999,  # session total ignored when daily rows exist
+        )
+        _insert_daily(
+            conn, session_id="with-daily", day="2026-03-05", total_output_tokens=250
+        )
+        _insert_session(
+            conn,
+            session_id="legacy",
+            first_timestamp="2026-01-20T10:00:00Z",
+            total_output_tokens=200,
+        )
+        result = compute_by_period(conn)
+        by_month = {r["month"]: r for r in result}
+        assert by_month["2026-01"]["total_output_tokens"] == 200
+        assert by_month["2026-03"]["total_output_tokens"] == 250
+
+    def test_cache_creation_rolls_up_per_month(self):
+        conn = _make_db()
+        _insert_session(
+            conn,
+            session_id="s1",
+            first_timestamp="2026-01-10T10:00:00Z",
+        )
+        _insert_daily(
+            conn,
+            session_id="s1",
+            day="2026-01-10",
+            total_input_tokens=5_000,
+            cache_creation_input_tokens=4_000,
+        )
+        _insert_session(
+            conn,
+            session_id="s2",
+            first_timestamp="2026-03-15T10:00:00Z",
+        )
+        _insert_daily(conn, session_id="s2", day="2026-03-15", total_output_tokens=10)
+        result = compute_by_period(conn)
+        by_month = {r["month"]: r for r in result}
+        assert by_month["2026-01"]["cache_creation_input_tokens"] == 4_000
+        assert by_month["2026-01"]["total_input_tokens"] == 5_000
 
 
 # ── compute_stats (end-to-end) ────────────────────────────────────────

@@ -83,7 +83,44 @@ Options:
   -v, --verbose     Print each file processed
 ```
 
-Scans `~/.claude/projects/**/*.jsonl` and `~/.codex/sessions/**/*.jsonl`, extracts repo metadata, activity counts, narrative fields, and origin classification, then writes to SQLite.
+Scans `~/.claude/projects/**/*.jsonl` plus every Codex rollout root —
+`~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.codex-2/sessions`,
+`~/.codex-3/sessions`, and OpenClaw codex homes
+(`~/.openclaw/agents/*/agent/codex-home/sessions`) — extracts repo metadata,
+activity counts, narrative fields, and origin classification, then writes to
+SQLite. If a rollout stem exists in more than one root (mid-archive race),
+the live `sessions/` copy wins. Unchanged files are skipped on a size+mtime
+fast path, so multi-GB immutable archives are hashed once, not every sync.
+
+#### Token accounting
+
+- **Codex** `token_count` events carry *cumulative* counters, and resuming or
+  forking a session writes a new rollout file that replays the whole prior
+  history re-stamped into a single wall-clock second under a fresh session
+  id. Sync detects that leading same-second burst (two `token_count` events
+  can never share a second live), folds it into a delta baseline, and
+  accumulates clamped per-event deltas — so each file contributes only its
+  live continuation, and replayed messages/tool calls are not re-counted
+  either. (`first_user_message` is still taken from the replay so resumed
+  sessions keep their topic.)
+- **Claude Code** assistant records are deduplicated by `message.id` within a
+  file, and cache writes (`cache_creation_input_tokens`, split 5m/1h) are
+  captured alongside fresh input and cache reads.
+  `total_input_tokens = fresh + cache_creation + cache_read`.
+- **Per-day usage** (`session_daily_usage`) buckets tokens, messages, and
+  tool calls by the UTC day of the underlying events. Date-bucketed rollups
+  (`logpile stats` by-month, the per-day charts in both web UIs) read the
+  `session_daily_effective` view, which falls back to start-date attribution
+  for sessions not yet re-synced — a session spanning weeks no longer dumps
+  all its usage on its start date.
+
+**Known limitation:** resuming a *Claude Code* session copies prior history
+into a new file and re-stamps each record's `sessionId`, so replayed Claude
+messages are locally indistinguishable from native ones. Each session row is
+correct as "what this transcript contains", but summing token totals across a
+resume chain double-counts the inherited history. Cross-session dedup by
+`(message.id, requestId)` is deliberately out of scope here (the usage-tracker
+pipeline does it globally when computing spend).
 
 ### `logpile search` / `logpile show` / `logpile status`
 

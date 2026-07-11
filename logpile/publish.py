@@ -230,12 +230,12 @@ def _scan_metadata(row, findings: list[PublishFinding]) -> None:
         "machine",
         "model",
     )
-    for field in metadata_fields:
-        value = row[field]
+    for field_name in metadata_fields:
+        value = row[field_name]
         if not value:
             continue
-        text = f"{field}: {value}"
-        _scan_text(text, f"metadata.{field}", findings)
+        text = f"{field_name}: {value}"
+        _scan_text(text, f"metadata.{field_name}", findings)
 
 
 def _dedupe_findings(findings: list[PublishFinding]) -> list[PublishFinding]:

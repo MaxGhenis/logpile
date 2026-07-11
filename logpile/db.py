@@ -100,6 +100,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     total_output_tokens   INTEGER DEFAULT 0,
     fresh_input_tokens    INTEGER DEFAULT 0,
     cached_input_tokens   INTEGER DEFAULT 0,
+    cache_creation_input_tokens INTEGER DEFAULT 0,
+    cache_creation_5m_input_tokens INTEGER DEFAULT 0,
+    cache_creation_1h_input_tokens INTEGER DEFAULT 0,
     reasoning_output_tokens INTEGER DEFAULT 0,
     token_version        INTEGER DEFAULT 0,
     first_user_message    TEXT,
@@ -111,8 +114,30 @@ CREATE TABLE IF NOT EXISTS sessions (
     visibility_reason TEXT,
     is_private     INTEGER DEFAULT 0,
     file_hash      TEXT,
+    file_size      INTEGER,
+    file_mtime     REAL,
     synced_at      TEXT,
     model          TEXT
+);
+
+-- Usage bucketed by UTC day of the underlying events. Sessions can span
+-- weeks, so date-bucketed rollups must come from here, not from attributing
+-- whole-session totals to first_timestamp.
+CREATE TABLE IF NOT EXISTS session_daily_usage (
+    session_id     TEXT NOT NULL,
+    day            TEXT NOT NULL,
+    total_input_tokens  INTEGER NOT NULL DEFAULT 0,
+    total_output_tokens INTEGER NOT NULL DEFAULT 0,
+    fresh_input_tokens  INTEGER NOT NULL DEFAULT 0,
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+    user_message_count      INTEGER NOT NULL DEFAULT 0,
+    assistant_message_count INTEGER NOT NULL DEFAULT 0,
+    tool_call_count         INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, day)
 );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -159,6 +184,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_status              ON sessions(session_
 CREATE INDEX IF NOT EXISTS idx_sessions_objective_family    ON sessions(objective_family);
 CREATE INDEX IF NOT EXISTS idx_sessions_origin              ON sessions(session_origin);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent_session      ON sessions(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_session_daily_day            ON session_daily_usage(day);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session           ON tool_calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_name              ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_session_paths_session        ON session_paths(session_id);
@@ -197,6 +223,50 @@ SELECT
     END AS direct_private
 FROM sessions s
 LEFT JOIN users u ON u.username = s.username;
+
+-- Per-day usage with graceful degradation: sessions that have not been
+-- re-synced since session_daily_usage was introduced (or whose records carry
+-- no timestamps) fall back to whole-session totals attributed to the start
+-- date, flagged approximated = 1.
+DROP VIEW IF EXISTS session_daily_effective;
+CREATE VIEW session_daily_effective AS
+SELECT
+    d.session_id,
+    d.day,
+    d.total_input_tokens,
+    d.total_output_tokens,
+    d.fresh_input_tokens,
+    d.cached_input_tokens,
+    d.cache_creation_input_tokens,
+    d.cache_creation_5m_input_tokens,
+    d.cache_creation_1h_input_tokens,
+    d.reasoning_output_tokens,
+    d.user_message_count,
+    d.assistant_message_count,
+    d.tool_call_count,
+    0 AS approximated
+FROM session_daily_usage d
+UNION ALL
+SELECT
+    s.session_id,
+    substr(s.first_timestamp, 1, 10) AS day,
+    COALESCE(s.total_input_tokens, 0),
+    COALESCE(s.total_output_tokens, 0),
+    COALESCE(s.fresh_input_tokens, 0),
+    COALESCE(s.cached_input_tokens, 0),
+    COALESCE(s.cache_creation_input_tokens, 0),
+    COALESCE(s.cache_creation_5m_input_tokens, 0),
+    COALESCE(s.cache_creation_1h_input_tokens, 0),
+    COALESCE(s.reasoning_output_tokens, 0),
+    COALESCE(s.user_message_count, 0),
+    COALESCE(s.assistant_message_count, 0),
+    COALESCE(s.tool_call_count, 0),
+    1 AS approximated
+FROM sessions s
+WHERE s.first_timestamp IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM session_daily_usage d2 WHERE d2.session_id = s.session_id
+  );
 
 DROP VIEW IF EXISTS user_catalog;
 CREATE VIEW user_catalog AS
@@ -1253,6 +1323,14 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _backfill_users(conn)
     _rebuild_identity_schema(conn)
     _backfill_users(conn)
+    # After _rebuild_identity_schema: the rebuild recreates `sessions` from a
+    # fixed column list that predates these columns, so adding them earlier
+    # would be undone on legacy-slug databases.
+    _ensure_column(conn, "sessions", "cache_creation_input_tokens", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "sessions", "cache_creation_5m_input_tokens", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "sessions", "cache_creation_1h_input_tokens", "INTEGER DEFAULT 0")
+    _ensure_column(conn, "sessions", "file_size", "INTEGER")
+    _ensure_column(conn, "sessions", "file_mtime", "REAL")
     conn.execute(
         """
         UPDATE sessions
@@ -1434,10 +1512,15 @@ def upsert_session(conn, data: dict):
         "origin_version": 0,
         "fresh_input_tokens": 0,
         "cached_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_creation_5m_input_tokens": 0,
+        "cache_creation_1h_input_tokens": 0,
         "reasoning_output_tokens": 0,
         "token_version": 0,
         "parent_session_id": None,
         "spawn_depth": 0,
+        "file_size": None,
+        "file_mtime": None,
         **data,
     }
     if payload.get("username"):
@@ -1457,9 +1540,10 @@ def upsert_session(conn, data: dict):
              objective_family, objective_label, objective_version,
              session_origin, origin_version,
              total_input_tokens, total_output_tokens, fresh_input_tokens, cached_input_tokens,
+             cache_creation_input_tokens, cache_creation_5m_input_tokens, cache_creation_1h_input_tokens,
              reasoning_output_tokens, token_version, first_user_message, parent_session_id, spawn_depth, visibility,
              visibility_source, visibility_rule_id, visibility_reason,
-             is_private, file_hash, synced_at, model)
+             is_private, file_hash, file_size, file_mtime, synced_at, model)
         VALUES
             (:session_id, :source, :username, :machine, :project, :workspace_root,
              :worktree_root, :repo_root, :repo_name, :git_branch, :git_commit, :git_dirty,
@@ -1473,9 +1557,10 @@ def upsert_session(conn, data: dict):
              :objective_family, :objective_label, :objective_version,
              :session_origin, :origin_version,
              :total_input_tokens, :total_output_tokens, :fresh_input_tokens, :cached_input_tokens,
+             :cache_creation_input_tokens, :cache_creation_5m_input_tokens, :cache_creation_1h_input_tokens,
              :reasoning_output_tokens, :token_version, :first_user_message, :parent_session_id, :spawn_depth, :visibility,
              :visibility_source, :visibility_rule_id, :visibility_reason,
-             :is_private, :file_hash, :synced_at, :model)
+             :is_private, :file_hash, :file_size, :file_mtime, :synced_at, :model)
         ON CONFLICT(session_id) DO UPDATE SET
             source = excluded.source,
             username = excluded.username,
@@ -1526,6 +1611,9 @@ def upsert_session(conn, data: dict):
             total_output_tokens = excluded.total_output_tokens,
             fresh_input_tokens = excluded.fresh_input_tokens,
             cached_input_tokens = excluded.cached_input_tokens,
+            cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+            cache_creation_5m_input_tokens = excluded.cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens = excluded.cache_creation_1h_input_tokens,
             reasoning_output_tokens = excluded.reasoning_output_tokens,
             token_version = excluded.token_version,
             first_user_message = excluded.first_user_message,
@@ -1561,10 +1649,48 @@ def upsert_session(conn, data: dict):
                 ) = 'private' THEN 1 ELSE 0
             END,
             file_hash = excluded.file_hash,
+            file_size = excluded.file_size,
+            file_mtime = excluded.file_mtime,
             synced_at = excluded.synced_at,
             model = excluded.model
         """,
         payload,
+    )
+
+
+def insert_session_daily_usage(conn, session_id: str, daily_usage: list):
+    conn.execute("DELETE FROM session_daily_usage WHERE session_id = ?", (session_id,))
+    if not daily_usage:
+        return
+    conn.executemany(
+        """
+        INSERT INTO session_daily_usage (
+            session_id, day,
+            total_input_tokens, total_output_tokens,
+            fresh_input_tokens, cached_input_tokens,
+            cache_creation_input_tokens, cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens, reasoning_output_tokens,
+            user_message_count, assistant_message_count, tool_call_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                session_id,
+                d.day,
+                d.total_input_tokens,
+                d.total_output_tokens,
+                d.fresh_input_tokens,
+                d.cached_input_tokens,
+                d.cache_creation_input_tokens,
+                d.cache_creation_5m_input_tokens,
+                d.cache_creation_1h_input_tokens,
+                d.reasoning_output_tokens,
+                d.user_message_count,
+                d.assistant_message_count,
+                d.tool_call_count,
+            )
+            for d in daily_usage
+        ],
     )
 
 

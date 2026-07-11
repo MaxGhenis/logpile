@@ -5,7 +5,6 @@ import json
 import os
 import subprocess
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 
 class GitHubSyncError(Exception):

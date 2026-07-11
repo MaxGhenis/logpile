@@ -19,6 +19,7 @@ from .db import (
     get_user_by_identifier,
     get_db,
     init_db,
+    insert_session_daily_usage,
     insert_session_paths,
     insert_tool_calls,
     normalize_username,
@@ -29,7 +30,9 @@ from .db import (
 
 SESSION_ACTIVITY_VERSION = 1
 SESSION_NARRATIVE_VERSION = 1
-SESSION_TOKEN_VERSION = 3
+# 4: codex replay-burst deltas (resume snapshots no longer re-count history),
+#    Claude cache_creation capture, per-day usage rows, file size/mtime.
+SESSION_TOKEN_VERSION = 4
 _TEST_PATTERNS = (
     re.compile(r"\b(pytest|py\.test|vitest|jest|nosetests|rspec)\b"),
     re.compile(r"\bpython(?:\d+(?:\.\d+)?)?\s+-m\s+(pytest|unittest)\b"),
@@ -66,6 +69,54 @@ def _safe_expanduser(path: Path) -> Path:
         return path.expanduser()
     except RuntimeError:
         return path
+
+
+def _codex_session_roots(home: Path) -> list[Path]:
+    """All Codex rollout roots under a home dir.
+
+    Live sessions come first so that when a rollout exists both live and
+    archived (mid-archive race), the live copy wins the per-run stem dedup.
+    ~/.codex/archived_sessions alone held 26GB that sync never saw.
+    """
+    roots = [
+        home / ".codex" / "sessions",
+        home / ".codex" / "archived_sessions",
+        home / ".codex-2" / "sessions",
+        home / ".codex-3" / "sessions",
+    ]
+    openclaw_agents = home / ".openclaw" / "agents"
+    if openclaw_agents.exists():
+        roots.extend(sorted(openclaw_agents.glob("*/agent/codex-home/sessions")))
+    return [root for root in roots if root.exists()]
+
+
+def _unchanged_on_disk(existing_row, jsonl_path: Path) -> bool:
+    """Cheap no-op check for a synced session: same path, same size+mtime,
+    and the shared copy (when one is expected) still present.
+
+    file_hash() reads the whole file, and _copy_session hashes both sides
+    again — tens of GB per sync once immutable archives are scanned. Any
+    mismatch here just falls through to the full hash-and-parse path.
+    """
+    if existing_row["file_size"] is None or existing_row["file_mtime"] is None:
+        return False
+    if existing_row["source_path"] != str(jsonl_path):
+        return False
+    try:
+        stat = jsonl_path.stat()
+    except OSError:
+        return False
+    if existing_row["file_size"] != stat.st_size:
+        return False
+    if abs(existing_row["file_mtime"] - stat.st_mtime) > 1e-6:
+        return False
+    shared_path = existing_row["shared_path"] or ""
+    if existing_row["visibility"] == "private":
+        return shared_path == ""
+    if not shared_path:
+        return False
+    shared = Path(shared_path)
+    return shared.exists() or shared.is_symlink()
 
 
 def _resolve_sync_username(conn, requested_username: str) -> str:
@@ -683,7 +734,6 @@ def _compute_duration(t1: str, t2: str) -> float | None:
         return None
     try:
         from datetime import datetime
-        fmt = "%Y-%m-%dT%H:%M:%S"
         d1 = datetime.fromisoformat(t1.replace("Z", "+00:00"))
         d2 = datetime.fromisoformat(t2.replace("Z", "+00:00"))
         return max(0.0, (d2 - d1).total_seconds())
@@ -768,7 +818,10 @@ def _sync_sessions(
                     repo_name,
                     shared_path,
                     source,
+                    source_path,
                     project,
+                    file_size,
+                    file_mtime,
                     (
                         SELECT COUNT(*)
                         FROM session_paths sp
@@ -796,7 +849,6 @@ def _sync_sessions(
                     skipped_count += 1
                     continue
 
-                fhash = file_hash(jsonl_path)
                 session_id = jsonl_path.stem
                 existing_row = existing.get(session_id)
                 needs_structure_backfill = bool(
@@ -819,6 +871,20 @@ def _sync_sessions(
                     )
                 )
 
+                if existing_row and not needs_structure_backfill and _unchanged_on_disk(existing_row, jsonl_path):
+                    skipped_count += 1
+                    continue
+
+                try:
+                    # stat BEFORE hashing: a write landing mid-hash then makes
+                    # the stored size/mtime stale, forcing a re-parse next
+                    # sync instead of silently skipping the newer content.
+                    file_stat = jsonl_path.stat()
+                except OSError:
+                    skipped_count += 1
+                    continue
+                fhash = file_hash(jsonl_path)
+
                 if existing_row and existing_row["file_hash"] == fhash and not needs_structure_backfill:
                     shared_path, storage_changed = _sync_shared_copy(
                         src=jsonl_path,
@@ -830,14 +896,22 @@ def _sync_sessions(
                         visibility=existing_row["visibility"],
                         existing_shared_path=existing_row["shared_path"],
                     )
-                    if storage_changed or shared_path != (existing_row["shared_path"] or ""):
+                    row_moved = (
+                        existing_row["source_path"] != str(jsonl_path)
+                        or existing_row["file_size"] != file_stat.st_size
+                        or existing_row["file_mtime"] is None
+                        or abs(existing_row["file_mtime"] - file_stat.st_mtime) > 1e-6
+                    )
+                    if storage_changed or row_moved or shared_path != (existing_row["shared_path"] or ""):
                         conn.execute(
                             """
                             UPDATE sessions
-                            SET shared_path = ?, synced_at = ?
+                            SET shared_path = ?, source_path = ?, file_size = ?,
+                                file_mtime = ?, synced_at = ?
                             WHERE session_id = ?
                             """,
-                            (shared_path, now, session_id),
+                            (shared_path, str(jsonl_path), file_stat.st_size,
+                             file_stat.st_mtime, now, session_id),
                         )
                         flush_if_needed()
                         updated_count += 1
@@ -947,6 +1021,8 @@ def _sync_sessions(
                     "visibility_reason": visibility["visibility_reason"],
                     "is_private": 1 if visibility["visibility"] == "private" else 0,
                     "file_hash": fhash,
+                    "file_size": file_stat.st_size,
+                    "file_mtime": file_stat.st_mtime,
                     "synced_at": now,
                     "model": info.model,
                     **activity,
@@ -956,6 +1032,7 @@ def _sync_sessions(
                 })
                 insert_tool_calls(conn, info.session_id, info.tool_calls)
                 insert_session_paths(conn, info.session_id, session_paths)
+                insert_session_daily_usage(conn, info.session_id, info.daily_usage)
                 flush_if_needed()
 
                 action = "Updated" if session_id in existing else "Added"
@@ -968,15 +1045,18 @@ def _sync_sessions(
                     print(f"  {action}: {session_id[:12]}… ({project})")
 
         # ── Codex sessions ─────────────────────────────────────────────────────
-        codex_root = home / ".codex" / "sessions"
-        if codex_root.exists():
+        seen_codex_stems: set[str] = set()
+        for codex_root in _codex_session_roots(home):
             for jsonl_path in sorted(codex_root.rglob("*.jsonl")):
                 if should_ignore(jsonl_path, patterns):
                     skipped_count += 1
                     continue
 
-                fhash = file_hash(jsonl_path)
                 session_id = jsonl_path.stem  # full filename stem as unique ID
+                if session_id in seen_codex_stems:
+                    skipped_count += 1
+                    continue
+                seen_codex_stems.add(session_id)
                 existing_row = existing.get(session_id)
                 needs_structure_backfill = bool(
                     existing_row and (
@@ -998,6 +1078,18 @@ def _sync_sessions(
                     )
                 )
 
+                if existing_row and not needs_structure_backfill and _unchanged_on_disk(existing_row, jsonl_path):
+                    skipped_count += 1
+                    continue
+
+                try:
+                    # stat BEFORE hashing — see the Claude loop.
+                    file_stat = jsonl_path.stat()
+                except OSError:
+                    skipped_count += 1
+                    continue
+                fhash = file_hash(jsonl_path)
+
                 if existing_row and existing_row["file_hash"] == fhash and not needs_structure_backfill:
                     shared_path, storage_changed = _sync_shared_copy(
                         src=jsonl_path,
@@ -1009,14 +1101,22 @@ def _sync_sessions(
                         visibility=existing_row["visibility"],
                         existing_shared_path=existing_row["shared_path"],
                     )
-                    if storage_changed or shared_path != (existing_row["shared_path"] or ""):
+                    row_moved = (
+                        existing_row["source_path"] != str(jsonl_path)
+                        or existing_row["file_size"] != file_stat.st_size
+                        or existing_row["file_mtime"] is None
+                        or abs(existing_row["file_mtime"] - file_stat.st_mtime) > 1e-6
+                    )
+                    if storage_changed or row_moved or shared_path != (existing_row["shared_path"] or ""):
                         conn.execute(
                             """
                             UPDATE sessions
-                            SET shared_path = ?, synced_at = ?
+                            SET shared_path = ?, source_path = ?, file_size = ?,
+                                file_mtime = ?, synced_at = ?
                             WHERE session_id = ?
                             """,
-                            (shared_path, now, session_id),
+                            (shared_path, str(jsonl_path), file_stat.st_size,
+                             file_stat.st_mtime, now, session_id),
                         )
                         flush_if_needed()
                         updated_count += 1
@@ -1128,6 +1228,8 @@ def _sync_sessions(
                     "visibility_reason": visibility["visibility_reason"],
                     "is_private": 1 if visibility["visibility"] == "private" else 0,
                     "file_hash": fhash,
+                    "file_size": file_stat.st_size,
+                    "file_mtime": file_stat.st_mtime,
                     "synced_at": now,
                     "model": info.model,
                     **activity,
@@ -1137,6 +1239,7 @@ def _sync_sessions(
                 })
                 insert_tool_calls(conn, session_id, info.tool_calls)
                 insert_session_paths(conn, session_id, session_paths)
+                insert_session_daily_usage(conn, session_id, info.daily_usage)
                 flush_if_needed()
 
                 action = "Updated" if session_id in existing else "Added"

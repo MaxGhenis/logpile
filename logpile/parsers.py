@@ -21,6 +21,29 @@ class ToolCall:
 
 
 @dataclass
+class DailyUsage:
+    """Per-UTC-day slice of a session's usage, bucketed by event timestamps.
+
+    Sessions can span weeks; attributing whole-session totals to the start
+    date distorts any date-bucketed rollup. Records without timestamps are
+    excluded, so daily sums can undercount session totals slightly.
+    """
+
+    day: str  # YYYY-MM-DD (UTC)
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    fresh_input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_creation_5m_input_tokens: int = 0
+    cache_creation_1h_input_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    user_message_count: int = 0
+    assistant_message_count: int = 0
+    tool_call_count: int = 0
+
+
+@dataclass
 class SessionPath:
     raw_path: str
     normalized_path: str
@@ -48,6 +71,9 @@ class SessionInfo:
     total_output_tokens: int = 0
     fresh_input_tokens: int = 0
     cached_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_creation_5m_input_tokens: int = 0
+    cache_creation_1h_input_tokens: int = 0
     reasoning_output_tokens: int = 0
     first_user_message: str = ""
     model: Optional[str] = None
@@ -56,6 +82,7 @@ class SessionInfo:
     spawn_depth: int = 0
     tool_calls: list = field(default_factory=list)
     session_paths: list = field(default_factory=list)
+    daily_usage: list = field(default_factory=list)
 
 
 _USER_CONTEXT_PREAMBLE_RE = re.compile(
@@ -189,6 +216,78 @@ def _extract_codex_token_totals(record_type: str, payload: dict) -> tuple[int, i
     output_tokens = int(totals.get("output_tokens", 0) or 0)
     reasoning_output_tokens = int(totals.get("reasoning_output_tokens", 0) or 0)
     return input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens
+
+
+def _day_of(timestamp: Optional[str]) -> Optional[str]:
+    if not timestamp or len(timestamp) < 10:
+        return None
+    return timestamp[:10]
+
+
+def _daily_bucket(daily: dict, timestamp: Optional[str]) -> Optional[DailyUsage]:
+    day = _day_of(timestamp)
+    if day is None:
+        return None
+    bucket = daily.get(day)
+    if bucket is None:
+        bucket = daily[day] = DailyUsage(day=day)
+    return bucket
+
+
+def _sorted_daily(daily: dict) -> list[DailyUsage]:
+    return [daily[day] for day in sorted(daily)]
+
+
+def _codex_replay_window(records: list) -> tuple[int, int]:
+    """Detect the replay burst a Codex resume/fork snapshot starts with.
+
+    Resuming a session writes a NEW rollout file containing a full copy of
+    the prior history, re-stamped into a single wall-clock second (and given
+    a fresh session id), followed by the live continuation. Counting the
+    replayed records would count the same history once per snapshot.
+
+    Live turns never produce two token_count events inside one second, so:
+    the file is a snapshot iff its first two token_count events share a
+    wall-clock second S. The replayed history is then the contiguous run of
+    records stamped S (records without timestamps ride along with the run).
+
+    Returns (start, end) record indices of the replay window, or (0, 0) if
+    the file is not a snapshot.
+    """
+    first_second = None
+    token_events_in_second = 0
+    for record in records:
+        record_type, payload, timestamp = _normalize_codex_record(record)
+        if _extract_codex_token_totals(record_type, payload) is None:
+            continue
+        second = (timestamp or "")[:19]
+        if first_second is None:
+            if not second:
+                return 0, 0
+            first_second = second
+            token_events_in_second = 1
+            continue
+        if second == first_second:
+            token_events_in_second += 1
+        break
+    if token_events_in_second < 2:
+        return 0, 0
+
+    start = end = None
+    for index, record in enumerate(records):
+        _, _, timestamp = _normalize_codex_record(record)
+        second = (timestamp or "")[:19]
+        if second == first_second:
+            if start is None:
+                start = index
+            end = index + 1
+        elif start is not None:
+            if timestamp:
+                break
+            end = index + 1
+    if start is None:
+        return 0, 0
+    return start, end
 
 
 def _extract_command(arguments: dict) -> Optional[str]:
@@ -497,8 +596,14 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
             break
     workspace_root = project
 
-    # Deduplicate assistant messages by message.id, keep last (highest tokens)
-    seen_msg: dict = {}  # message_id -> {"fresh_input": int, "cached_input": int, "output": int, "model": str}
+    # Deduplicate assistant messages by message.id, keep last (highest tokens).
+    # NOTE: this is per-file only. Resuming a Claude Code session copies the
+    # prior history into a NEW file and re-stamps each record's sessionId to
+    # the new session, so replayed messages are indistinguishable locally and
+    # aggregate rollups count them once per resume file. Deduplicating those
+    # requires cross-session state (usage-tracker does it globally by
+    # message.id + requestId).
+    seen_msg: dict = {}  # message_id -> {"fresh_input": ..., "cached_input": ..., "output": ..., ...}
     first_timestamp = None
     last_timestamp = None
     user_message_count = 0
@@ -509,6 +614,7 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
     model = None
     parent_session_id = None
     spawn_depth = 0
+    daily: dict[str, DailyUsage] = {}
 
     for r in records:
         rtype = r.get("type", "")
@@ -545,6 +651,9 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
                 user_message_count += 1
                 if not first_user_message:
                     first_user_message = text.strip()[:500]
+                bucket = _daily_bucket(daily, ts)
+                if bucket is not None:
+                    bucket.user_message_count += 1
 
         elif rtype == "assistant":
             msg = r.get("message", {})
@@ -552,6 +661,17 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
             usage = msg.get("usage", {})
             fresh_inp = int(usage.get("input_tokens", 0) or 0)
             cached_inp = int(usage.get("cache_read_input_tokens", 0) or 0)
+            # Cache writes are billed input (at a premium) and were ~1B
+            # tokens/month as of Jul 2026 — capture them, split 5m/1h when
+            # the breakdown is present (they bill at different rates).
+            cache_creation = int(usage.get("cache_creation_input_tokens", 0) or 0)
+            breakdown = usage.get("cache_creation")
+            cw5 = cw1 = 0
+            if isinstance(breakdown, dict):
+                cw5 = int(breakdown.get("ephemeral_5m_input_tokens", 0) or 0)
+                cw1 = int(breakdown.get("ephemeral_1h_input_tokens", 0) or 0)
+            if cw5 + cw1 == 0:
+                cw5 = cache_creation  # no breakdown -> assume 5m
             out = usage.get("output_tokens", 0)
             mdl = msg.get("model")
 
@@ -561,8 +681,12 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
                     seen_msg[msg_id] = {
                         "fresh_input": fresh_inp,
                         "cached_input": cached_inp,
+                        "cache_creation": cache_creation,
+                        "cache_creation_5m": cw5,
+                        "cache_creation_1h": cw1,
                         "output": out,
                         "model": mdl,
+                        "timestamp": ts,
                     }
                 if mdl and not model:
                     model = mdl
@@ -595,12 +719,33 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
                         ))
                         if tool_use_id:
                             tool_call_index_by_id[tool_use_id] = len(tool_calls) - 1
+                        bucket = _daily_bucket(daily, ts)
+                        if bucket is not None:
+                            bucket.tool_call_count += 1
 
     assistant_message_count = len(seen_msg)
     fresh_input = sum(v["fresh_input"] for v in seen_msg.values())
     cached_input = sum(v["cached_input"] for v in seen_msg.values())
-    total_input = fresh_input + cached_input
+    cache_creation_input = sum(v["cache_creation"] for v in seen_msg.values())
+    cache_creation_5m = sum(v["cache_creation_5m"] for v in seen_msg.values())
+    cache_creation_1h = sum(v["cache_creation_1h"] for v in seen_msg.values())
+    # Every prompt token reaches the model exactly one way: uncached (fresh),
+    # written to cache, or read from cache.
+    total_input = fresh_input + cache_creation_input + cached_input
     total_output = sum(v["output"] for v in seen_msg.values())
+
+    for v in seen_msg.values():
+        bucket = _daily_bucket(daily, v["timestamp"])
+        if bucket is None:
+            continue
+        bucket.assistant_message_count += 1
+        bucket.fresh_input_tokens += v["fresh_input"]
+        bucket.cached_input_tokens += v["cached_input"]
+        bucket.cache_creation_input_tokens += v["cache_creation"]
+        bucket.cache_creation_5m_input_tokens += v["cache_creation_5m"]
+        bucket.cache_creation_1h_input_tokens += v["cache_creation_1h"]
+        bucket.total_input_tokens += v["fresh_input"] + v["cache_creation"] + v["cached_input"]
+        bucket.total_output_tokens += v["output"]
 
     return SessionInfo(
         session_id=session_id,
@@ -616,6 +761,9 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
         total_output_tokens=total_output,
         fresh_input_tokens=fresh_input,
         cached_input_tokens=cached_input,
+        cache_creation_input_tokens=cache_creation_input,
+        cache_creation_5m_input_tokens=cache_creation_5m,
+        cache_creation_1h_input_tokens=cache_creation_1h,
         first_user_message=first_user_message,
         model=model,
         workspace_root=workspace_root,
@@ -623,6 +771,7 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
         spawn_depth=spawn_depth,
         tool_calls=tool_calls,
         session_paths=_build_session_paths(tool_calls, workspace_root),
+        daily_usage=_sorted_daily(daily),
     )
 
 
@@ -666,31 +815,57 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo]:
     first_user_message = ""
     error_count = 0
     last_timestamp = first_timestamp
-    total_input_tokens = 0
-    total_output_tokens = 0
     fresh_input_tokens = 0
     cached_input_tokens = 0
+    total_output_tokens = 0
     reasoning_output_tokens = 0
+    daily: dict[str, DailyUsage] = {}
 
-    for record in records:
+    # Codex token_count events carry CUMULATIVE counters, and resume/fork
+    # snapshot files replay the whole prior history (see
+    # _codex_replay_window). Taking max() of the counter would re-count that
+    # history once per snapshot, so instead: fold the replay window into a
+    # delta baseline and accumulate clamped per-event deltas — each file
+    # contributes only its live continuation. Deltas are clamped at zero per
+    # component so a counter reset can't go negative or double-count.
+    replay_start, replay_end = _codex_replay_window(records)
+    baseline = [0, 0, 0, 0]  # input, cached_input, output, reasoning (cumulative maxima)
+
+    for index, record in enumerate(records):
         record_type, payload, timestamp = _normalize_codex_record(record)
         if timestamp:
             if not first_timestamp:
                 first_timestamp = timestamp
             last_timestamp = timestamp
 
+        in_replay = replay_start <= index < replay_end
+
         token_totals = _extract_codex_token_totals(record_type, payload)
         if token_totals is not None:
             input_tokens, cached_tokens, output_tokens, reasoning_tokens = token_totals
-            # Codex reports cumulative usage where input_tokens ALREADY includes
-            # the cached (inherited) portion and total = input + output. So the
-            # uncached/fresh input is input - cached, and total input is
-            # input_tokens itself — adding cached again would double-count it.
-            fresh_input_tokens = max(fresh_input_tokens, max(0, input_tokens - cached_tokens))
-            cached_input_tokens = max(cached_input_tokens, cached_tokens)
-            total_input_tokens = max(total_input_tokens, input_tokens)
-            total_output_tokens = max(total_output_tokens, output_tokens)
-            reasoning_output_tokens = max(reasoning_output_tokens, reasoning_tokens)
+            current = [input_tokens, cached_tokens, output_tokens, reasoning_tokens]
+            if not in_replay:
+                delta_input = max(0, input_tokens - baseline[0])
+                delta_cached = max(0, cached_tokens - baseline[1])
+                delta_output = max(0, output_tokens - baseline[2])
+                delta_reasoning = max(0, reasoning_tokens - baseline[3])
+                # Codex input_tokens already includes the cached portion, so
+                # fresh is the remainder — adding cached again would
+                # double-count it.
+                delta_fresh = max(0, delta_input - delta_cached)
+                fresh_input_tokens += delta_fresh
+                cached_input_tokens += delta_cached
+                total_output_tokens += delta_output
+                reasoning_output_tokens += delta_reasoning
+                if delta_fresh or delta_cached or delta_output:
+                    bucket = _daily_bucket(daily, timestamp)
+                    if bucket is not None:
+                        bucket.fresh_input_tokens += delta_fresh
+                        bucket.cached_input_tokens += delta_cached
+                        bucket.total_input_tokens += delta_fresh + delta_cached
+                        bucket.total_output_tokens += delta_output
+                        bucket.reasoning_output_tokens += delta_reasoning
+            baseline = [max(base, cur) for base, cur in zip(baseline, current)]
 
         if record_type == "message":
             role = payload.get("role", "")
@@ -701,14 +876,29 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo]:
                 clean = _clean_codex_user_text(text)
                 if not clean or len(clean) < 3:
                     continue
-                user_message_count += 1
+                # Keep first_user_message from the replayed history: it names
+                # the session's actual topic. Counts stay live-only.
                 if not first_user_message:
                     first_user_message = clean[:500]
+                if in_replay:
+                    continue
+                user_message_count += 1
+                bucket = _daily_bucket(daily, timestamp)
+                if bucket is not None:
+                    bucket.user_message_count += 1
 
             elif role == "assistant":
+                if in_replay:
+                    continue
                 text = _extract_text(content)
                 if text.strip():
                     assistant_message_count += 1
+                    bucket = _daily_bucket(daily, timestamp)
+                    if bucket is not None:
+                        bucket.assistant_message_count += 1
+
+        elif in_replay:
+            continue
 
         elif record_type == "function_call":
             tool_name = payload.get("name", "unknown")
@@ -726,6 +916,9 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo]:
             call_id = payload.get("call_id") or payload.get("id")
             if call_id:
                 tool_call_index_by_id[str(call_id)] = len(tool_calls) - 1
+            bucket = _daily_bucket(daily, timestamp)
+            if bucket is not None:
+                bucket.tool_call_count += 1
 
         elif record_type == "function_call_output":
             _, is_error = _parse_tool_output(payload.get("output", ""))
@@ -745,7 +938,7 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo]:
         assistant_message_count=assistant_message_count,
         tool_call_count=len(tool_calls),
         error_count=error_count,
-        total_input_tokens=total_input_tokens,
+        total_input_tokens=fresh_input_tokens + cached_input_tokens,
         total_output_tokens=total_output_tokens,
         fresh_input_tokens=fresh_input_tokens,
         cached_input_tokens=cached_input_tokens,
@@ -757,6 +950,7 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo]:
         spawn_depth=spawn_depth,
         tool_calls=tool_calls,
         session_paths=_build_session_paths(tool_calls, workspace_root),
+        daily_usage=_sorted_daily(daily),
     )
 
 
@@ -774,8 +968,6 @@ def render_claudecode_transcript(path: Path) -> list:
     records = _load_jsonl(path)
     turns = []
     seen_msg_ids = set()
-    # Map tool_use id -> turn index for pairing results
-    pending_tool_calls = {}  # tool_use_id -> index in turns
 
     for r in records:
         rtype = r.get("type", "")

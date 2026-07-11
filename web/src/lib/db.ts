@@ -119,21 +119,25 @@ export function getRecentSessions(limit = 10, origin?: string): SessionRow[] {
 
 /* ── Chart data ───────────────────────────────────────────────────── */
 
+// Day-bucketed charts read session_daily_effective: usage lands on the UTC
+// day its events happened, not on the session's start date (sessions can
+// span weeks; not-yet-resynced sessions degrade to start-date attribution).
 export function getMessagesPerDay(days = 30, origin?: string) {
   const db = getDb();
-  const cutoff = new Date(Date.now() - days * 86400000).toISOString();
-  const clauses = [listedSessionClause("s", "u"), "s.first_timestamp >= ?"];
+  const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+  const clauses = [listedSessionClause("s", "u"), "d.day >= ?"];
   const params: unknown[] = [cutoff];
   appendOriginClause(clauses, params, origin);
   const rows = db
     .prepare(
       `SELECT
-        substr(s.first_timestamp, 1, 10) AS day,
+        d.day AS day,
         s.username AS user_key,
         s.username,
         s.user_display_name,
-        SUM(s.user_message_count + s.assistant_message_count) AS msgs
-      FROM session_catalog s
+        SUM(d.user_message_count + d.assistant_message_count) AS msgs
+      FROM session_daily_effective d
+      JOIN session_catalog s ON s.session_id = d.session_id
       WHERE ${clauses.join(" AND ")}
       GROUP BY day, user_key, s.username, s.user_display_name
       ORDER BY day`
@@ -150,17 +154,18 @@ export function getMessagesPerDay(days = 30, origin?: string) {
 
 export function getMessagesByTool(days = 30, origin?: string) {
   const db = getDb();
-  const cutoff = new Date(Date.now() - days * 86400000).toISOString();
-  const clauses = [listedSessionClause("s", "u"), "first_timestamp >= ?"];
+  const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+  const clauses = [listedSessionClause("s", "u"), "d.day >= ?"];
   const params: unknown[] = [cutoff];
   appendOriginClause(clauses, params, origin);
   return db
     .prepare(
       `SELECT
-        substr(first_timestamp, 1, 10) AS day,
-        source,
-        SUM(user_message_count + assistant_message_count) AS msgs
-      FROM session_catalog s
+        d.day AS day,
+        s.source AS source,
+        SUM(d.user_message_count + d.assistant_message_count) AS msgs
+      FROM session_daily_effective d
+      JOIN session_catalog s ON s.session_id = d.session_id
       WHERE ${clauses.join(" AND ")}
       GROUP BY day, source
       ORDER BY day`
@@ -900,14 +905,13 @@ export function getUserSummary(username: string, origin?: string): UserSummary |
   const clauses = [profileSessionClause("s"), "s.username = ?"];
   const params: unknown[] = [username];
   appendOriginClause(clauses, params, origin);
-  return db
+  const summary = db
     .prepare(
       `SELECT
         COUNT(*) AS total_sessions,
         SUM(user_message_count + assistant_message_count) AS total_messages,
         SUM(tool_call_count) AS total_tool_calls,
         SUM(total_input_tokens + total_output_tokens) AS total_tokens,
-        COUNT(DISTINCT substr(first_timestamp, 1, 10)) AS active_days,
         COUNT(DISTINCT CASE
           WHEN project IS NOT NULL AND project != '' AND project != 'unknown'
           THEN project
@@ -932,24 +936,36 @@ export function getUserSummary(username: string, origin?: string): UserSummary |
       WHERE ${clauses.join(" AND ")}`
     )
     .get(...params) as UserSummary | undefined;
+  if (!summary) return summary;
+  // Event-dated active days: a session spanning N days counts N, not 1.
+  const activeDays = db
+    .prepare(
+      `SELECT COUNT(DISTINCT d.day) AS active_days
+      FROM session_daily_effective d
+      JOIN session_catalog s ON s.session_id = d.session_id
+      WHERE ${clauses.join(" AND ")}`
+    )
+    .get(...params) as { active_days: number } | undefined;
+  return { ...summary, active_days: activeDays?.active_days ?? 0 };
 }
 
 /* ── User profile data ────────────────────────────────────────────── */
 
 export function getUserActivity(username: string, days = 60, origin?: string) {
   const db = getDb();
-  const cutoff = new Date(Date.now() - days * 86400000).toISOString();
-  const clauses = [profileSessionClause("s"), "s.username = ?", "s.first_timestamp >= ?"];
+  const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+  const clauses = [profileSessionClause("s"), "s.username = ?", "d.day >= ?"];
   const params: unknown[] = [username, cutoff];
   appendOriginClause(clauses, params, origin);
   return db
     .prepare(
       `SELECT
-        substr(s.first_timestamp, 1, 10) AS day,
-        COUNT(*) AS sessions,
-        SUM(s.user_message_count + s.assistant_message_count) AS messages,
-        SUM(s.tool_call_count) AS tool_calls
-      FROM session_catalog s
+        d.day AS day,
+        COUNT(DISTINCT d.session_id) AS sessions,
+        SUM(d.user_message_count + d.assistant_message_count) AS messages,
+        SUM(d.tool_call_count) AS tool_calls
+      FROM session_daily_effective d
+      JOIN session_catalog s ON s.session_id = d.session_id
       WHERE ${clauses.join(" AND ")}
       GROUP BY day
       ORDER BY day`

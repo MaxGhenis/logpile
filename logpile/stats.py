@@ -5,7 +5,7 @@ from __future__ import annotations
 import calendar
 import sqlite3
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 
 
 BEHAVIORAL_PATTERNS = (
@@ -102,6 +102,7 @@ def compute_overview(
             COALESCE(SUM(s.total_input_tokens), 0) AS total_input_tokens,
             COALESCE(SUM(s.total_output_tokens), 0) AS total_output_tokens,
             COALESCE(SUM(s.cached_input_tokens), 0) AS cached_input_tokens,
+            COALESCE(SUM(s.cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
             COUNT(DISTINCT s.repo_name) AS repos_touched
         FROM sessions s
         WHERE {where}
@@ -115,6 +116,7 @@ def compute_overview(
         "total_input_tokens": row["total_input_tokens"],
         "total_output_tokens": row["total_output_tokens"],
         "cached_input_tokens": row["cached_input_tokens"],
+        "cache_creation_input_tokens": row["cache_creation_input_tokens"],
         "repos_touched": row["repos_touched"],
     }
 
@@ -278,13 +280,33 @@ def compute_by_period(
     since: str | None = None,
     until: str | None = None,
 ) -> list[dict]:
-    where, params = _build_where(username, since, until)
+    """Monthly rollup from per-day usage (session_daily_effective).
+
+    Tokens land on the UTC day their events happened. Bucketing whole
+    sessions by first_timestamp instead would dump a weeks-long session onto
+    its start month (that inflated Apr/May 2026 and starved Jun). Sessions
+    not re-synced since session_daily_usage was introduced degrade to
+    start-date attribution via the view. A session active in N months counts
+    toward each month's session_count.
+    """
+    clauses: list[str] = ["d.day IS NOT NULL", "d.day != ''"]
+    params: list[str] = []
+    if username:
+        clauses.append("s.username = ?")
+        params.append(username)
+    if since:
+        clauses.append("d.day >= ?")
+        params.append(since[:10])
+    if until:
+        clauses.append("d.day <= ?")
+        params.append(until[:10])
+    where = " AND ".join(clauses)
+
     overview = conn.execute(
         f"""
-        SELECT
-            MIN(s.first_timestamp) AS first_date,
-            MAX(s.first_timestamp) AS last_date
-        FROM sessions s
+        SELECT MIN(d.day) AS first_date, MAX(d.day) AS last_date
+        FROM session_daily_effective d
+        JOIN sessions s ON s.session_id = d.session_id
         WHERE {where}
         """,
         params,
@@ -308,14 +330,16 @@ def compute_by_period(
     rows = conn.execute(
         f"""
         SELECT
-            SUBSTR(s.first_timestamp, 1, 7) AS month,
-            COUNT(*) AS session_count,
-            COALESCE(SUM(s.total_output_tokens), 0) AS total_output_tokens,
-            MIN(s.first_timestamp) AS first_date,
-            MAX(s.first_timestamp) AS last_date
-        FROM sessions s
-        WHERE {where} AND s.first_timestamp IS NOT NULL
-        GROUP BY SUBSTR(s.first_timestamp, 1, 7)
+            SUBSTR(d.day, 1, 7) AS month,
+            COUNT(DISTINCT d.session_id) AS session_count,
+            COALESCE(SUM(d.total_output_tokens), 0) AS total_output_tokens,
+            COALESCE(SUM(d.total_input_tokens), 0) AS total_input_tokens,
+            COALESCE(SUM(d.cached_input_tokens), 0) AS cached_input_tokens,
+            COALESCE(SUM(d.cache_creation_input_tokens), 0) AS cache_creation_input_tokens
+        FROM session_daily_effective d
+        JOIN sessions s ON s.session_id = d.session_id
+        WHERE {where}
+        GROUP BY SUBSTR(d.day, 1, 7)
         ORDER BY month
         """,
         params,
@@ -340,6 +364,9 @@ def compute_by_period(
                 "month": row["month"],
                 "session_count": row["session_count"],
                 "total_output_tokens": row["total_output_tokens"],
+                "total_input_tokens": row["total_input_tokens"],
+                "cached_input_tokens": row["cached_input_tokens"],
+                "cache_creation_input_tokens": row["cache_creation_input_tokens"],
                 "tokens_per_day": row["total_output_tokens"] // days,
             }
         )
@@ -389,6 +416,7 @@ def format_stats(data: dict) -> list[str]:
     lines.append(f"  Input tokens:   {_fmt(ov['total_input_tokens'])}")
     lines.append(f"  Output tokens:  {_fmt(ov['total_output_tokens'])}")
     lines.append(f"  Cached tokens:  {_fmt(ov['cached_input_tokens'])}")
+    lines.append(f"  Cache writes:   {_fmt(ov.get('cache_creation_input_tokens', 0))}")
     lines.append(f"  Repos touched:  {_fmt(ov['repos_touched'])}")
 
     patterns = data["by_pattern"]
@@ -441,13 +469,14 @@ def format_stats(data: dict) -> list[str]:
     periods = data["by_period"]
     if periods:
         lines.append("")
-        lines.append("=== By month ===")
-        hdr = f"  {'Month':<10}{'Sessions':>10}{'Output':>14}{'Tok/day':>12}"
+        lines.append("=== By month (event-dated) ===")
+        hdr = f"  {'Month':<10}{'Sessions':>10}{'Input':>16}{'Output':>14}{'Tok/day':>12}"
         lines.append(hdr)
         for p in periods:
             lines.append(
                 f"  {p['month']:<10}"
                 f"{_fmt(p['session_count']):>10}"
+                f"{_fmt(p.get('total_input_tokens', 0)):>16}"
                 f"{_fmt(p['total_output_tokens']):>14}"
                 f"{_fmt(p['tokens_per_day']):>12}"
             )

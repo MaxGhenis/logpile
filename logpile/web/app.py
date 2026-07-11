@@ -461,23 +461,38 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             """,
             (user["username"],),
         ).fetchone()
+        summary = dict(summary) if summary else summary
+        if summary:
+            # Event-dated active days: a session spanning N days counts N,
+            # not 1 (start-date attribution).
+            active_days_row = db.execute(
+                f"""
+                SELECT COUNT(DISTINCT d.day) AS active_days
+                FROM session_daily_effective d
+                JOIN session_catalog s ON s.session_id = d.session_id
+                WHERE { _profile_session_clause("s") } AND s.username = ?{origin_sql}
+                """,
+                (user["username"],),
+            ).fetchone()
+            summary["active_days"] = active_days_row["active_days"] if active_days_row else 0
 
         cutoff = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
         activity_rows = db.execute(
             f"""
             SELECT
-                substr(first_timestamp, 1, 10) AS day,
-                COUNT(*) AS sessions,
-                SUM(user_message_count + assistant_message_count) AS messages,
-                SUM(tool_call_count) AS tool_calls
-            FROM session_catalog s
+                d.day AS day,
+                COUNT(DISTINCT d.session_id) AS sessions,
+                SUM(d.user_message_count + d.assistant_message_count) AS messages,
+                SUM(d.tool_call_count) AS tool_calls
+            FROM session_daily_effective d
+            JOIN session_catalog s ON s.session_id = d.session_id
             WHERE { _profile_session_clause("s") }
               AND s.username = ?
-              AND s.first_timestamp >= ?{origin_sql}
+              AND d.day >= ?{origin_sql}
             GROUP BY day
             ORDER BY day
             """,
-            (user["username"], cutoff),
+            (user["username"], cutoff[:10]),
         ).fetchall()
 
         source_rows = db.execute(
@@ -645,18 +660,19 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         rows = db.execute(
             f"""
             SELECT
-                substr(s.first_timestamp, 1, 10) AS day,
+                d.day AS day,
                 COALESCE(s.username, s.username) AS user_key,
                 s.username,
                 COALESCE(u.display_name, s.username) AS user_display_name,
-                SUM(s.user_message_count + s.assistant_message_count) AS msgs
-            FROM session_catalog s
+                SUM(d.user_message_count + d.assistant_message_count) AS msgs
+            FROM session_daily_effective d
+            JOIN session_catalog s ON s.session_id = d.session_id
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") } AND s.first_timestamp >= ?{origin_sql}
+            WHERE { _listed_session_clause("s", "u") } AND d.day >= ?{origin_sql}
             GROUP BY day, user_key, s.username, user_display_name
             ORDER BY day
             """,
-            (cutoff,),
+            (cutoff[:10],),
         ).fetchall()
 
         days_set = sorted({r["day"] for r in rows})
@@ -700,16 +716,17 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         rows = db.execute(
             f"""
             SELECT
-                substr(first_timestamp, 1, 10) AS day,
-                source,
-                SUM(user_message_count + assistant_message_count) AS msgs
-            FROM session_catalog s
+                d.day AS day,
+                s.source AS source,
+                SUM(d.user_message_count + d.assistant_message_count) AS msgs
+            FROM session_daily_effective d
+            JOIN session_catalog s ON s.session_id = d.session_id
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") } AND first_timestamp >= ?{origin_sql}
+            WHERE { _listed_session_clause("s", "u") } AND d.day >= ?{origin_sql}
             GROUP BY day, source
             ORDER BY day
             """,
-            (cutoff,),
+            (cutoff[:10],),
         ).fetchall()
 
         days_set = sorted({r["day"] for r in rows})

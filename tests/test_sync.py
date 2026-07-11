@@ -1,17 +1,19 @@
 import json
+import shutil
 import sqlite3
 import subprocess
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest import mock
 
 from click.testing import CliRunner
 
 from logpile.cli import cli
 from logpile.db import ensure_user, init_db, set_session_visibility, update_user
 from logpile.origins import derive_session_origin
-from logpile.sync import sync_sessions
+from logpile.sync import SESSION_TOKEN_VERSION, sync_sessions
 from logpile.web.app import create_app
 
 
@@ -510,7 +512,7 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(row["total_output_tokens"], 45)
             self.assertEqual(row["fresh_input_tokens"], 900)
             self.assertEqual(row["cached_input_tokens"], 300)
-            self.assertEqual(row["token_version"], 3)
+            self.assertEqual(row["token_version"], SESSION_TOKEN_VERSION)
 
     def test_sync_populates_git_repo_metadata_and_root_relative_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -935,7 +937,7 @@ class SyncTests(unittest.TestCase):
             home = root / "home"
             shared = root / "shared"
             db_path = root / "logpile.db"
-            session_path = self._write_claude_session(home)
+            self._write_claude_session(home)
 
             sync_sessions(
                 shared_dir=shared,
@@ -1197,6 +1199,194 @@ class CopySessionAtomicityTests(unittest.TestCase):
             self.assertTrue(_copy_session(self.src, self.dst))
         self.assertTrue(self.dst.is_symlink())
         self.assertEqual(self.dst.resolve(), self.src.resolve())
+
+
+class SyncCoverageAndFastPathTests(unittest.TestCase):
+    """Multi-root codex discovery, per-day usage rows, and the size+mtime
+    fast path that keeps 20GB+ archives from being re-hashed every sync."""
+
+    # Reuse the session-writing fixtures without re-running SyncTests' cases.
+    _write_claude_session = SyncTests._write_claude_session
+    _write_codex_session = SyncTests._write_codex_session
+
+    def _write_codex_rollout(
+        self,
+        home: Path,
+        *,
+        root: str,
+        session_id: str,
+        message: str = "Fix the parser",
+    ) -> Path:
+        session_path = home / root / f"{session_id}.jsonl"
+        write_jsonl(
+            session_path,
+            [
+                {
+                    "timestamp": "2026-04-10T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": session_id,
+                        "timestamp": "2026-04-10T10:00:00Z",
+                        "cwd": "/tmp/demo",
+                    },
+                },
+                {
+                    "timestamp": "2026-04-10T10:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": message}],
+                    },
+                },
+                {
+                    "timestamp": "2026-04-10T10:00:02Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 1200,
+                                "cached_input_tokens": 300,
+                                "output_tokens": 45,
+                                "total_tokens": 1245,
+                            }
+                        },
+                    },
+                },
+            ],
+        )
+        return session_path
+
+    def test_sync_scans_archived_and_extra_codex_homes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            archived = self._write_codex_rollout(
+                home, root=".codex/archived_sessions/2026/03/17", session_id="rollout-archived"
+            )
+            extra_home = self._write_codex_rollout(
+                home, root=".codex-2/sessions/2026/04/10", session_id="rollout-codex2"
+            )
+            openclaw = self._write_codex_rollout(
+                home,
+                root=".openclaw/agents/bot/agent/codex-home/sessions/2026/04",
+                session_id="rollout-openclaw",
+            )
+
+            sync_sessions(root / "shared", root / "logpile.db", "alice", "m1", home)
+
+            with open_sqlite(root / "logpile.db") as conn:
+                rows = {
+                    row["session_id"]: row["source_path"]
+                    for row in conn.execute(
+                        "SELECT session_id, source_path FROM sessions WHERE source = 'codex'"
+                    )
+                }
+            self.assertEqual(rows["rollout-archived"], str(archived))
+            self.assertEqual(rows["rollout-codex2"], str(extra_home))
+            self.assertEqual(rows["rollout-openclaw"], str(openclaw))
+
+    def test_sync_prefers_live_copy_when_stem_exists_in_archive_too(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            live = self._write_codex_rollout(
+                home, root=".codex/sessions/2026/04/10", session_id="rollout-dup",
+                message="live continuation",
+            )
+            self._write_codex_rollout(
+                home, root=".codex/archived_sessions/2026/04/10", session_id="rollout-dup",
+                message="stale archived copy",
+            )
+
+            sync_sessions(root / "shared", root / "logpile.db", "alice", "m1", home)
+
+            with open_sqlite(root / "logpile.db") as conn:
+                row = conn.execute(
+                    "SELECT source_path, first_user_message FROM sessions WHERE session_id = 'rollout-dup'"
+                ).fetchone()
+            self.assertEqual(row["source_path"], str(live))
+            self.assertEqual(row["first_user_message"], "live continuation")
+
+    def test_sync_writes_daily_usage_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            self._write_claude_session(home, session_id="claude-daily")
+            self._write_codex_session(home, session_id="rollout-daily")
+
+            sync_sessions(root / "shared", root / "logpile.db", "alice", "m1", home)
+
+            with open_sqlite(root / "logpile.db") as conn:
+                claude_day = conn.execute(
+                    "SELECT * FROM session_daily_usage WHERE session_id = 'claude-daily'"
+                ).fetchone()
+                codex_day = conn.execute(
+                    "SELECT * FROM session_daily_usage WHERE session_id = 'rollout-daily'"
+                ).fetchone()
+                effective = conn.execute(
+                    """
+                    SELECT day, SUM(total_output_tokens) AS out_tokens, MIN(approximated) AS approximated
+                    FROM session_daily_effective
+                    GROUP BY day
+                    """
+                ).fetchone()
+
+            self.assertEqual(claude_day["day"], "2026-04-10")
+            self.assertEqual(claude_day["total_input_tokens"], 1)
+            self.assertEqual(claude_day["total_output_tokens"], 2)
+            self.assertEqual(claude_day["user_message_count"], 1)
+            self.assertEqual(claude_day["assistant_message_count"], 1)
+            self.assertEqual(codex_day["day"], "2026-04-10")
+            self.assertEqual(codex_day["total_input_tokens"], 1200)
+            self.assertEqual(codex_day["cached_input_tokens"], 300)
+            self.assertEqual(codex_day["total_output_tokens"], 45)
+            self.assertEqual(effective["day"], "2026-04-10")
+            self.assertEqual(effective["out_tokens"], 47)
+            self.assertEqual(effective["approximated"], 0)
+
+    def test_second_sync_skips_without_rehashing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            self._write_claude_session(home, session_id="claude-fast")
+            self._write_codex_session(home, session_id="rollout-fast")
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+
+            sync_sessions(shared, db_path, "alice", "m1", home)
+
+            with mock.patch(
+                "logpile.sync.file_hash",
+                side_effect=AssertionError("file_hash called on unchanged files"),
+            ):
+                new, updated, skipped = sync_sessions(shared, db_path, "alice", "m1", home)
+            self.assertEqual((new, updated), (0, 0))
+            self.assertEqual(skipped, 2)
+
+    def test_moved_rollout_updates_source_path_without_reparse(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            live = self._write_codex_session(home, session_id="rollout-move")
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+
+            sync_sessions(shared, db_path, "alice", "m1", home)
+
+            archived = home / ".codex" / "archived_sessions" / live.name
+            archived.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(live), str(archived))
+
+            sync_sessions(shared, db_path, "alice", "m1", home)
+
+            with open_sqlite(db_path) as conn:
+                row = conn.execute(
+                    "SELECT source_path, total_input_tokens FROM sessions WHERE session_id = 'rollout-move'"
+                ).fetchone()
+            self.assertEqual(row["source_path"], str(archived))
+            self.assertEqual(row["total_input_tokens"], 1200)
 
 
 class SyncLockTests(unittest.TestCase):

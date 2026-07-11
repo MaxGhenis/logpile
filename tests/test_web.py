@@ -704,6 +704,56 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(len(set(error_payload["labels"])), 2)
             self.assertTrue(all(label.startswith("Sam (@") for label in error_payload["labels"]))
 
+    def test_messages_per_day_buckets_by_event_day_not_session_start(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "alice"
+            shared = root / "shared"
+            db_path = root / "logpile.db"
+            self._prepare_user(db_path, username="alice")
+
+            start = datetime.now(timezone.utc) - timedelta(days=3)
+            later = datetime.now(timezone.utc) - timedelta(days=1)
+            write_jsonl(
+                home / ".claude" / "projects" / "-Users-alice-demo" / "long-session.jsonl",
+                [
+                    {
+                        "timestamp": start.isoformat().replace("+00:00", "Z"),
+                        "type": "user",
+                        "cwd": "/tmp/demo",
+                        "message": {"content": "kick off a multi-day task"},
+                    },
+                    {
+                        "timestamp": later.isoformat().replace("+00:00", "Z"),
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg-late",
+                            "model": "claude-3.7",
+                            "usage": {"input_tokens": 1, "output_tokens": 2},
+                            "content": [{"type": "text", "text": "done two days later"}],
+                        },
+                    },
+                ],
+            )
+            sync_sessions(
+                shared_dir=shared,
+                db_path=db_path,
+                username="alice",
+                machine="machine-1",
+                home=home,
+            )
+
+            app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            with app.test_client() as client:
+                payload = client.get("/api/messages-per-day").get_json()
+
+            # One message on each event day — not both dumped on the start day.
+            self.assertEqual(
+                payload["labels"],
+                [start.date().isoformat(), later.date().isoformat()],
+            )
+            self.assertEqual(payload["datasets"][0]["data"], [1, 1])
+
     def test_path_apis_and_filters_use_extracted_session_paths(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
