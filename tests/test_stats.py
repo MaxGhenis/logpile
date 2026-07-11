@@ -43,14 +43,18 @@ def _insert_session(
     cached_input_tokens: int = 200,
     first_timestamp: str = "2026-03-15T10:00:00Z",
 ) -> None:
+    # native_* mirrors the transcript columns, as refresh_native_usage
+    # leaves any ledger without resume-chain duplication.
     conn.execute(
         """
         INSERT INTO sessions (
             session_id, source, username, repo_name,
             spawn_depth, user_message_count, tool_call_count,
             total_input_tokens, total_output_tokens, cached_input_tokens,
+            native_total_input_tokens, native_total_output_tokens,
+            native_cached_input_tokens,
             first_timestamp, last_timestamp, source_path, shared_path
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
@@ -60,6 +64,9 @@ def _insert_session(
             spawn_depth,
             user_message_count,
             tool_call_count,
+            total_input_tokens,
+            total_output_tokens,
+            cached_input_tokens,
             total_input_tokens,
             total_output_tokens,
             cached_input_tokens,
@@ -89,12 +96,18 @@ def _insert_daily(
         INSERT INTO session_daily_usage (
             session_id, day, total_input_tokens, total_output_tokens,
             cached_input_tokens, cache_creation_input_tokens,
+            native_total_input_tokens, native_total_output_tokens,
+            native_cached_input_tokens, native_cache_creation_input_tokens,
             user_message_count, assistant_message_count, tool_call_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
             day,
+            total_input_tokens,
+            total_output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
             total_input_tokens,
             total_output_tokens,
             cached_input_tokens,

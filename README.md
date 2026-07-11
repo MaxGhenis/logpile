@@ -113,13 +113,38 @@ fast path, so multi-GB immutable archives are hashed once, not every sync.
   for sessions not yet re-synced — a session spanning weeks no longer dumps
   all its usage on its start date.
 
-**Known limitation:** resuming a *Claude Code* session copies prior history
-into a new file and re-stamps each record's `sessionId`, so replayed Claude
-messages are locally indistinguishable from native ones. Each session row is
-correct as "what this transcript contains", but summing token totals across a
-resume chain double-counts the inherited history. Cross-session dedup by
-`(message.id, requestId)` is deliberately out of scope here (the usage-tracker
-pipeline does it globally when computing spend).
+##### Cross-session dedup (`native_*` columns)
+
+Resuming a *Claude Code* session copies prior history into a new file and
+re-stamps each record's `sessionId`, so replayed Claude messages are locally
+indistinguishable from native ones — but they keep their original
+`message.id`, `requestId`, `uuid`, and timestamps. Sync claims each parsed
+assistant message in the `message_claims` table under the same key the
+usage-tracker pipeline uses (`message.id:requestId`); among the sessions
+containing a message, the owner is the one with the smallest
+`(last_timestamp, first_timestamp, session_id)` — the earliest-ending
+transcript, i.e. the session where the message actually ran (a resume copy
+always ends at or after its source). That min-rule is order-independent, so
+re-parsing files in any order, or rebuilding the database from scratch,
+converges to the same owners.
+
+Every token column therefore exists in two flavors:
+
+- `total_input_tokens` etc. — **transcript semantics**: what this session's
+  file contains, including history inherited through a resume. Correct for
+  "how big was this session's context", double-counts across a resume chain.
+- `native_total_input_tokens` etc. (plus `native_assistant_message_count`) —
+  **native semantics**: usage first attributed to this session. Summing
+  native columns across sessions never double-counts. For Codex, parse-time
+  replay handling already makes transcript totals live-only, so native
+  mirrors them; for pre-claims Claude rows whose bytes are gone everywhere,
+  native falls back to mirroring transcript totals.
+
+Aggregates (`logpile stats`, dashboard totals, per-day charts, per-user and
+per-repo rollups) read `native_*`. Per-session rows in the UI still show
+transcript totals. `user_message_count` and `tool_call_count` remain
+transcript-level everywhere (only assistant records carry the identity
+needed for claims).
 
 ### `logpile search` / `logpile show` / `logpile status`
 

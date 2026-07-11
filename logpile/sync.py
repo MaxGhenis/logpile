@@ -15,7 +15,9 @@ from .parsers import parse_claudecode_session, parse_codex_session, file_hash
 from .objectives import SESSION_OBJECTIVE_VERSION, derive_session_objective
 from .origins import SESSION_ORIGIN_VERSION, derive_session_origin
 from .db import (
+    apply_message_claims,
     ensure_user,
+    get_meta,
     get_user_by_identifier,
     get_db,
     init_db,
@@ -23,7 +25,9 @@ from .db import (
     insert_session_paths,
     insert_tool_calls,
     normalize_username,
+    refresh_native_usage,
     resolve_session_visibility,
+    set_meta,
     upsert_session,
 )
 
@@ -32,7 +36,9 @@ SESSION_ACTIVITY_VERSION = 1
 SESSION_NARRATIVE_VERSION = 1
 # 4: codex replay-burst deltas (resume snapshots no longer re-count history),
 #    Claude cache_creation capture, per-day usage rows, file size/mtime.
-SESSION_TOKEN_VERSION = 4
+# 5: cross-session Claude dedup — parses emit message_claims and native_*
+#    columns are claims-derived (db.CLAIMS_TOKEN_VERSION).
+SESSION_TOKEN_VERSION = 5
 _TEST_PATTERNS = (
     re.compile(r"\b(pytest|py\.test|vitest|jest|nosetests|rspec)\b"),
     re.compile(r"\bpython(?:\d+(?:\.\d+)?)?\s+-m\s+(pytest|unittest)\b"),
@@ -741,16 +747,19 @@ def _compute_duration(t1: str, t2: str) -> float | None:
         return None
 
 
-def _backfill_tokens_from_shared(conn, verbose: bool = False) -> int:
+def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[str]]:
     """Re-parse sessions whose source file is gone but whose shared copy
-    survives, refreshing token columns and per-day usage rows.
+    survives, refreshing token columns, per-day usage rows, and message
+    claims.
 
     Claude Code rotates transcripts after ~30 days and Codex sessions can be
     deleted outright; the ledger keeps their rows. Without this, those rows
     could never pick up accounting fixes (SESSION_TOKEN_VERSION bumps) —
-    they'd keep whatever numbers the buggy parser wrote. Only token fields
-    and daily usage are refreshed; identity, narrative, and path data from
-    the original parse stay untouched.
+    they'd keep whatever numbers the buggy parser wrote. Only token fields,
+    daily usage, and claims are refreshed; identity, narrative, and path
+    data from the original parse stay untouched.
+
+    Returns (backfilled_count, session ids needing a native_* refresh).
     """
     rows = conn.execute(
         """
@@ -762,6 +771,7 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> int:
         (SESSION_TOKEN_VERSION,),
     ).fetchall()
     backfilled = 0
+    affected: set[str] = set()
     for row in rows:
         if Path(row["source_path"]).exists():
             continue  # live files belong to the main scan loops
@@ -804,10 +814,16 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> int:
             ),
         )
         insert_session_daily_usage(conn, row["session_id"], info.daily_usage)
+        affected.add(row["session_id"])
+        if row["source"] == "claudecode":
+            affected |= apply_message_claims(conn, row["session_id"], info.message_usage)
         backfilled += 1
+        if backfilled % 200 == 0:
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         if verbose:
             print(f"  Backfilled tokens from shared copy: {row['session_id'][:20]}…")
-    return backfilled
+    return backfilled, affected
 
 
 def sync_sessions(
@@ -902,6 +918,14 @@ def _sync_sessions(
         }
         processed_count = 0
         repo_metadata_cache: dict[str, dict[str, str | int | None]] = {}
+        # Sessions whose native_* aggregates must be recomputed before this
+        # sync finishes: everything (re)parsed plus previous owners of stolen
+        # claims. If an earlier sync died before its refresh (flag not reset
+        # to "0"), recompute everything to heal whatever it left behind.
+        affected_native: set[str] = set()
+        force_full_refresh = get_meta(conn, "native_refresh_pending") != "0"
+        set_meta(conn, "native_refresh_pending", "1")
+        conn.commit()
 
         def flush_if_needed() -> None:
             nonlocal processed_count
@@ -1105,6 +1129,10 @@ def _sync_sessions(
                 insert_tool_calls(conn, info.session_id, info.tool_calls)
                 insert_session_paths(conn, info.session_id, session_paths)
                 insert_session_daily_usage(conn, info.session_id, info.daily_usage)
+                affected_native.add(info.session_id)
+                affected_native |= apply_message_claims(
+                    conn, info.session_id, info.message_usage
+                )
                 flush_if_needed()
 
                 action = "Updated" if session_id in existing else "Added"
@@ -1315,6 +1343,7 @@ def _sync_sessions(
                 insert_tool_calls(conn, session_id, info.tool_calls)
                 insert_session_paths(conn, session_id, session_paths)
                 insert_session_daily_usage(conn, session_id, info.daily_usage)
+                affected_native.add(session_id)
                 flush_if_needed()
 
                 action = "Updated" if session_id in existing else "Added"
@@ -1327,6 +1356,11 @@ def _sync_sessions(
                     short = session_id[-20:] if len(session_id) > 20 else session_id
                     print(f"  {action}: …{short} ({project})")
 
-        updated_count += _backfill_tokens_from_shared(conn, verbose=verbose)
+        backfilled, backfill_affected = _backfill_tokens_from_shared(conn, verbose=verbose)
+        updated_count += backfilled
+        affected_native |= backfill_affected
+
+        refresh_native_usage(conn, None if force_full_refresh else affected_native)
+        set_meta(conn, "native_refresh_pending", "0")
 
     return new_count, updated_count, skipped_count

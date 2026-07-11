@@ -44,6 +44,28 @@ class DailyUsage:
 
 
 @dataclass
+class MessageUsage:
+    """One deduplicated assistant message's usage, for cross-session claims.
+
+    claim_key matches the usage-tracker pipeline: "mid:rid" when both are
+    present (replayed copies preserve message.id, requestId, uuid, and
+    timestamps verbatim — only sessionId is re-stamped), falling back to
+    "uuid:<uuid>" then "mid:<message.id>". Records logpile already drops
+    (no message.id) emit no claim.
+    """
+
+    claim_key: str
+    day: Optional[str]  # YYYY-MM-DD (UTC), None when the record has no timestamp
+    model: Optional[str]
+    fresh_input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_creation_5m_input_tokens: int = 0
+    cache_creation_1h_input_tokens: int = 0
+    output_tokens: int = 0
+
+
+@dataclass
 class SessionPath:
     raw_path: str
     normalized_path: str
@@ -83,6 +105,7 @@ class SessionInfo:
     tool_calls: list = field(default_factory=list)
     session_paths: list = field(default_factory=list)
     daily_usage: list = field(default_factory=list)
+    message_usage: list = field(default_factory=list)  # MessageUsage, claudecode only
 
 
 _USER_CONTEXT_PREAMBLE_RE = re.compile(
@@ -600,9 +623,10 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
     # NOTE: this is per-file only. Resuming a Claude Code session copies the
     # prior history into a NEW file and re-stamps each record's sessionId to
     # the new session, so replayed messages are indistinguishable locally and
-    # aggregate rollups count them once per resume file. Deduplicating those
-    # requires cross-session state (usage-tracker does it globally by
-    # message.id + requestId).
+    # this file's totals count them again. Cross-session dedup happens in the
+    # ledger: each kept message is also emitted as a MessageUsage claim
+    # (message_usage) and sync resolves one owning session per claim_key in
+    # the message_claims table, which feeds the native_* columns.
     seen_msg: dict = {}  # message_id -> {"fresh_input": ..., "cached_input": ..., "output": ..., ...}
     first_timestamp = None
     last_timestamp = None
@@ -687,6 +711,8 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
                         "output": out,
                         "model": mdl,
                         "timestamp": ts,
+                        "request_id": r.get("requestId"),
+                        "uuid": r.get("uuid"),
                     }
                 if mdl and not model:
                     model = mdl
@@ -747,6 +773,26 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
         bucket.total_input_tokens += v["fresh_input"] + v["cache_creation"] + v["cached_input"]
         bucket.total_output_tokens += v["output"]
 
+    message_usage = []
+    for msg_id, v in seen_msg.items():
+        if v["request_id"]:
+            claim_key = f"{msg_id}:{v['request_id']}"
+        elif v["uuid"]:
+            claim_key = f"uuid:{v['uuid']}"
+        else:
+            claim_key = f"mid:{msg_id}"
+        message_usage.append(MessageUsage(
+            claim_key=claim_key,
+            day=_day_of(v["timestamp"]),
+            model=v["model"],
+            fresh_input_tokens=v["fresh_input"],
+            cached_input_tokens=v["cached_input"],
+            cache_creation_input_tokens=v["cache_creation"],
+            cache_creation_5m_input_tokens=v["cache_creation_5m"],
+            cache_creation_1h_input_tokens=v["cache_creation_1h"],
+            output_tokens=v["output"],
+        ))
+
     return SessionInfo(
         session_id=session_id,
         source="claudecode",
@@ -772,6 +818,7 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo]:
         tool_calls=tool_calls,
         session_paths=_build_session_paths(tool_calls, workspace_root),
         daily_usage=_sorted_daily(daily),
+        message_usage=message_usage,
     )
 
 

@@ -432,9 +432,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             f"""
             SELECT
                 COUNT(*) AS total_sessions,
-                SUM(user_message_count + assistant_message_count) AS total_messages,
+                SUM(user_message_count + native_assistant_message_count) AS total_messages,
                 SUM(tool_call_count) AS total_tool_calls,
-                SUM(total_input_tokens + total_output_tokens) AS total_tokens,
+                SUM(native_total_input_tokens + native_total_output_tokens) AS total_tokens,
                 COUNT(DISTINCT substr(first_timestamp, 1, 10)) AS active_days,
                 COUNT(DISTINCT CASE
                     WHEN project IS NOT NULL AND project != '' AND project != 'unknown'
@@ -482,7 +482,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             SELECT
                 d.day AS day,
                 COUNT(DISTINCT d.session_id) AS sessions,
-                SUM(d.user_message_count + d.assistant_message_count) AS messages,
+                SUM(d.user_message_count + d.native_assistant_message_count) AS messages,
                 SUM(d.tool_call_count) AS tool_calls
             FROM session_daily_effective d
             JOIN session_catalog s ON s.session_id = d.session_id
@@ -500,7 +500,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             SELECT
                 source,
                 COUNT(*) AS sessions,
-                SUM(user_message_count + assistant_message_count) AS messages,
+                SUM(user_message_count + native_assistant_message_count) AS messages,
                 SUM(tool_call_count) AS tool_calls
             FROM session_catalog s
             WHERE { _profile_session_clause("s") } AND s.username = ?{origin_sql}
@@ -531,7 +531,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                     ELSE model
                 END AS model_name,
                 COUNT(*) AS sessions,
-                SUM(user_message_count + assistant_message_count) AS messages
+                SUM(user_message_count + native_assistant_message_count) AS messages
             FROM session_catalog s
             WHERE { _profile_session_clause("s") } AND s.username = ?{origin_sql}
             GROUP BY model_name
@@ -616,10 +616,10 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             SELECT
                 COUNT(*) AS total_sessions,
                 SUM(user_message_count) AS total_user_msgs,
-                SUM(assistant_message_count) AS total_assistant_msgs,
+                SUM(native_assistant_message_count) AS total_assistant_msgs,
                 SUM(tool_call_count) AS total_tool_calls,
-                SUM(total_input_tokens) AS total_input_tokens,
-                SUM(total_output_tokens) AS total_output_tokens,
+                SUM(native_total_input_tokens) AS total_input_tokens,
+                SUM(native_total_output_tokens) AS total_output_tokens,
                 COUNT(DISTINCT s.username) AS active_users,
                 COUNT(DISTINCT project) AS total_projects
             FROM session_catalog s
@@ -664,7 +664,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 COALESCE(s.username, s.username) AS user_key,
                 s.username,
                 COALESCE(u.display_name, s.username) AS user_display_name,
-                SUM(d.user_message_count + d.assistant_message_count) AS msgs
+                SUM(d.user_message_count + d.native_assistant_message_count) AS msgs
             FROM session_daily_effective d
             JOIN session_catalog s ON s.session_id = d.session_id
             LEFT JOIN user_catalog u ON u.username = s.username
@@ -718,7 +718,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             SELECT
                 d.day AS day,
                 s.source AS source,
-                SUM(d.user_message_count + d.assistant_message_count) AS msgs
+                SUM(d.user_message_count + d.native_assistant_message_count) AS msgs
             FROM session_daily_effective d
             JOIN session_catalog s ON s.session_id = d.session_id
             LEFT JOIN user_catalog u ON u.username = s.username

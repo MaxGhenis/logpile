@@ -93,16 +93,18 @@ def compute_overview(
     until: str | None = None,
 ) -> dict:
     where, params = _build_where(username, since, until)
+    # Cross-session sums use native_* so a Claude Code resume chain's
+    # inherited history counts once, not once per transcript.
     row = conn.execute(
         f"""
         SELECT
             COUNT(*) AS total_sessions,
             MIN(s.first_timestamp) AS first_date,
             MAX(s.first_timestamp) AS last_date,
-            COALESCE(SUM(s.total_input_tokens), 0) AS total_input_tokens,
-            COALESCE(SUM(s.total_output_tokens), 0) AS total_output_tokens,
-            COALESCE(SUM(s.cached_input_tokens), 0) AS cached_input_tokens,
-            COALESCE(SUM(s.cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
+            COALESCE(SUM(s.native_total_input_tokens), 0) AS total_input_tokens,
+            COALESCE(SUM(s.native_total_output_tokens), 0) AS total_output_tokens,
+            COALESCE(SUM(s.native_cached_input_tokens), 0) AS cached_input_tokens,
+            COALESCE(SUM(s.native_cache_creation_input_tokens), 0) AS cache_creation_input_tokens,
             COUNT(DISTINCT s.repo_name) AS repos_touched
         FROM sessions s
         WHERE {where}
@@ -135,7 +137,7 @@ def compute_by_pattern(
             s.spawn_depth,
             s.user_message_count,
             s.tool_call_count,
-            s.total_output_tokens
+            s.native_total_output_tokens AS total_output_tokens
         FROM sessions s
         WHERE {where}
         """,
@@ -235,7 +237,7 @@ def compute_by_repo(
         SELECT
             COALESCE(s.repo_name, '(no repo)') AS repo_name,
             COUNT(*) AS session_count,
-            COALESCE(SUM(s.total_output_tokens), 0) AS total_output_tokens
+            COALESCE(SUM(s.native_total_output_tokens), 0) AS total_output_tokens
         FROM sessions s
         WHERE {where}
         GROUP BY COALESCE(s.repo_name, '(no repo)')
@@ -248,7 +250,7 @@ def compute_by_repo(
     # Use all-sessions total as denominator, not just top-N
     grand_total_row = conn.execute(
         f"""
-        SELECT COALESCE(SUM(s.total_output_tokens), 0) AS total
+        SELECT COALESCE(SUM(s.native_total_output_tokens), 0) AS total
         FROM sessions s
         WHERE {where}
         """,
@@ -287,7 +289,8 @@ def compute_by_period(
     its start month (that inflated Apr/May 2026 and starved Jun). Sessions
     not re-synced since session_daily_usage was introduced degrade to
     start-date attribution via the view. A session active in N months counts
-    toward each month's session_count.
+    toward each month's session_count. Sums use native_* so Claude Code
+    resume chains count their inherited history once.
     """
     clauses: list[str] = ["d.day IS NOT NULL", "d.day != ''"]
     params: list[str] = []
@@ -332,10 +335,10 @@ def compute_by_period(
         SELECT
             SUBSTR(d.day, 1, 7) AS month,
             COUNT(DISTINCT d.session_id) AS session_count,
-            COALESCE(SUM(d.total_output_tokens), 0) AS total_output_tokens,
-            COALESCE(SUM(d.total_input_tokens), 0) AS total_input_tokens,
-            COALESCE(SUM(d.cached_input_tokens), 0) AS cached_input_tokens,
-            COALESCE(SUM(d.cache_creation_input_tokens), 0) AS cache_creation_input_tokens
+            COALESCE(SUM(d.native_total_output_tokens), 0) AS total_output_tokens,
+            COALESCE(SUM(d.native_total_input_tokens), 0) AS total_input_tokens,
+            COALESCE(SUM(d.native_cached_input_tokens), 0) AS cached_input_tokens,
+            COALESCE(SUM(d.native_cache_creation_input_tokens), 0) AS cache_creation_input_tokens
         FROM session_daily_effective d
         JOIN sessions s ON s.session_id = d.session_id
         WHERE {where}

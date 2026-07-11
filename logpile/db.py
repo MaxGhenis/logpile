@@ -11,6 +11,28 @@ from .origins import SESSION_ORIGINS
 
 SESSION_VISIBILITIES = ("private", "unlisted", "public")
 PROFILE_VISIBILITIES = ("private", "unlisted", "public")
+
+# Parses at or above this token_version emit message_claims rows, so their
+# native_* columns are claims-derived. Older rows (whose bytes may be gone)
+# keep native_* mirroring transcript totals — the pre-dedup approximation.
+CLAIMS_TOKEN_VERSION = 5
+
+# (native column, transcript column) pairs shared by `sessions` and
+# `session_daily_usage`. native_* = usage first attributed to this session:
+# for claudecode, inherited resume history is excluded via message_claims;
+# for codex, parse-time replay-burst handling already makes transcript
+# totals live-only, so native mirrors them.
+NATIVE_TOKEN_COLUMNS = (
+    ("native_total_input_tokens", "total_input_tokens"),
+    ("native_total_output_tokens", "total_output_tokens"),
+    ("native_fresh_input_tokens", "fresh_input_tokens"),
+    ("native_cached_input_tokens", "cached_input_tokens"),
+    ("native_cache_creation_input_tokens", "cache_creation_input_tokens"),
+    ("native_cache_creation_5m_input_tokens", "cache_creation_5m_input_tokens"),
+    ("native_cache_creation_1h_input_tokens", "cache_creation_1h_input_tokens"),
+    ("native_reasoning_output_tokens", "reasoning_output_tokens"),
+    ("native_assistant_message_count", "assistant_message_count"),
+)
 RULE_MATCH_FIELDS = (
     "project",
     "source_path",
@@ -104,6 +126,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_creation_5m_input_tokens INTEGER DEFAULT 0,
     cache_creation_1h_input_tokens INTEGER DEFAULT 0,
     reasoning_output_tokens INTEGER DEFAULT 0,
+    native_total_input_tokens    INTEGER DEFAULT 0,
+    native_total_output_tokens   INTEGER DEFAULT 0,
+    native_fresh_input_tokens    INTEGER DEFAULT 0,
+    native_cached_input_tokens   INTEGER DEFAULT 0,
+    native_cache_creation_input_tokens INTEGER DEFAULT 0,
+    native_cache_creation_5m_input_tokens INTEGER DEFAULT 0,
+    native_cache_creation_1h_input_tokens INTEGER DEFAULT 0,
+    native_reasoning_output_tokens INTEGER DEFAULT 0,
+    native_assistant_message_count INTEGER DEFAULT 0,
     token_version        INTEGER DEFAULT 0,
     first_user_message    TEXT,
     parent_session_id    TEXT,
@@ -134,10 +165,47 @@ CREATE TABLE IF NOT EXISTS session_daily_usage (
     cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
     reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+    native_total_input_tokens    INTEGER NOT NULL DEFAULT 0,
+    native_total_output_tokens   INTEGER NOT NULL DEFAULT 0,
+    native_fresh_input_tokens    INTEGER NOT NULL DEFAULT 0,
+    native_cached_input_tokens   INTEGER NOT NULL DEFAULT 0,
+    native_cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    native_cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
+    native_cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
+    native_reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+    native_assistant_message_count INTEGER NOT NULL DEFAULT 0,
     user_message_count      INTEGER NOT NULL DEFAULT 0,
     assistant_message_count INTEGER NOT NULL DEFAULT 0,
     tool_call_count         INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, day)
+);
+
+-- Cross-session dedup ledger for Claude Code assistant messages. Resuming a
+-- CC session copies prior history into a new transcript re-stamped with the
+-- new sessionId, so the same (message.id, requestId) appears in every file
+-- of a resume chain. Each parsed message claims its key here; the owner is
+-- the session with the smallest (last_timestamp, first_timestamp,
+-- session_id) among claimants — the earliest-ending transcript containing
+-- the message, i.e. the session where it ran live (a resume copy always
+-- ends at or after its source). native_* columns aggregate from here.
+CREATE TABLE IF NOT EXISTS message_claims (
+    claim_key TEXT PRIMARY KEY,
+    owner_session_id TEXT NOT NULL,
+    day TEXT,
+    model TEXT,
+    fresh_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+
+-- Small key/value state for the sync pipeline itself (e.g. whether a
+-- native_* refresh is owed after an interrupted sync).
+CREATE TABLE IF NOT EXISTS logpile_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -185,6 +253,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_objective_family    ON sessions(objectiv
 CREATE INDEX IF NOT EXISTS idx_sessions_origin              ON sessions(session_origin);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent_session      ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_session_daily_day            ON session_daily_usage(day);
+CREATE INDEX IF NOT EXISTS idx_message_claims_owner_day     ON message_claims(owner_session_id, day);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session           ON tool_calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_name              ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_session_paths_session        ON session_paths(session_id);
@@ -241,6 +310,15 @@ SELECT
     d.cache_creation_5m_input_tokens,
     d.cache_creation_1h_input_tokens,
     d.reasoning_output_tokens,
+    d.native_total_input_tokens,
+    d.native_total_output_tokens,
+    d.native_fresh_input_tokens,
+    d.native_cached_input_tokens,
+    d.native_cache_creation_input_tokens,
+    d.native_cache_creation_5m_input_tokens,
+    d.native_cache_creation_1h_input_tokens,
+    d.native_reasoning_output_tokens,
+    d.native_assistant_message_count,
     d.user_message_count,
     d.assistant_message_count,
     d.tool_call_count,
@@ -258,6 +336,15 @@ SELECT
     COALESCE(s.cache_creation_5m_input_tokens, 0),
     COALESCE(s.cache_creation_1h_input_tokens, 0),
     COALESCE(s.reasoning_output_tokens, 0),
+    COALESCE(s.native_total_input_tokens, 0),
+    COALESCE(s.native_total_output_tokens, 0),
+    COALESCE(s.native_fresh_input_tokens, 0),
+    COALESCE(s.native_cached_input_tokens, 0),
+    COALESCE(s.native_cache_creation_input_tokens, 0),
+    COALESCE(s.native_cache_creation_5m_input_tokens, 0),
+    COALESCE(s.native_cache_creation_1h_input_tokens, 0),
+    COALESCE(s.native_reasoning_output_tokens, 0),
+    COALESCE(s.native_assistant_message_count, 0),
     COALESCE(s.user_message_count, 0),
     COALESCE(s.assistant_message_count, 0),
     COALESCE(s.tool_call_count, 0),
@@ -1331,6 +1418,19 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "sessions", "cache_creation_1h_input_tokens", "INTEGER DEFAULT 0")
     _ensure_column(conn, "sessions", "file_size", "INTEGER")
     _ensure_column(conn, "sessions", "file_mtime", "REAL")
+    for native_column, _transcript_column in NATIVE_TOKEN_COLUMNS:
+        _ensure_column(conn, "sessions", native_column, "INTEGER DEFAULT 0")
+        _ensure_column(conn, "session_daily_usage", native_column, "INTEGER NOT NULL DEFAULT 0")
+    # Claims whose owning session left the ledger no longer feed any native
+    # aggregate; drop them. (Duplicates in other transcripts re-claim on
+    # their next re-parse, not automatically.)
+    conn.execute(
+        "DELETE FROM message_claims WHERE owner_session_id NOT IN (SELECT session_id FROM sessions)"
+    )
+    # Give pre-claims rows sane native values immediately (mirror transcript
+    # totals) so aggregate readers never see zeros between the column
+    # migration and the first full re-parse.
+    _refresh_native_mirror(conn)
     conn.execute(
         """
         UPDATE sessions
@@ -1692,6 +1792,251 @@ def insert_session_daily_usage(conn, session_id: str, daily_usage: list):
             for d in daily_usage
         ],
     )
+
+
+def _chunked(values: list, size: int = 500):
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _session_rank(last_timestamp, first_timestamp, session_id) -> tuple[str, str, str]:
+    """Ownership rank; the minimum-ranked claimant owns a message.
+
+    Earliest last_timestamp wins: a resume transcript is a superset of its
+    source, so it always ends at or after the source — the earliest-ending
+    claimant is the session where the message actually ran. Sessions without
+    timestamps rank after any dated session ("~" > every digit in ASCII).
+    """
+    return (last_timestamp or "~", first_timestamp or "~", session_id)
+
+
+def apply_message_claims(conn, session_id: str, message_usage: list) -> set[str]:
+    """Resolve cross-session ownership for one parsed session's messages.
+
+    Upserts this session's claims into message_claims: new keys are claimed,
+    keys it already owns get refreshed values, keys owned by a higher-ranked
+    session are stolen, and stale keys it owns but no longer emits are
+    deleted. Because ownership is a pure min-rule over current session ranks,
+    the final owner set is the same whatever order files are (re)parsed in.
+
+    The session's own row must already be upserted (rank reads sessions).
+    Returns the set of session ids whose native aggregates are now stale
+    (always includes session_id itself when anything changed).
+    """
+    my_row = conn.execute(
+        "SELECT last_timestamp, first_timestamp FROM sessions WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    my_rank = _session_rank(
+        my_row["last_timestamp"] if my_row else None,
+        my_row["first_timestamp"] if my_row else None,
+        session_id,
+    )
+
+    affected: set[str] = set()
+    current_keys = {m.claim_key for m in message_usage}
+
+    existing: dict[str, tuple] = {}
+    keys = sorted(current_keys)
+    for chunk in _chunked(keys):
+        placeholders = ",".join("?" * len(chunk))
+        for row in conn.execute(
+            f"""
+            SELECT c.claim_key, c.owner_session_id,
+                   s.session_id AS owner_in_ledger,
+                   s.last_timestamp, s.first_timestamp,
+                   c.day, c.model,
+                   c.fresh_input_tokens, c.cached_input_tokens,
+                   c.cache_creation_input_tokens, c.cache_creation_5m_input_tokens,
+                   c.cache_creation_1h_input_tokens, c.output_tokens
+            FROM message_claims c
+            LEFT JOIN sessions s ON s.session_id = c.owner_session_id
+            WHERE c.claim_key IN ({placeholders})
+            """,
+            chunk,
+        ):
+            existing[row["claim_key"]] = row
+
+    to_write = []
+    for m in message_usage:
+        values = (
+            m.day, m.model,
+            m.fresh_input_tokens, m.cached_input_tokens,
+            m.cache_creation_input_tokens, m.cache_creation_5m_input_tokens,
+            m.cache_creation_1h_input_tokens, m.output_tokens,
+        )
+        row = existing.get(m.claim_key)
+        if row is None:
+            to_write.append((m.claim_key, session_id) + values)
+            affected.add(session_id)
+            continue
+        owner = row["owner_session_id"]
+        if owner != session_id:
+            if row["owner_in_ledger"] is None:
+                # Owner vanished from the ledger: any live claimant takes over
+                # ("~~" outranks even a timestamp-less session's "~").
+                owner_rank = ("~~", "~~", "~~")
+            else:
+                owner_rank = _session_rank(
+                    row["last_timestamp"], row["first_timestamp"], owner
+                )
+            if my_rank < owner_rank:
+                to_write.append((m.claim_key, session_id) + values)
+                affected.add(session_id)
+                affected.add(owner)
+            continue
+        if (
+            row["day"], row["model"],
+            row["fresh_input_tokens"], row["cached_input_tokens"],
+            row["cache_creation_input_tokens"], row["cache_creation_5m_input_tokens"],
+            row["cache_creation_1h_input_tokens"], row["output_tokens"],
+        ) != values:
+            to_write.append((m.claim_key, session_id) + values)
+            affected.add(session_id)
+
+    if to_write:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO message_claims (
+                claim_key, owner_session_id, day, model,
+                fresh_input_tokens, cached_input_tokens,
+                cache_creation_input_tokens, cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens, output_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            to_write,
+        )
+
+    # A re-parse can retire keys this session claimed earlier (e.g. the
+    # kept-copy of a retried message.id changed requestId). Every transcript
+    # holding the message keeps the retired key out of its parse for the same
+    # reason, so deleting is safe — no other session is waiting to claim it.
+    owned = [
+        row[0]
+        for row in conn.execute(
+            "SELECT claim_key FROM message_claims WHERE owner_session_id = ?",
+            (session_id,),
+        )
+    ]
+    stale = [key for key in owned if key not in current_keys]
+    if stale:
+        for chunk in _chunked(stale):
+            placeholders = ",".join("?" * len(chunk))
+            conn.execute(
+                f"DELETE FROM message_claims WHERE owner_session_id = ? AND claim_key IN ({placeholders})",
+                [session_id, *chunk],
+            )
+        affected.add(session_id)
+
+    return affected
+
+
+def _native_scope_clause(session_ids: set[str] | list[str] | None) -> tuple[str, list]:
+    if session_ids is None:
+        return "", []
+    ids = sorted(session_ids)
+    placeholders = ",".join("?" * len(ids))
+    return f" AND session_id IN ({placeholders})", ids
+
+
+def _refresh_native_mirror(conn, session_ids=None) -> None:
+    """native_* = transcript totals for rows not governed by claims:
+    codex (parse-time replay handling already makes totals live-only) and
+    claudecode rows below CLAIMS_TOKEN_VERSION (no re-parseable bytes)."""
+    assignments = ", ".join(f"{native} = {transcript}" for native, transcript in NATIVE_TOKEN_COLUMNS)
+    drift_guard = " OR ".join(f"{native} != {transcript}" for native, transcript in NATIVE_TOKEN_COLUMNS)
+    scope, params = _native_scope_clause(session_ids)
+    predicate = (
+        "session_id IN (SELECT session_id FROM sessions "
+        " WHERE source != 'claudecode' OR COALESCE(token_version, 0) < ?)"
+    )
+    conn.execute(
+        f"UPDATE sessions SET {assignments} WHERE {predicate}{scope} AND ({drift_guard})",
+        [CLAIMS_TOKEN_VERSION, *params],
+    )
+    conn.execute(
+        f"UPDATE session_daily_usage SET {assignments} WHERE {predicate}{scope} AND ({drift_guard})",
+        [CLAIMS_TOKEN_VERSION, *params],
+    )
+
+
+def _refresh_native_claims(conn, session_ids=None) -> None:
+    """native_* from owned message_claims for claudecode rows parsed at
+    CLAIMS_TOKEN_VERSION or later. Claims carry no reasoning tokens (Claude
+    reports none), so native_reasoning_output_tokens is 0 here."""
+    native_columns = ", ".join(native for native, _ in NATIVE_TOKEN_COLUMNS)
+    aggregates = """
+        COALESCE(SUM(c.fresh_input_tokens + c.cache_creation_input_tokens + c.cached_input_tokens), 0),
+        COALESCE(SUM(c.output_tokens), 0),
+        COALESCE(SUM(c.fresh_input_tokens), 0),
+        COALESCE(SUM(c.cached_input_tokens), 0),
+        COALESCE(SUM(c.cache_creation_input_tokens), 0),
+        COALESCE(SUM(c.cache_creation_5m_input_tokens), 0),
+        COALESCE(SUM(c.cache_creation_1h_input_tokens), 0),
+        0,
+        COUNT(c.claim_key)
+    """
+    scope, params = _native_scope_clause(session_ids)
+    conn.execute(
+        f"""
+        UPDATE sessions SET ({native_columns}) = (
+            SELECT {aggregates}
+            FROM message_claims c
+            WHERE c.owner_session_id = sessions.session_id
+        )
+        WHERE source = 'claudecode' AND COALESCE(token_version, 0) >= ?{scope}
+        """,
+        [CLAIMS_TOKEN_VERSION, *params],
+    )
+    conn.execute(
+        f"""
+        UPDATE session_daily_usage SET ({native_columns}) = (
+            SELECT {aggregates}
+            FROM message_claims c
+            WHERE c.owner_session_id = session_daily_usage.session_id
+              AND c.day = session_daily_usage.day
+        )
+        WHERE session_id IN (
+            SELECT session_id FROM sessions
+            WHERE source = 'claudecode' AND COALESCE(token_version, 0) >= ?
+        ){scope}
+        """,
+        [CLAIMS_TOKEN_VERSION, *params],
+    )
+
+
+def refresh_native_usage(conn, session_ids=None) -> None:
+    """Recompute native_* columns on sessions and session_daily_usage.
+
+    Restricted to session_ids when given (the set whose claims or transcript
+    columns changed this sync); None recomputes everything. Idempotent.
+    """
+    if session_ids is not None and not session_ids:
+        return
+    if session_ids is not None:
+        chunks = [set(chunk) for chunk in _chunked(sorted(session_ids))]
+    else:
+        chunks = [None]
+    for chunk in chunks:
+        _refresh_native_mirror(conn, chunk)
+        _refresh_native_claims(conn, chunk)
+
+
+def get_meta(conn, key: str) -> str | None:
+    row = conn.execute(
+        "SELECT value FROM logpile_meta WHERE key = ?", (key,)
+    ).fetchone()
+    return row["value"] if row else None
+
+
+def set_meta(conn, key: str, value: str | None) -> None:
+    if value is None:
+        conn.execute("DELETE FROM logpile_meta WHERE key = ?", (key,))
+    else:
+        conn.execute(
+            "INSERT OR REPLACE INTO logpile_meta (key, value) VALUES (?, ?)",
+            (key, value),
+        )
 
 
 def insert_tool_calls(conn, session_id: str, tool_calls: list):
