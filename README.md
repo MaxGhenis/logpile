@@ -4,7 +4,6 @@
 
 Logpile turns the JSONL session files your agent CLIs leave on disk into something you can actually browse — filtered by repo, activity (wrote files? ran tests? committed?), status (success / partial / failed / exploration), and workflow origin (your direct work vs. delegated agents vs. pipeline runs). A publish queue reviews each session for secrets and PII before anything goes on a public profile.
 
-Hosted: **[logpile.ai](https://logpile.ai)**
 Source: **[github.com/MaxGhenis/logpile](https://github.com/MaxGhenis/logpile)**
 
 ---
