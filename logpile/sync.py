@@ -25,6 +25,7 @@ from .parsers import (
 from .objectives import SESSION_OBJECTIVE_VERSION, derive_session_objective
 from .origins import SESSION_ORIGIN_VERSION, derive_session_origin
 from .db import (
+    SEARCH_INDEX_VERSION,
     apply_message_claims,
     defer_storage_transition,
     defer_storage_transitions,
@@ -44,6 +45,11 @@ from .db import (
     transition_session_visibility,
     upsert_session,
 )
+from .search import (
+    SearchTranscriptReadError,
+    backfill_search_index,
+    replace_session_search_index,
+)
 
 
 SESSION_ACTIVITY_VERSION = 1
@@ -56,7 +62,12 @@ SESSION_IDENTITY_VERSION = 1
 # 6: ISO-8601 timestamps are normalized to UTC before daily usage bucketing.
 # 7: structural Codex replay/reset accounting, explicit residual daily usage,
 #    and exact Claude cache-creation subtype accounting.
-SESSION_TOKEN_VERSION = 7
+# v8 restricts first-user extraction to explicit plaintext content blocks.
+# Reparse v7 rows so tool-result/thinking dictionaries cannot survive in
+# first_user_message or its derived session_goal and then enter search.
+# v9 additionally keeps isMeta (harness-injected) records out of
+# first_user_message and its derived session_goal.
+SESSION_TOKEN_VERSION = 9
 
 
 class SyncStatus(str, Enum):
@@ -1606,8 +1617,10 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
     could never pick up parser fixes. Refresh every parser-derived field that
     replay detection can suppress: identity/lineage, timestamps, message and
     tool counts, tool rows, token components, daily usage, and claims. Repo,
-    narrative, visibility, and storage metadata remain untouched because they
-    depend on sync-time context rather than transcript parsing.
+    Most narrative, visibility, and storage metadata remains untouched because
+    it depends on sync-time context rather than transcript parsing. The goal is
+    the clipped first user message, so it is refreshed alongside that field to
+    remove payload text admitted by older parser versions.
 
     Returns (backfilled_count, session ids needing a native_* refresh).
     """
@@ -1667,6 +1680,7 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
                 reasoning_output_tokens = ?,
                 token_version = ?,
                 first_user_message = ?,
+                session_goal = ?,
                 parent_session_id = ?,
                 spawn_depth = ?,
                 thread_id = ?,
@@ -1694,6 +1708,7 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
                 info.reasoning_output_tokens,
                 SESSION_TOKEN_VERSION,
                 info.first_user_message,
+                _clip_text(info.first_user_message, limit=180),
                 info.parent_session_id if row["source"] == "claudecode" else None,
                 info.spawn_depth,
                 info.thread_id,
@@ -2000,7 +2015,27 @@ def _sync_sessions(
         affected_native: set[str] = set()
         force_full_refresh = get_meta(conn, "native_refresh_pending") != "0"
         set_meta(conn, "native_refresh_pending", "1")
+        # Search replacement commits in bounded batches during a full corpus
+        # backfill. Persist the owed-refresh bit first so an interruption can
+        # resume from durable per-session state on an otherwise unchanged
+        # next sync, mirroring native_refresh_pending recovery.
+        set_meta(conn, "search_refresh_pending", "1")
         conn.commit()
+
+        def refresh_session_search(session_id: str, path: Path) -> None:
+            try:
+                replace_session_search_index(
+                    conn,
+                    session_id,
+                    transcript_path=path,
+                    shared_dir=shared_dir,
+                )
+            except SearchTranscriptReadError as exc:
+                # The parser already avoided committing partial session state.
+                # Preserve the prior complete FTS revision and let the
+                # end-of-sync resumable pass retry a managed/shared copy.
+                if verbose:
+                    print(f"  Search index deferred for {path}: {exc}", file=sys.stderr)
 
         def flush_if_needed() -> None:
             nonlocal processed_count
@@ -2339,6 +2374,7 @@ def _sync_sessions(
                 affected_native |= apply_message_claims(
                     conn, info.session_id, info.message_usage
                 )
+                refresh_session_search(info.session_id, Path(shared_path))
                 flush_if_needed()
 
                 action = "Updated" if session_id in existing else "Added"
@@ -2646,6 +2682,7 @@ def _sync_sessions(
                 insert_session_paths(conn, session_id, session_paths)
                 insert_session_daily_usage(conn, session_id, info.daily_usage)
                 affected_native.add(session_id)
+                refresh_session_search(session_id, Path(shared_path))
                 flush_if_needed()
 
                 action = "Updated" if session_id in existing else "Added"
@@ -2665,5 +2702,36 @@ def _sync_sessions(
         _resolve_canonical_parents(conn)
         refresh_native_usage(conn, None if force_full_refresh else affected_native)
         set_meta(conn, "native_refresh_pending", "0")
+
+        # Run committing search batches only after all ordinary sync work and
+        # native refresh have succeeded. This preserves the existing promise
+        # that a late sync failure rolls back uncommitted visibility/storage
+        # transitions instead of letting the backfill commit them early.
+        search_backfill = backfill_search_index(
+            conn,
+            shared_dir=shared_dir,
+            verbose=verbose,
+        )
+        if search_backfill.indexed or search_backfill.missing or search_backfill.errors:
+            gib = search_backfill.indexed_bytes / (1024 ** 3)
+            print(
+                "Search index: "
+                f"{search_backfill.indexed} session(s), {gib:.2f} GiB scanned "
+                f"in {search_backfill.elapsed_seconds:.1f}s; "
+                f"{search_backfill.missing} missing, {search_backfill.errors} error(s).",
+                file=sys.stderr,
+            )
+        if search_backfill.missing or search_backfill.errors:
+            set_meta(conn, "search_refresh_pending", "1")
+        else:
+            set_meta(conn, "search_index_version", str(SEARCH_INDEX_VERSION))
+            set_meta(conn, "search_refresh_pending", "0")
+        set_meta(
+            conn,
+            "search_backfill_last_elapsed_seconds",
+            f"{search_backfill.elapsed_seconds:.6f}",
+        )
+        set_meta(conn, "search_backfill_last_sessions", str(search_backfill.indexed))
+        set_meta(conn, "search_backfill_last_bytes", str(search_backfill.indexed_bytes))
 
     return SyncResult(new_count, updated_count, skipped_count)

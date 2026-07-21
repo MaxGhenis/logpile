@@ -171,20 +171,38 @@ needed for claims).
 
 ### `logpile search` / `logpile show` / `logpile status`
 
-Read from either local SQLite/shared files or the cloud raw-log index.
+Normal search reads the extracted-text FTS5 index in local SQLite. It indexes
+session goals, summaries, cleaned first-user titles, repository/project names,
+and user and assistant prose only; tool payloads, thinking/reasoning,
+harness-injected records, encrypted/base64 blobs (including any unbroken
+64+-character token, so full SHA-256 digests in prose need `--raw`), and
+non-text blocks are excluded. A first sync after a search-schema upgrade
+builds the index in resumable batches. Structured fields rank ahead of
+transcript body matches, with newest sessions breaking equal-score ties.
+Very common terms rank the best few thousand candidates per tier first,
+deepening automatically until enough distinct sessions qualify — the cut
+never decides membership — and public-mode results omit numeric relevance
+scores.
 
 ```bash
-# Auto chooses cloud when LOGPILE_SUPABASE_DB_URL is set, otherwise local.
+# Search all local/operator-visible sessions, including private archives.
 logpile search "specific thing x"
 logpile show <session-id>
 logpile status
 
-# Force one backend.
-logpile search "specific thing x" --backend local
-LOGPILE_SUPABASE_DB_URL="postgresql://..." logpile search "specific thing x" --backend cloud
+# Apply the public listing gate, or explicitly inspect raw records.
+logpile search "specific thing x" --public
+logpile search "specific thing x" --backend local --raw
+LOGPILE_SUPABASE_DB_URL="postgresql://..." \
+  logpile search "specific thing x" --backend cloud --raw
 ```
 
-Local mode is the privacy-preserving path: it reads only your local SQLite database and local JSONL files. Cloud mode reads Supabase/Postgres search chunks and links those chunks back to immutable raw objects in R2/S3.
+Local extracted search is the default even when cloud credentials are set, so
+raw cloud chunks can never silently become the normal result path. `--raw` is
+an explicit forensic mode and may match tool or opaque payloads. Cloud raw
+mode reads Supabase/Postgres chunks and links them back to immutable objects
+in R2/S3. Raw mode cannot be combined with `--public`, because mutable raw
+paths are not the reviewed public artifact.
 
 ### `logpile db-backup`
 

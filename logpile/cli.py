@@ -110,14 +110,46 @@ def _excerpt(text: str, query: str, *, width: int = 600) -> str:
     return prefix + clean[start:end].strip() + suffix
 
 
-def _local_search(db_path: Path, query: str, *, limit: int) -> list[dict]:
+def _local_search(
+    db_path: Path,
+    query: str,
+    *,
+    limit: int,
+    public_mode: bool = False,
+) -> list[dict]:
+    import sqlite3
+
+    from .search import search_sessions
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return search_sessions(
+            conn,
+            query,
+            limit=limit,
+            public_mode=public_mode,
+        )
+    finally:
+        conn.close()
+
+
+def _local_raw_search(
+    db_path: Path,
+    query: str,
+    *,
+    limit: int,
+    public_mode: bool = False,
+) -> list[dict]:
+    """Legacy raw JSONL grep retained only for explicit forensic use."""
     import sqlite3
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     pattern = f"%{query}%"
+    visibility_clause = "AND s.listed_public = 1" if public_mode else ""
     rows = conn.execute(
-        """
+        f"""
         SELECT
             s.session_id,
             s.source,
@@ -130,7 +162,8 @@ def _local_search(db_path: Path, query: str, *, limit: int) -> list[dict]:
             s.session_goal,
             s.session_summary
         FROM session_catalog s
-        WHERE s.first_user_message LIKE ?
+        WHERE (
+              s.first_user_message LIKE ?
            OR s.session_goal LIKE ?
            OR s.session_summary LIKE ?
            OR EXISTS (
@@ -138,6 +171,8 @@ def _local_search(db_path: Path, query: str, *, limit: int) -> list[dict]:
                 WHERE tc.session_id = s.session_id
                   AND (tc.command LIKE ? OR tc.tool_name LIKE ?)
            )
+        )
+        {visibility_clause}
         ORDER BY s.first_timestamp DESC
         LIMIT ?
         """,
@@ -165,9 +200,11 @@ def _local_search(db_path: Path, query: str, *, limit: int) -> list[dict]:
         return results[:limit]
 
     candidates = conn.execute(
-        """
+        f"""
         SELECT session_id, source, source_path, shared_path, first_timestamp
-        FROM session_catalog
+        FROM session_catalog s
+        WHERE 1 = 1
+        {visibility_clause}
         ORDER BY first_timestamp DESC
         """
     ).fetchall()
@@ -345,28 +382,85 @@ def status_command(backend, db, db_url, json_output):
 @click.option("--db-url", envvar="LOGPILE_SUPABASE_DB_URL",
               help="Supabase/Postgres connection URL for cloud mode.")
 @click.option("--limit", default=20, show_default=True, type=int)
+@click.option(
+    "--public",
+    "public_mode",
+    is_flag=True,
+    help="Restrict results to sessions listed in public mode.",
+)
+@click.option(
+    "--raw",
+    is_flag=True,
+    help="Forensic raw JSONL/chunk search; may include tool or opaque payloads.",
+)
 @click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
-def search_command(query, backend, db, db_url, limit, json_output):
-    """Search sessions using the selected backend."""
+def search_command(query, backend, db, db_url, limit, public_mode, raw, json_output):
+    """Search extracted session prose (or raw records with --raw)."""
     db_path = Path(db)
     db_url = _cloud_db_url(db_url)
     try:
-        selected = _select_backend(backend, db_path=db_path, db_url=db_url)
-        if selected == "cloud":
-            from .backup import SupabaseArchive
+        if raw:
+            if public_mode:
+                raise click.ClickException(
+                    "Public-mode raw search is unavailable because live raw "
+                    "files are not bound to the reviewed publication artifact."
+                )
+            selected = _select_backend(backend, db_path=db_path, db_url=db_url)
+            if selected == "cloud":
+                from .backup import SupabaseArchive
 
-            rows = SupabaseArchive(db_url).search(query, limit=limit)
+                rows = SupabaseArchive(db_url).search(query, limit=limit)
+            else:
+                rows = _local_raw_search(
+                    db_path,
+                    query,
+                    limit=limit,
+                    public_mode=public_mode,
+                )
         else:
-            rows = _local_search(db_path, query, limit=limit)
-    except RuntimeError as exc:
+            if backend == "cloud":
+                raise click.ClickException(
+                    "Extracted-text search is stored in local SQLite. Use "
+                    "--backend local, or add --raw for forensic cloud chunks."
+                )
+            # Never let a configured cloud raw-chunk backend silently replace
+            # the safe default. Normal search always uses the local FTS index.
+            selected = _select_backend("local", db_path=db_path, db_url=db_url)
+            rows = _local_search(
+                db_path,
+                query,
+                limit=limit,
+                public_mode=public_mode,
+            )
+    except (RuntimeError, click.ClickException) as exc:
         raise click.ClickException(str(exc))
 
-    payload = {"backend": selected, "query": query, "results": rows}
+    payload = {
+        "backend": selected,
+        "query": query,
+        "raw": raw,
+        "public": public_mode,
+        "results": rows,
+    }
     if json_output:
         click.echo(json.dumps(payload, default=str))
         return
 
     for row in rows:
+        if not raw:
+            session = row.get("session_id") or "unknown-session"
+            date = row.get("date") or "—"
+            field = row.get("matched_field") or "session text"
+            repo_name = row.get("repo_name") or ""
+            project = row.get("project") or ""
+            scope = repo_name or project or "unknown"
+            if repo_name and project and repo_name != project:
+                scope = f"{repo_name}/{project}"
+            click.echo(f"{date}  {session}  [{field}]  {scope}")
+            click.echo((row.get("excerpt") or "").strip())
+            click.echo("")
+            continue
+
         session = row.get("session_id") or "unknown-session"
         location = row.get("relative_path") or row.get("source_path") or ""
         if row.get("event_index") is not None:

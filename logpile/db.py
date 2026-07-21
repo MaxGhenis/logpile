@@ -29,6 +29,21 @@ VISIBILITY_SOURCES = (
 # keep native_* mirroring transcript totals — the pre-dedup approximation.
 CLAIMS_TOKEN_VERSION = 5
 
+# Search index revisions are independent from parser/token revisions. A
+# mismatch schedules a streaming, per-session rebuild during the next locked
+# sync; migration itself never reads transcript files.
+# 3: harness-tag allowlist stripping, isMeta/tool-result-rider exclusion,
+#    and codex AGENTS.md payload exclusion.
+# 4: AGENTS.md payloads also dropped from structured title/goal fields.
+# 5: allowlist gains heartbeat/turn_aborted/goal_context/subagent_notification,
+#    wrapped-base64 removal requires MIME-shaped uniform line widths, and the
+#    AGENTS.md marker requires its " for " suffix.
+# 6: the AGENTS.md marker also accepts the bare-header "<INSTRUCTIONS>"
+#    variant observed in the live corpus.
+# 7: AGENTS.md marker requires an absolute path after "for", runs after
+#    wrapper stripping, and wrapped-base64 removal requires width >= 24.
+SEARCH_INDEX_VERSION = 7
+
 # (native column, transcript column) pairs shared by `sessions` and
 # `session_daily_usage`. native_* = usage first attributed to this session:
 # for claudecode, inherited resume history is excluded via message_claims;
@@ -479,6 +494,111 @@ SELECT
     END AS direct_public,
     1 AS direct_private
 FROM users u;
+"""
+
+
+SEARCH_SCHEMA = """
+-- Searchable documents retain one bounded text block per row. The B-tree
+-- table gives per-session replacement an indexed delete path; the external-
+-- content FTS table stores only its term index and reads snippets from these
+-- rows instead of duplicating transcript text a second time.
+CREATE TABLE IF NOT EXISTS session_search_documents (
+    id              INTEGER PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    field_label     TEXT NOT NULL,
+    chunk_index     INTEGER NOT NULL,
+    structured_text TEXT,
+    transcript_text TEXT,
+    UNIQUE (session_id, field_label, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_search_documents_session
+    ON session_search_documents(session_id);
+
+CREATE TABLE IF NOT EXISTS session_search_state (
+    session_id        TEXT PRIMARY KEY,
+    search_version    INTEGER NOT NULL,
+    file_hash         TEXT,
+    artifact_hash     TEXT,
+    metadata_hash     TEXT NOT NULL,
+    transcript_status TEXT NOT NULL,
+    last_error        TEXT,
+    indexed_at        TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS session_search_fts USING fts5(
+    structured_text,
+    transcript_text,
+    content='session_search_documents',
+    content_rowid='id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER IF NOT EXISTS session_search_documents_ai
+AFTER INSERT ON session_search_documents BEGIN
+    INSERT INTO session_search_fts(rowid, structured_text, transcript_text)
+    VALUES (new.id, new.structured_text, new.transcript_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_search_documents_ad
+AFTER DELETE ON session_search_documents BEGIN
+    INSERT INTO session_search_fts(
+        session_search_fts, rowid, structured_text, transcript_text
+    ) VALUES (
+        'delete', old.id, old.structured_text, old.transcript_text
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS session_search_documents_au
+AFTER UPDATE ON session_search_documents BEGIN
+    INSERT INTO session_search_fts(
+        session_search_fts, rowid, structured_text, transcript_text
+    ) VALUES (
+        'delete', old.id, old.structured_text, old.transcript_text
+    );
+    INSERT INTO session_search_fts(rowid, structured_text, transcript_text)
+    VALUES (new.id, new.structured_text, new.transcript_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_search_cleanup
+AFTER DELETE ON sessions BEGIN
+    DELETE FROM session_search_documents WHERE session_id = old.session_id;
+    DELETE FROM session_search_state WHERE session_id = old.session_id;
+END;
+
+-- Any direct mutation of indexed inputs invalidates the prior revision before
+-- it can be returned. Normal sync upserts write many columns even when their
+-- values are unchanged, so the WHEN clause deliberately uses null-safe value
+-- comparisons to avoid needless rebuilds.
+CREATE TRIGGER IF NOT EXISTS sessions_search_stale
+AFTER UPDATE OF
+    source, file_hash, session_goal, session_summary, first_user_message,
+    repo_name, project, visibility, reviewed_sha256, reviewed_artifact_path,
+    publication_metadata_sha256, reviewed_metadata_sha256
+ON sessions
+WHEN
+       NOT (old.source IS new.source)
+    OR NOT (old.file_hash IS new.file_hash)
+    OR NOT (old.session_goal IS new.session_goal)
+    OR NOT (old.session_summary IS new.session_summary)
+    OR NOT (old.first_user_message IS new.first_user_message)
+    OR NOT (old.repo_name IS new.repo_name)
+    OR NOT (old.project IS new.project)
+    OR NOT (old.visibility IS new.visibility)
+    OR (
+        (old.visibility = 'public' OR new.visibility = 'public')
+        AND (
+               NOT (old.reviewed_sha256 IS new.reviewed_sha256)
+            OR NOT (old.reviewed_artifact_path IS new.reviewed_artifact_path)
+            OR NOT (old.publication_metadata_sha256 IS new.publication_metadata_sha256)
+            OR NOT (old.reviewed_metadata_sha256 IS new.reviewed_metadata_sha256)
+        )
+    )
+BEGIN
+    UPDATE session_search_state
+    SET transcript_status = 'stale', artifact_hash = NULL
+    WHERE session_id = new.session_id;
+END;
 """
 
 
@@ -1841,6 +1961,12 @@ def _migrate_message_claim_occurrences(conn: sqlite3.Connection) -> None:
 
 def migrate_db(conn: sqlite3.Connection) -> None:
     conn.create_function("normalize_username_py", 1, lambda value: normalize_username(value or ""))
+    search_index_existed = bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'session_search_fts'"
+        ).fetchone()
+    )
     sessions_existed = bool(
         conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
@@ -2330,6 +2456,60 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         )
     conn.executescript(INDEXES)
     conn.executescript(VIEWS)
+    # Create search triggers only after the optional legacy identity rebuild,
+    # which can replace the sessions table and drop table-bound triggers.
+    search_generation_row = conn.execute(
+        "SELECT value FROM logpile_meta WHERE key = 'search_fts_generation'"
+    ).fetchone()
+    search_generation = search_generation_row[0] if search_generation_row else None
+    reset_search_storage = (
+        not search_index_existed
+        or search_generation != str(SEARCH_INDEX_VERSION)
+    )
+    if reset_search_storage:
+        # Make the reset intent durable before touching the external-content
+        # table. If creation is interrupted, the next migration sees this
+        # marker and resets again instead of trusting complete session states
+        # beside an empty FTS term index. Canonical search data is derived, so
+        # discard it and let the bounded sync backfill rebuild session by
+        # session rather than running one uninterruptible whole-index rebuild.
+        conn.execute(
+            "INSERT OR REPLACE INTO logpile_meta (key, value) VALUES (?, ?)",
+            ("search_fts_generation", f"rebuilding:{SEARCH_INDEX_VERSION}"),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO logpile_meta (key, value) "
+            "VALUES ('search_refresh_pending', '1')"
+        )
+        conn.commit()
+        conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS session_search_documents_ai;
+            DROP TRIGGER IF EXISTS session_search_documents_ad;
+            DROP TRIGGER IF EXISTS session_search_documents_au;
+            DROP TRIGGER IF EXISTS sessions_search_cleanup;
+            DROP TRIGGER IF EXISTS sessions_search_stale;
+            DROP TABLE IF EXISTS session_search_fts;
+            DROP TABLE IF EXISTS session_search_documents;
+            DROP TABLE IF EXISTS session_search_state;
+            """
+        )
+    conn.execute("DROP TRIGGER IF EXISTS sessions_search_stale")
+    conn.executescript(SEARCH_SCHEMA)
+    _ensure_column(conn, "session_search_state", "artifact_hash", "TEXT")
+    conn.execute(
+        "INSERT OR REPLACE INTO logpile_meta (key, value) VALUES (?, ?)",
+        ("search_fts_generation", str(SEARCH_INDEX_VERSION)),
+    )
+    search_version_row = conn.execute(
+        "SELECT value FROM logpile_meta WHERE key = 'search_index_version'"
+    ).fetchone()
+    search_version = search_version_row[0] if search_version_row else None
+    if reset_search_storage or search_version != str(SEARCH_INDEX_VERSION):
+        conn.execute(
+            "INSERT OR REPLACE INTO logpile_meta (key, value) "
+            "VALUES ('search_refresh_pending', '1')"
+        )
 
 
 class _StorageTransactionConnection(sqlite3.Connection):

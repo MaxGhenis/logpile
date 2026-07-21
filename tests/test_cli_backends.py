@@ -228,6 +228,7 @@ class CliBackendTests(unittest.TestCase):
                     "cloud",
                     "--db-url",
                     "postgresql://example",
+                    "--raw",
                     "--json",
                 ],
             )
@@ -284,7 +285,7 @@ class CliBackendTests(unittest.TestCase):
         self.assertEqual(payload["backend"], "cloud")
         self.assertEqual(payload["chunks"][0]["content"], "find exact raw content")
 
-    def test_local_search_reads_local_private_store_without_cloud_credentials(self) -> None:
+    def test_local_raw_search_requires_explicit_forensic_flag(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             db_path = root / "logpile.db"
@@ -310,7 +311,7 @@ class CliBackendTests(unittest.TestCase):
                     ),
                 )
 
-            result = CliRunner().invoke(
+            safe_result = CliRunner().invoke(
                 cli,
                 [
                     "search",
@@ -322,12 +323,49 @@ class CliBackendTests(unittest.TestCase):
                     "--json",
                 ],
             )
+            raw_result = CliRunner().invoke(
+                cli,
+                [
+                    "search",
+                    "needle",
+                    "--backend",
+                    "local",
+                    "--db",
+                    str(db_path),
+                    "--raw",
+                    "--json",
+                ],
+            )
 
-        self.assertEqual(result.exit_code, 0, result.output)
-        payload = json.loads(result.output)
+        self.assertEqual(safe_result.exit_code, 0, safe_result.output)
+        self.assertEqual(json.loads(safe_result.output)["results"], [])
+        self.assertEqual(raw_result.exit_code, 0, raw_result.output)
+        payload = json.loads(raw_result.output)
         self.assertEqual(payload["backend"], "local")
+        self.assertTrue(payload["raw"])
         self.assertEqual(payload["results"][0]["session_id"], "local-session")
         self.assertIn("needle", payload["results"][0]["excerpt"])
+
+    def test_public_mode_rejects_raw_search(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "logpile.db"
+            init_db(db_path)
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "search",
+                    "needle",
+                    "--backend",
+                    "local",
+                    "--db",
+                    str(db_path),
+                    "--public",
+                    "--raw",
+                ],
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Public-mode raw search is unavailable", result.output)
 
 
 if __name__ == "__main__":

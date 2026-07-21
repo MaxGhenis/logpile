@@ -1,4 +1,7 @@
 """Parse Claude Code and Codex JSONL session files."""
+
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -547,6 +550,88 @@ _USER_CONTEXT_PREAMBLE_RE = re.compile(
     r"#\s*Context from my IDE setup:.*?## My request for Codex:\n",
     flags=re.DOTALL,
 )
+_HARNESS_OPEN_TAG_RE = re.compile(r"^<([A-Za-z][A-Za-z0-9_-]*)[^>]*>")
+_RECOMMENDED_PLUGINS_RE = re.compile(
+    r"^<recommended_plugins\b",
+    flags=re.IGNORECASE,
+)
+# Only wrappers the harnesses themselves inject are stripped. Operators write
+# XML-tagged prompts on purpose (`<task>fix X</task>`), so an unknown leading
+# tag is user prose and must stay searchable. Grounded in a corpus scan of
+# leading tags across recent Claude Code and Codex user messages.
+_HARNESS_WRAPPER_TAGS = frozenset(
+    {
+        "command-args",
+        "command-contents",
+        "command-message",
+        "command-name",
+        "cross-session-message",
+        "cwd",
+        "environment_context",
+        "environment_details",
+        "goal_context",
+        "heartbeat",
+        "ide_diagnostics",
+        "ide_opened_file",
+        "ide_selection",
+        "local-command-caveat",
+        "local-command-stderr",
+        "local-command-stdout",
+        "recommended_plugins",
+        "scheduled-task",
+        "session-start-hook",
+        "subagent_notification",
+        "system-reminder",
+        "task-notification",
+        "turn_aborted",
+        "user-prompt-submit-hook",
+        "user_instructions",
+    }
+)
+# Codex injects repo/global AGENTS.md content as a synthetic user message
+# headed "# AGENTS.md instructions for <directory>" or, in other Codex
+# versions, the bare header directly followed by an <INSTRUCTIONS> block.
+# Requiring one of those continuations keeps operator prose ABOUT the
+# instructions ("# AGENTS.md instructions are confusing…") searchable.
+_CODEX_AGENTS_INSTRUCTIONS_PREFIX = "# AGENTS.md instructions"
+
+
+def _is_codex_agents_payload(text: str) -> bool:
+    if not text.startswith(_CODEX_AGENTS_INSTRUCTIONS_PREFIX):
+        return False
+    remainder = text[len(_CODEX_AGENTS_INSTRUCTIONS_PREFIX):].lstrip()
+    # Injections continue with an absolute directory or the wrapper block;
+    # prose like "for beginners: …" matches neither.
+    return remainder.startswith("for /") or remainder.startswith("<INSTRUCTIONS>")
+# Long opaque tokens are not useful transcript prose and are commonly image,
+# encrypted-thinking, or other base64 payloads. Standard MIME base64 wraps at
+# 76 columns, so remove both continuous tokens and multi-line wrapped runs.
+_WRAPPED_BASE64_RE = re.compile(
+    r"(?<![A-Za-z0-9+/_=-])"
+    r"(?:[A-Za-z0-9+/_-]{4,}[ \t]*\r?\n[ \t]*)+"
+    r"[A-Za-z0-9+/_-]{2,}={0,2}"
+    r"(?![A-Za-z0-9+/_=-])"
+)
+_SPACED_BASE64_RE = re.compile(
+    r"(?<![A-Za-z0-9+/_=-])"
+    r"(?:[A-Za-z0-9+/_-]{16,}[ \t]+)+"
+    r"[A-Za-z0-9+/_-]{2,}={0,2}"
+    r"(?![A-Za-z0-9+/_=-])"
+)
+# 64+-character unbroken opaque-charset runs are removed WITHOUT decode
+# validation: canonical checks cannot distinguish long identifiers from real
+# payloads at that length, and the index deliberately treats such runs
+# (including full SHA-256 hex digests in prose) as opaque. Raw search covers
+# the forensic case.
+_BASE64_BLOB_RE = re.compile(
+    r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{64,}={0,2}(?![A-Za-z0-9+/_=-])"
+)
+_PADDED_BASE64_BLOB_RE = re.compile(
+    r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{14,}={1,2}"
+    r"(?![A-Za-z0-9+/_=-])"
+)
+_CLAUDE_SEARCH_BLOCK_TYPES = frozenset({"text"})
+_CODEX_SEARCH_BLOCK_TYPES = frozenset({"text", "input_text", "output_text"})
 _ENVIRONMENT_CONTEXT_RE = re.compile(
     r"^\s*<environment_context>.*?</environment_context>\s*$",
     flags=re.DOTALL,
@@ -797,6 +882,247 @@ def _extract_text(content: Any) -> str:
     return ""
 
 
+def strip_harness_preamble(value: str | None) -> str:
+    """Match the web app's ``sessionTitle`` harness cleanup exactly.
+
+    Codex can persist synthetic preamble messages before the operator's ask.
+    The title UI treats a leading ``recommended_plugins`` payload as empty;
+    for other XML-ish wrappers it removes at most four leading blocks (or
+    orphan opening tags). Search uses the same contract for goals and first
+    user messages so injected harness text is not promoted as session prose.
+    """
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if _RECOMMENDED_PLUGINS_RE.match(text):
+        return ""
+
+    for _ in range(4):
+        if not text.startswith("<"):
+            break
+        match = _HARNESS_OPEN_TAG_RE.match(text)
+        if match is None:
+            break
+        if match.group(1).lower() not in _HARNESS_WRAPPER_TAGS:
+            break
+        closing = f"</{match.group(1)}>"
+        closing_at = text.find(closing)
+        if closing_at >= 0:
+            text = text[closing_at + len(closing):].strip()
+        else:
+            text = text[match.end():].strip()
+    # A codex session whose stored title IS the injected AGENTS.md payload
+    # has no operator title; the stored row itself is healed separately by a
+    # future token-version reparse.
+    if _is_codex_agents_payload(text):
+        return ""
+    return text
+
+
+def strip_transcript_harness_preamble(value: str | None) -> str:
+    """Remove leading harness blocks while preserving trailing user prose.
+
+    The title contract intentionally treats any value beginning with
+    ``recommended_plugins`` as empty. A transcript message can contain that
+    wrapper and the real ask in one block, so transcript extraction removes
+    the wrapper itself and retains the suffix.
+    """
+    text = (value or "").strip()
+    for _ in range(4):
+        if not text.startswith("<"):
+            break
+        match = _HARNESS_OPEN_TAG_RE.match(text)
+        if match is None:
+            break
+        if match.group(1).lower() not in _HARNESS_WRAPPER_TAGS:
+            break
+        closing = f"</{match.group(1)}>"
+        closing_at = text.find(closing)
+        if closing_at >= 0:
+            text = text[closing_at + len(closing):].strip()
+        elif match.group(1).lower() == "recommended_plugins":
+            # Unlike a generic orphan tag, an unclosed plugin catalog has no
+            # trustworthy boundary between injected text and operator prose.
+            return ""
+        else:
+            text = text[match.end():].strip()
+    return text
+
+
+def _decode_canonical_base64(
+    value: str,
+    *,
+    minimum_length: int,
+) -> bytes | None:
+    """Decode canonical standard/URL base64, or return ``None``."""
+    compact = re.sub(r"\s+", "", value)
+    if len(compact) < minimum_length or len(compact) % 4 == 1:
+        return None
+    standard = compact.replace("-", "+").replace("_", "/")
+    padded = standard + ("=" * (-len(standard) % 4))
+    try:
+        decoded = base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) < 12:
+        return None
+    if base64.b64encode(decoded).decode().rstrip("=") != standard.rstrip("="):
+        return None
+    return decoded
+
+
+def _canonical_base64_payload(value: str, *, minimum_length: int) -> bool:
+    return _decode_canonical_base64(value, minimum_length=minimum_length) is not None
+
+
+def _credible_unpadded_base64_tail(prefix: str, complete: str) -> bool:
+    """Distinguish a short unpadded tail from ordinary trailing prose.
+
+    When the decoded full-width prefix is text-like, require the candidate
+    tail to decode as text-like too. Binary/encrypted prefixes admit any
+    canonical tail. This retains words such as ``done`` after an encoded text
+    run while still removing unpadded ``eHh4``-style final chunks.
+    """
+    if len(prefix) % 4:
+        return False
+    prefix_bytes = _decode_canonical_base64(prefix, minimum_length=64)
+    complete_bytes = _decode_canonical_base64(complete, minimum_length=64)
+    if prefix_bytes is None or complete_bytes is None:
+        return False
+    tail = complete_bytes[len(prefix_bytes):]
+    if not tail:
+        return False
+
+    def printable_ratio(value: bytes) -> float:
+        printable = sum(
+            byte in {9, 10, 13} or 32 <= byte <= 126
+            for byte in value
+        )
+        return printable / len(value)
+
+    return printable_ratio(prefix_bytes) < 0.85 or printable_ratio(tail) >= 0.85
+
+
+def _remove_wrapped_base64(match: re.Match[str]) -> str:
+    """Remove newline-wrapped base64 only when it is shaped like MIME output.
+
+    Encoders wrap at a fixed column, so every line except the last must share
+    one width of at least 16 and the last must not exceed it. Ragged runs of
+    single-word lines can concatenate into decodable strings by coincidence
+    ("first\\nsecond\\n…"), so shape is checked before the canonical decode.
+    """
+    value = match.group(0)
+    lines = [segment.strip() for segment in value.splitlines()]
+    widths = {len(segment) for segment in lines[:-1]}
+    if len(widths) != 1:
+        return value
+    width = next(iter(widths))
+    # Real encoders wrap at 60+ columns; 24 keeps every observed wrap while
+    # sparing coincidentally equal-length word pairs ("misunderstanding\n
+    # responsibilities" is uniform at 16).
+    if width < 24 or len(lines[-1]) > width:
+        return value
+    return " " if _canonical_base64_payload(value, minimum_length=32) else value
+
+
+def _remove_spaced_base64(match: re.Match[str]) -> str:
+    """Remove canonical fixed-width base64 chunks separated horizontally."""
+    value = match.group(0)
+    tokens = list(re.finditer(r"[A-Za-z0-9+/_-]+={0,2}", value))
+    removals: list[tuple[int, int]] = []
+    start = 0
+    while start < len(tokens) - 1:
+        width = len(tokens[start].group(0).rstrip("="))
+        if width < 16:
+            start += 1
+            continue
+        equal_end = start + 1
+        while (
+            equal_end < len(tokens)
+            and len(tokens[equal_end].group(0).rstrip("=")) == width
+            and not tokens[equal_end - 1].group(0).endswith("=")
+        ):
+            equal_end += 1
+
+        candidate_end: int | None = None
+        if equal_end < len(tokens):
+            short = tokens[equal_end].group(0)
+            short_width = len(short.rstrip("="))
+            if 2 <= short_width <= width:
+                prefix = "".join(
+                    token.group(0) for token in tokens[start:equal_end]
+                )
+                candidate = "".join(
+                    token.group(0) for token in tokens[start:equal_end + 1]
+                )
+                tail_is_credible = short.endswith("=") or (
+                    _credible_unpadded_base64_tail(prefix, candidate)
+                )
+                if tail_is_credible and _canonical_base64_payload(
+                    candidate,
+                    minimum_length=64,
+                ):
+                    candidate_end = equal_end + 1
+        if candidate_end is None and equal_end - start >= 2:
+            candidate = "".join(
+                token.group(0) for token in tokens[start:equal_end]
+            )
+            if _canonical_base64_payload(candidate, minimum_length=64):
+                candidate_end = equal_end
+            elif (
+                equal_end - start >= 3
+                and tokens[equal_end - 1].group(0).endswith("=")
+            ):
+                # A malformed padded terminal must not make us retry every
+                # suffix of a huge equal-width run. Remove the canonical
+                # full-chunk prefix if possible, then skip the terminal once.
+                prefix_end = equal_end - 1
+                prefix = "".join(
+                    token.group(0) for token in tokens[start:prefix_end]
+                )
+                if _canonical_base64_payload(prefix, minimum_length=64):
+                    candidate_end = prefix_end
+
+        if candidate_end is None:
+            start = max(start + 1, equal_end)
+            continue
+        removals.append(
+            (tokens[start].start(), tokens[candidate_end - 1].end())
+        )
+        start = candidate_end
+
+    if not removals:
+        return value
+    pieces: list[str] = []
+    cursor = 0
+    for start_at, end_at in removals:
+        pieces.extend((value[cursor:start_at], " "))
+        cursor = end_at
+    pieces.append(value[cursor:])
+    return "".join(pieces)
+
+
+def _remove_padded_base64(match: re.Match[str]) -> str:
+    value = match.group(0)
+    return " " if _canonical_base64_payload(value, minimum_length=16) else value
+
+
+def clean_search_text(
+    value: str | None,
+    *,
+    strip_preamble: bool = False,
+) -> str:
+    """Return readable index text with harness/base64 payloads removed."""
+    text = strip_harness_preamble(value) if strip_preamble else (value or "").strip()
+    if not text:
+        return ""
+    text = _WRAPPED_BASE64_RE.sub(_remove_wrapped_base64, text)
+    text = _SPACED_BASE64_RE.sub(_remove_spaced_base64, text)
+    text = _PADDED_BASE64_BLOB_RE.sub(_remove_padded_base64, text)
+    text = _BASE64_BLOB_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
 def _load_jsonl(
     path: Path,
     *,
@@ -851,11 +1177,67 @@ def _load_jsonl(
     return records
 
 
+def _bounded_lines(
+    stream: TextIO,
+    max_line_chars: int,
+    stats: JsonlLoadStats,
+) -> Iterator[str]:
+    """Yield lines without ever materializing one longer than the cap.
+
+    ``for line in stream`` builds the whole line first, so a single
+    multi-gigabyte record would be held in memory just to be discarded.
+    Reading fixed chunks keeps peak memory at cap + chunk size; oversized
+    lines are counted and skipped.
+    """
+    pending: list[str] = []
+    pending_chars = 0
+    skipping = False
+    while True:
+        chunk = stream.read(1 << 20)
+        if not chunk:
+            break
+        while chunk:
+            newline_at = chunk.find("\n")
+            if newline_at < 0:
+                if not skipping:
+                    pending_chars += len(chunk)
+                    if pending_chars > max_line_chars:
+                        skipping = True
+                        pending.clear()
+                    else:
+                        pending.append(chunk)
+                break
+            head, chunk = chunk[:newline_at], chunk[newline_at + 1:]
+            if skipping:
+                skipping = False
+                stats.malformed_fields["line:oversized"] = (
+                    stats.malformed_fields.get("line:oversized", 0) + 1
+                )
+            else:
+                pending_chars += len(head)
+                if pending_chars > max_line_chars:
+                    stats.malformed_fields["line:oversized"] = (
+                        stats.malformed_fields.get("line:oversized", 0) + 1
+                    )
+                else:
+                    pending.append(head)
+                    yield "".join(pending)
+            pending.clear()
+            pending_chars = 0
+    if skipping or pending_chars > max_line_chars:
+        stats.malformed_fields["line:oversized"] = (
+            stats.malformed_fields.get("line:oversized", 0) + 1
+        )
+    elif pending:
+        yield "".join(pending)
+
+
 def _iter_jsonl(
     path: Path | TextIO,
     *,
     stats: JsonlLoadStats | None = None,
     report_malformed: bool = True,
+    max_line_chars: int | None = None,
 ) -> Iterator[dict]:
     """Yield validated JSONL objects without retaining the transcript.
 
@@ -879,7 +1261,12 @@ def _iter_jsonl(
         if hasattr(path, "seek"):
             path.seek(0)
         with stream_context as f:
-            for line in f:
+            lines: Iterator[str] = (
+                _bounded_lines(f, max_line_chars, load_stats)
+                if max_line_chars is not None
+                else f
+            )
+            for line in lines:
                 line = line.strip()
                 if not line:
                     continue
@@ -1353,6 +1740,136 @@ def _clean_codex_user_text(text: str) -> str:
     return clean
 
 
+class SearchTranscriptReadError(RuntimeError):
+    """A transcript could not be read completely for search indexing."""
+
+
+# No legitimate prose line approaches this; a single-record blob larger than
+# the cap is skipped (and counted) instead of being materialized and decoded.
+_SEARCH_MAX_LINE_CHARS = 64 * 1024 * 1024
+
+
+def _iter_search_content_text(
+    content: Any,
+    *,
+    block_types: frozenset[str],
+    allow_untyped_text: bool = False,
+) -> Iterator[str]:
+    """Yield only explicitly textual message content without recursion."""
+    if isinstance(content, str):
+        yield content
+        return
+    if isinstance(content, dict):
+        block_type = content.get("type")
+        is_legacy_text = (
+            allow_untyped_text
+            and block_type is None
+            and set(content) == {"text"}
+        )
+        if (block_type in block_types or is_legacy_text) and isinstance(
+            content.get("text"), str
+        ):
+            yield content["text"]
+        return
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        # Early Codex JSONL used exact bare {"text": ...} message blocks.
+        # Extra tool/reasoning/image keys make an untyped block ineligible.
+        is_legacy_text = (
+            allow_untyped_text
+            and block_type is None
+            and set(block) == {"text"}
+        )
+        if block_type not in block_types and not is_legacy_text:
+            continue
+        text = block.get("text")
+        if isinstance(text, str):
+            yield text
+
+
+def iter_session_search_text(
+    path: Path | TextIO,
+    source: str,
+) -> Iterator[tuple[str, str]]:
+    """Stream searchable ``(role, text)`` pairs from one transcript.
+
+    This intentionally does not call :func:`_extract_text`, whose display and
+    parser semantics include thinking and recursively nested content. Search
+    accepts only user/assistant message strings and explicitly typed text
+    blocks. Tool calls/results, reasoning, encrypted content, images, and all
+    other block types never reach the index.
+    """
+    if source not in {"claudecode", "codex"}:
+        raise ValueError(f"Unsupported transcript source: {source}")
+
+    load_stats = JsonlLoadStats()
+    for record in _iter_jsonl(
+        path,
+        stats=load_stats,
+        max_line_chars=_SEARCH_MAX_LINE_CHARS,
+    ):
+        if source == "claudecode":
+            role = record.get("type", "")
+            if role not in {"user", "assistant"}:
+                continue
+            # Harness-injected records (caveats, command echoes) carry
+            # isMeta; they are not operator prose.
+            if record.get("isMeta"):
+                continue
+            message = record.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content", "")
+            # Text blocks riding a tool-result user record are harness
+            # attachments (system reminders, hook output), not something the
+            # operator typed. Real user turns never share a record with
+            # tool_result blocks.
+            if role == "user" and isinstance(content, list) and any(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in content
+            ):
+                continue
+            block_types = _CLAUDE_SEARCH_BLOCK_TYPES
+        else:
+            record_type, payload, _timestamp = _normalize_codex_record(record)
+            if record_type != "message":
+                continue
+            role = payload.get("role", "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = payload.get("content", "")
+            block_types = _CODEX_SEARCH_BLOCK_TYPES
+
+        for raw_text in _iter_search_content_text(
+            content,
+            block_types=block_types,
+            allow_untyped_text=source == "codex",
+        ):
+            if role == "user":
+                if source == "codex":
+                    raw_text = _clean_codex_user_text(raw_text)
+                raw_text = strip_transcript_harness_preamble(raw_text)
+                # Check AFTER wrapper stripping so a payload hiding behind a
+                # leading harness wrapper is still recognized.
+                if source == "codex" and _is_codex_agents_payload(raw_text):
+                    continue
+                text = clean_search_text(raw_text)
+            else:
+                text = clean_search_text(raw_text)
+            if text:
+                yield role, text
+
+    if load_stats.io_errors:
+        label = getattr(path, "name", path)
+        raise SearchTranscriptReadError(
+            f"Could not read complete transcript for search indexing: {label}"
+        )
+
+
 def _extract_codex_project(records: list[dict]) -> str:
     for record in records:
         record_type, payload, _ = _normalize_codex_record(record)
@@ -1647,10 +2164,17 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
                                 spool.set_tool_result(tool_use_id, is_error)
                     continue
 
-            text = _extract_text(content)
+            text = " ".join(
+                _iter_search_content_text(
+                    content,
+                    block_types=_CLAUDE_SEARCH_BLOCK_TYPES,
+                )
+            )
             if text.strip():
                 user_message_count += 1
-                if not first_user_message:
+                # Harness-injected records (isMeta: caveats, command echoes)
+                # keep their count semantics but must not become the title.
+                if not first_user_message and not r.get("isMeta"):
                     first_user_message = text.strip()[:500]
                 bucket = _daily_bucket(daily, ts)
                 if bucket is not None:
@@ -1990,7 +2514,13 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
             content = payload.get("content", [])
 
             if role == "user":
-                text = _extract_text(content)
+                text = " ".join(
+                    _iter_search_content_text(
+                        content,
+                        block_types=_CODEX_SEARCH_BLOCK_TYPES,
+                        allow_untyped_text=True,
+                    )
+                )
                 clean = _clean_codex_user_text(text)
                 if not clean or len(clean) < 3:
                     continue
