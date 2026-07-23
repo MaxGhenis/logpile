@@ -666,8 +666,12 @@ def _fts_tier_candidates(
     while True:
         # Fetch one candidate beyond the cap from the raw sorter: if it ties
         # the boundary score, the cut splits an equal-rank class and the
-        # final newest-first tiebreak would depend on which members happened
-        # to make the cut — deepen before joining instead.
+        # final newest-first tiebreak could depend on which members happened
+        # to make the cut. That only matters when the boundary score can
+        # reach the winner set at all — stop-word queries tie at the
+        # boundary routinely while their winners sit far above it, so the
+        # deepening decision is made after joining, against the limit-th
+        # session's best score.
         candidates = conn.execute(
             "SELECT rowid AS document_id, rank AS score "
             "FROM session_search_fts "
@@ -679,11 +683,8 @@ def _fts_tier_candidates(
             len(candidates) > cap
             and candidates[cap]["score"] == candidates[cap - 1]["score"]
         )
-        if boundary_tie_split and cap < total_matches:
-            cap = min(total_matches, cap * 8)
-            continue
-
         candidates = candidates[:cap]
+        boundary_score = candidates[-1]["score"] if candidates else None
         scores = {row["document_id"]: row["score"] for row in candidates}
         rows: list[sqlite3.Row] = []
         candidate_ids = list(scores)
@@ -724,8 +725,20 @@ def _fts_tier_candidates(
         ]
         if cap >= total_matches:
             return scored_rows
-        if len({row["session_id"] for row in scored_rows}) >= limit:
-            return scored_rows
+        session_best: dict[str, float] = {}
+        for row in scored_rows:
+            best = session_best.get(row["session_id"])
+            if best is None or row["score"] < best:
+                session_best[row["session_id"]] = row["score"]
+        if len(session_best) >= limit:
+            # bm25 ascends (lower is better). Documents beyond the cap score
+            # no better than the boundary; they can only displace or reorder
+            # a winner if the boundary reaches the limit-th session's best.
+            worst_winner = sorted(session_best.values())[limit - 1]
+            if not boundary_tie_split or (
+                boundary_score is not None and boundary_score > worst_winner
+            ):
+                return scored_rows
         cap = min(total_matches, cap * 8)
 
 

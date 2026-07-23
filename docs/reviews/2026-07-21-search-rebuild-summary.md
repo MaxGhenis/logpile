@@ -232,7 +232,7 @@ claims above, this section supersedes them.
   sessions than the requested limit, the cap deepens geometrically until the
   tier is exact: the cut is a performance floor and never decides membership,
   so dense private or stale documents cannot shadow eligible public matches.
-  `the` completes in ~1.5 s. The 20:1 bm25 weights are gone — tier precedence
+  `the` completes in ~4 s (equal-score goal classes overlapping the winner set must be exhausted for deterministic newest-first order; all other measured queries are 0.0–0.2 s). The 20:1 bm25 weights are gone — tier precedence
   is structural, so the "structured outranks body" guarantee no longer
   depends on weight tuning.
 - *Public score channel*: bm25 statistics span the mixed-visibility corpus,
@@ -328,8 +328,13 @@ A third round verified all round-2 closures and added:
 - *Boundary-tie determinism (blocker)*: the deepening loop stopped once
   `limit` sessions were found even when the rank cut split an equal-score
   class, making membership/newest-first order depend on rowid order at the
-  cut. The loop now fetches cap+1 raw candidates and deepens whenever the
-  boundary is tied, before joining (chunked b-tree lookups). Pinned by
+  cut. The loop now fetches cap+1 raw candidates and deepens through a tied
+  boundary — but only when the boundary score can reach the limit-th
+  session's best score, because stop-word queries tie at the boundary
+  routinely while their winners sit far above it (an unconditional tie rule
+  measured 6.7s on `the`; the winner-reachability condition brings it to
+  ~3.9s, the honest cost of exhausting the templated equal-score goal
+  classes that genuinely overlap the winner set). Pinned by
   test_boundary_score_ties_deepen_until_exhausted.
 - *isMeta records as titles (medium)*: `parse_claudecode_session` now skips
   harness-injected records for `first_user_message` (counts unchanged);
