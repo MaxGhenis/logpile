@@ -2652,7 +2652,7 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             db_path = root / "logpile.db"
             sync_sessions(shared, db_path, "alice", "m1", home)
 
-            self.assertEqual(SESSION_TOKEN_VERSION, 9)
+            self.assertEqual(SESSION_TOKEN_VERSION, 10)
             with open_sqlite(db_path) as conn:
                 conn.execute(
                     "UPDATE sessions SET token_version = 5 "

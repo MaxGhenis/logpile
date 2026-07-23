@@ -2525,8 +2525,11 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
                 if not clean or len(clean) < 3:
                     continue
                 # Keep first_user_message from the replayed history: it names
-                # the session's actual topic. Counts stay live-only.
-                if not first_user_message:
+                # the session's actual topic. Counts stay live-only. Injected
+                # AGENTS.md payloads are not the topic.
+                if not first_user_message and not _is_codex_agents_payload(
+                    clean
+                ):
                     first_user_message = clean[:500]
                 if in_replay:
                     continue

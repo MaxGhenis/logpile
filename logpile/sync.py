@@ -67,7 +67,10 @@ SESSION_IDENTITY_VERSION = 1
 # first_user_message or its derived session_goal and then enter search.
 # v9 additionally keeps isMeta (harness-injected) records out of
 # first_user_message and its derived session_goal.
-SESSION_TOKEN_VERSION = 9
+# v10 keeps injected codex AGENTS.md payloads out of first_user_message —
+# the v9 fix covered Claude isMeta records only, so the ~12.6k polluted
+# codex titles survived the v9 reparse.
+SESSION_TOKEN_VERSION = 10
 
 
 class SyncStatus(str, Enum):

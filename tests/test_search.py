@@ -1639,6 +1639,48 @@ class SearchIndexTests(unittest.TestCase):
                     search_sessions(conn, "wrappedAgentsSentinel"), []
                 )
 
+    def test_codex_agents_payload_never_becomes_the_title(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "codex-agents-title.jsonl"
+            write_jsonl(
+                path,
+                [
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-07-01T00:00:00Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": (
+                                        "# AGENTS.md instructions for /Users/x"
+                                        "\n<INSTRUCTIONS>\nrules\n</INSTRUCTIONS>"
+                                    ),
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "timestamp": "2026-07-01T00:00:01Z",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "real codex topic ask",
+                                }
+                            ],
+                        },
+                    },
+                ],
+            )
+            info = parse_codex_session(path)
+            self.assertEqual(info.first_user_message, "real codex topic ask")
+
     def test_is_meta_record_never_becomes_the_title(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "meta-first.jsonl"
