@@ -11,8 +11,8 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from logpile.cli import cli
 import logpile.db as db_module
+from logpile.cli import cli
 from logpile.db import (
     ensure_user,
     get_db,
@@ -636,23 +636,25 @@ class SyncTests(unittest.TestCase):
             shared_copy = shared / "alice" / "claudecode" / "demo" / source.name
             expected = shared_copy.read_bytes()
 
-            with mock.patch.object(
-                db_module._StorageTransactionConnection,
-                "_commit_database",
-                side_effect=sqlite3.OperationalError("forced commit failure"),
-            ):
-                with self.assertRaisesRegex(
+            with (
+                mock.patch.object(
+                    db_module._StorageTransactionConnection,
+                    "_commit_database",
+                    side_effect=sqlite3.OperationalError("forced commit failure"),
+                ),
+                self.assertRaisesRegex(
                     sqlite3.OperationalError, "forced commit failure"
-                ):
-                    with get_db(db_path) as conn:
-                        set_session_visibility(
-                            conn, "session-1", "private", shared_dir=shared
-                        )
-                        archive = Path(
-                            conn.execute(
-                                "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
-                            ).fetchone()[0]
-                        )
+                ),
+                get_db(db_path) as conn,
+            ):
+                set_session_visibility(
+                    conn, "session-1", "private", shared_dir=shared
+                )
+                archive = Path(
+                    conn.execute(
+                        "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
+                    ).fetchone()[0]
+                )
 
             with open_sqlite(db_path) as conn:
                 row = conn.execute(
@@ -688,11 +690,10 @@ class SyncTests(unittest.TestCase):
             with mock.patch(
                 "logpile.sync.refresh_native_usage",
                 side_effect=RuntimeError("forced late sync failure"),
+            ), self.assertRaisesRegex(
+                RuntimeError, "forced late sync failure"
             ):
-                with self.assertRaisesRegex(
-                    RuntimeError, "forced late sync failure"
-                ):
-                    sync_sessions(shared, db_path, "alice", "machine-1", home)
+                sync_sessions(shared, db_path, "alice", "machine-1", home)
 
             with open_sqlite(db_path) as conn:
                 row = conn.execute(
@@ -737,14 +738,13 @@ class SyncTests(unittest.TestCase):
                     else:
                         nested.write_text("not a directory", encoding="utf-8")
 
-                with get_db(db_path) as conn:
-                    with self.assertRaisesRegex(
-                        _sync_module.StorageSafetyError,
-                        "private archive component",
-                    ):
-                        set_session_visibility(
-                            conn, "session-1", "private", shared_dir=shared
-                        )
+                with get_db(db_path) as conn, self.assertRaisesRegex(
+                    _sync_module.StorageSafetyError,
+                    "private archive component",
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "private", shared_dir=shared
+                    )
 
                 with open_sqlite(db_path) as conn:
                     row = conn.execute(
@@ -924,13 +924,12 @@ class SyncTests(unittest.TestCase):
                 )
                 with mock.patch.object(
                     Path, "unlink", autospec=True, side_effect=fail_shared_unlink
+                ), self.assertRaisesRegex(
+                    sqlite3.IntegrityError, "forced promotion failure"
                 ):
-                    with self.assertRaisesRegex(
-                        sqlite3.IntegrityError, "forced promotion failure"
-                    ):
-                        set_session_visibility(
-                            conn, "session-1", "unlisted", shared_dir=shared
-                        )
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
 
             self.assertFalse(shared_copy.exists())
             self.assertTrue(archive.exists())
@@ -961,14 +960,13 @@ class SyncTests(unittest.TestCase):
                 else:
                     os.mkfifo(shared_copy)
 
-                with get_db(db_path) as conn:
-                    with self.assertRaisesRegex(
-                        _sync_module.StorageSafetyError,
-                        "non-regular or unsafe shared transcript",
-                    ):
-                        set_session_visibility(
-                            conn, "session-1", "private", shared_dir=shared
-                        )
+                with get_db(db_path) as conn, self.assertRaisesRegex(
+                    _sync_module.StorageSafetyError,
+                    "non-regular or unsafe shared transcript",
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "private", shared_dir=shared
+                    )
 
                 self.assertTrue(shared_copy.exists())
                 with open_sqlite(db_path) as conn:
@@ -1007,14 +1005,13 @@ class SyncTests(unittest.TestCase):
             user_dir.rename(real_user_dir)
             user_dir.symlink_to(real_user_dir, target_is_directory=True)
 
-            with get_db(db_path) as conn:
-                with self.assertRaisesRegex(
-                    _sync_module.StorageSafetyError,
-                    "non-regular or unsafe shared transcript",
-                ):
-                    set_session_visibility(
-                        conn, "session-1", "private", shared_dir=shared
-                    )
+            with get_db(db_path) as conn, self.assertRaisesRegex(
+                _sync_module.StorageSafetyError,
+                "non-regular or unsafe shared transcript",
+            ):
+                set_session_visibility(
+                    conn, "session-1", "private", shared_dir=shared
+                )
 
             outside_copy = real_user_dir / "claudecode" / "demo" / source.name
             self.assertTrue(outside_copy.exists())
@@ -1060,13 +1057,12 @@ class SyncTests(unittest.TestCase):
         with mock.patch(
             "logpile.sync._prepare_sync_shared_copy",
             side_effect=[first, second],
+        ), self.assertRaisesRegex(
+            _sync_module.StorageSafetyError, "forced rollback failure"
         ):
-            with self.assertRaisesRegex(
-                _sync_module.StorageSafetyError, "forced rollback failure"
-            ):
-                _sync_module.reconcile_session_storage(
-                    conn, shared_dir=Path("/shared")
-                )
+            _sync_module.reconcile_session_storage(
+                conn, shared_dir=Path("/shared")
+            )
 
         second.rollback.assert_called_once_with()
         first.rollback.assert_called_once_with()
@@ -1959,13 +1955,13 @@ class SyncTests(unittest.TestCase):
 # --- archive-integrity tests -------------------------------------------------
 # Imports are grouped here (not at top of file) so this block stays a single
 # self-contained appended hunk.
-import errno as _errno  # noqa: E402
-import fcntl as _fcntl  # noqa: E402
-import shutil as _shutil  # noqa: E402
-from unittest import mock as _mock  # noqa: E402
+import errno as _errno
+import fcntl as _fcntl
+import shutil as _shutil
+from unittest import mock as _mock
 
-from logpile import sync as _sync_module  # noqa: E402
-from logpile.sync import _copy_session  # noqa: E402
+from logpile import sync as _sync_module
+from logpile.sync import _copy_session
 
 
 class CopySessionAtomicityTests(unittest.TestCase):
@@ -2038,9 +2034,11 @@ class CopySessionAtomicityTests(unittest.TestCase):
             dst.write(b"partial")
             raise OSError(_errno.EIO, "boom")
 
-        with _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=boom):
-            with self.assertRaises(OSError):
-                _copy_session(self.src, self.dst)
+        with (
+            _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=boom),
+            self.assertRaises(OSError),
+        ):
+            _copy_session(self.src, self.dst)
         self.assertEqual(self.dst.read_text(), "previous complete copy\n")
         self.assertEqual(self._tmp_leftovers(), [])
 
@@ -2050,9 +2048,11 @@ class CopySessionAtomicityTests(unittest.TestCase):
         def full(src, dst):
             raise OSError(_errno.ENOSPC, "disk full")
 
-        with _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=full):
-            with self.assertRaises(OSError) as raised:
-                _copy_session(self.src, self.dst)
+        with (
+            _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=full),
+            self.assertRaises(OSError) as raised,
+        ):
+            _copy_session(self.src, self.dst)
         self.assertEqual(raised.exception.errno, _errno.ENOSPC)
         self.assertFalse(self.dst.is_symlink())
         self.assertEqual(self.dst.read_text(), "previous complete copy\n")
@@ -2061,9 +2061,11 @@ class CopySessionAtomicityTests(unittest.TestCase):
         def full(src, dst):
             raise OSError(_errno.ENOSPC, "disk full")
 
-        with _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=full):
-            with self.assertRaises(OSError) as raised:
-                _copy_session(self.src, self.dst)
+        with (
+            _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=full),
+            self.assertRaises(OSError) as raised,
+        ):
+            _copy_session(self.src, self.dst)
         self.assertEqual(raised.exception.errno, _errno.ENOSPC)
         self.assertFalse(self.dst.exists())
         self.assertFalse(self.dst.is_symlink())
@@ -2927,11 +2929,10 @@ class SyncLockTests(unittest.TestCase):
                 _sync_module.fcntl,
                 "flock",
                 side_effect=OSError(_errno.ENOTSUP, "locking unsupported"),
-            ):
-                with self.assertRaises(_sync_module.SyncLockError):
-                    sync_sessions(
-                        root / "shared", root / "logpile.db", "alice", "m1", home
-                    )
+            ), self.assertRaises(_sync_module.SyncLockError):
+                sync_sessions(
+                    root / "shared", root / "logpile.db", "alice", "m1", home
+                )
 
     def test_sync_lock_rejects_symlink_without_touching_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2978,17 +2979,16 @@ class SyncLockTests(unittest.TestCase):
             fake_stat = _mock.Mock(st_mode=0o010600)
             with _mock.patch.object(
                 _sync_module.os, "fstat", return_value=fake_stat
+            ), self.assertRaisesRegex(
+                _sync_module.SyncLockError, "non-regular sync lock"
             ):
-                with self.assertRaisesRegex(
-                    _sync_module.SyncLockError, "non-regular sync lock"
-                ):
-                    sync_sessions(
-                        root / "shared",
-                        root / "logpile.db",
-                        "alice",
-                        "m1",
-                        home,
-                    )
+                sync_sessions(
+                    root / "shared",
+                    root / "logpile.db",
+                    "alice",
+                    "m1",
+                    home,
+                )
 
 
 class RuntimePermissionTests(unittest.TestCase):

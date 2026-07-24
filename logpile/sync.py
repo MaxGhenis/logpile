@@ -11,46 +11,45 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
-from .discovery import claude_projects_root, codex_session_roots, discover_transcripts
-from .parsers import (
-    PrivateSessionMarker,
-    file_hash,
-    parse_claudecode_session,
-    parse_codex_session,
-)
-from .objectives import SESSION_OBJECTIVE_VERSION, derive_session_objective
-from .origins import SESSION_ORIGIN_VERSION, derive_session_origin
 from .db import (
     SEARCH_INDEX_VERSION,
     apply_message_claims,
     defer_storage_transition,
     defer_storage_transitions,
     ensure_user,
+    get_db,
     get_meta,
     get_user_by_identifier,
-    get_db,
     init_db,
     insert_session_daily_usage,
     insert_session_paths,
     insert_tool_calls,
     normalize_username,
-    refresh_session_publication_metadata,
     refresh_native_usage,
+    refresh_session_publication_metadata,
     resolve_session_visibility,
     set_meta,
     transition_session_visibility,
     upsert_session,
+)
+from .discovery import claude_projects_root, codex_session_roots, discover_transcripts
+from .objectives import SESSION_OBJECTIVE_VERSION, derive_session_objective
+from .origins import SESSION_ORIGIN_VERSION, derive_session_origin
+from .parsers import (
+    PrivateSessionMarker,
+    file_hash,
+    parse_claudecode_session,
+    parse_codex_session,
 )
 from .search import (
     SearchTranscriptReadError,
     backfill_search_index,
     replace_session_search_index,
 )
-
 
 SESSION_ACTIVITY_VERSION = 1
 SESSION_NARRATIVE_VERSION = 1
@@ -565,7 +564,7 @@ def _record_copy_retry(
             file_stat.st_size,
             file_stat.st_mtime,
             str(error),
-            datetime.now(timezone.utc).isoformat(),
+            datetime.now(UTC).isoformat(),
         ),
     )
     print(
@@ -754,11 +753,15 @@ def _prepare_shared_storage(
     copy_src = src
     if existing and _is_within(existing, private_root):
         _validate_private_archive_file(existing, private_root)
-    elif existing and _is_within(existing, shared_dir) and _lexists(existing):
-        if not _harden_managed_artifact(existing, shared_dir):
-            raise StorageSafetyError(
-                f"Refusing non-regular or unsafe shared transcript: {existing}"
-            )
+    elif (
+        existing
+        and _is_within(existing, shared_dir)
+        and _lexists(existing)
+        and not _harden_managed_artifact(existing, shared_dir)
+    ):
+        raise StorageSafetyError(
+            f"Refusing non-regular or unsafe shared transcript: {existing}"
+        )
     if (
         not copy_src.exists()
         and existing
@@ -1167,8 +1170,7 @@ def project_from_claude_path(jsonl_path: Path) -> str:
         dir_name = parts[project_index] if project_index >= 0 else jsonl_path.parent.name
     else:
         dir_name = jsonl_path.parent.name
-    if dir_name.startswith("-"):
-        dir_name = dir_name[1:]
+    dir_name = dir_name.removeprefix("-")
     # Claude replaces '/' with '-', but so does '-' in repo names, so just take last segment
     parts = dir_name.split("-")
     # Return the last non-empty, non-UUID-looking part
@@ -1605,8 +1607,8 @@ def _compute_duration(t1: str, t2: str) -> float | None:
         return None
     try:
         from datetime import datetime
-        d1 = datetime.fromisoformat(t1.replace("Z", "+00:00"))
-        d2 = datetime.fromisoformat(t2.replace("Z", "+00:00"))
+        d1 = datetime.fromisoformat(t1)
+        d2 = datetime.fromisoformat(t2)
         return max(0.0, (d2 - d1).total_seconds())
     except Exception:
         return None
@@ -1947,7 +1949,7 @@ def _sync_sessions(
     init_db(db_path)
     _secure_shared_mkdir(shared_dir, shared_dir)
     patterns = load_ignore_patterns(home)
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     new_count = updated_count = skipped_count = 0
 
     with get_db(db_path) as conn:

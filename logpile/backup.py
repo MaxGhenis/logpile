@@ -8,10 +8,10 @@ import os
 import re
 import sqlite3
 import tempfile
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Iterator
 
 from .discovery import (
     DiscoveredTranscript,
@@ -19,7 +19,6 @@ from .discovery import (
     transcript_roots,
 )
 from .parsers import _extract_text, _normalize_codex_record
-
 
 MAX_TEXT_CHARS = 12_000
 CHUNK_OVERLAP_CHARS = 400
@@ -246,13 +245,12 @@ def create_sqlite_snapshot(source: Path, destination: Path) -> Path:
     temp_path.unlink()
     try:
         try:
-            with _private_umask():
-                with sqlite3.connect(
-                    _sqlite_readonly_uri(source),
-                    uri=True,
-                    timeout=30,
-                ) as conn:
-                    conn.execute("VACUUM INTO ?", (str(temp_path),))
+            with _private_umask(), sqlite3.connect(
+                _sqlite_readonly_uri(source),
+                uri=True,
+                timeout=30,
+            ) as conn:
+                conn.execute("VACUUM INTO ?", (str(temp_path),))
         except sqlite3.Error as exc:
             raise RuntimeError(f"Could not snapshot SQLite database {source}: {exc}") from exc
 
@@ -335,7 +333,7 @@ def object_key_for(sha256: str, path: Path) -> str:
 
 
 def file_id_for(relative_path: str, sha256: str) -> str:
-    return hashlib.sha256(f"{relative_path}\0{sha256}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{relative_path}\0{sha256}".encode()).hexdigest()
 
 
 def build_candidate(

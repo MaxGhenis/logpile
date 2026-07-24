@@ -1,8 +1,9 @@
 """Click CLI for Logpile."""
-import json
 import ipaddress
+import json
 import os
 import socket
+from datetime import UTC
 from pathlib import Path
 
 import click
@@ -538,6 +539,7 @@ def show_command(session_id, backend, db, db_url, limit, json_output):
             return
 
         import sqlite3
+
         from .parsers import render_claudecode_transcript, render_codex_transcript
 
         conn = sqlite3.connect(db_path)
@@ -721,8 +723,8 @@ def serve(shared, db, host, port, public, unsafe_network, dev, flask):
 
     # ── Next.js path ──────────────────────────────────────────────────
     import shutil
-    import subprocess
     import signal
+    import subprocess
     import sys
 
     # Source-only web tree, validated before any database or runtime checks.
@@ -981,14 +983,15 @@ def github_sync(db, identifier, since):
 
         logpile user <username> --github <github-handle>
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
+
     from .db import get_db, get_user_by_identifier
-    from .github import sync_user_github, users_with_github, GitHubSyncError
+    from .github import GitHubSyncError, sync_user_github, users_with_github
 
     since_dt = None
     if since:
         try:
-            since_dt = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            since_dt = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=UTC)
         except ValueError:
             click.echo(f"Invalid --since (want YYYY-MM-DD): {since}", err=True)
             raise SystemExit(1)
@@ -1596,12 +1599,12 @@ def backup_search(query, db_url, limit, json_output):
 @click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
 def publish_review(session_id, db, json_output):
     """Inspect a session for risky content before publishing."""
+    from .db import get_db
     from .publish import (
         format_publish_review,
         review_publish_session,
         serialize_publish_review,
     )
-    from .db import get_db
 
     with get_db(_prepare_db(db)) as conn:
         try:
@@ -1647,8 +1650,8 @@ def _publish_apply_impl(session_id, db, shared, visibility, force):
         can_apply_visibility,
         format_publish_review,
         preserve_reviewed_artifact,
-        review_staging_dir,
         review_publish_session,
+        review_staging_dir,
     )
     from .sync import StorageSafetyError
 

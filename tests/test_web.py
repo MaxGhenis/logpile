@@ -6,13 +6,19 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from click.testing import CliRunner
 
 from logpile.cli import cli
-from logpile.db import create_visibility_rule, ensure_user, init_db, set_session_visibility, update_user
+from logpile.db import (
+    create_visibility_rule,
+    ensure_user,
+    init_db,
+    set_session_visibility,
+    update_user,
+)
 from logpile.objectives import normalize_objective_family
 from logpile.sync import sync_sessions
 from logpile.web.app import create_app
@@ -63,7 +69,7 @@ class WebAppTests(unittest.TestCase):
     ) -> None:
         # Relative to now so fixtures stay inside the rolling 30-day windows
         # the chart/analysis endpoints query (a fixed date silently ages out).
-        recent = datetime.now(timezone.utc) - timedelta(days=1)
+        recent = datetime.now(UTC) - timedelta(days=1)
         write_jsonl(
             home / ".claude" / "projects" / "-Users-alice-demo" / f"{session_id}.jsonl",
             [
@@ -216,7 +222,7 @@ class WebAppTests(unittest.TestCase):
         shared = root / "shared"
         db_path = root / "logpile.db"
         self._prepare_user(db_path, username="alice")
-        now = datetime.now(timezone.utc) - timedelta(days=1)
+        now = datetime.now(UTC) - timedelta(days=1)
         self._write_codex_session(
             home,
             session_id="private-root",
@@ -590,7 +596,7 @@ class WebAppTests(unittest.TestCase):
             db_path = root / "logpile.db"
             self._prepare_user(db_path, username="alice")
 
-            now = datetime.now(timezone.utc) - timedelta(days=1)
+            now = datetime.now(UTC) - timedelta(days=1)
             self._write_codex_session(
                 home,
                 session_id="root-codex",
@@ -858,8 +864,8 @@ class WebAppTests(unittest.TestCase):
             db_path = root / "logpile.db"
             self._prepare_user(db_path, username="alice")
 
-            start = datetime.now(timezone.utc) - timedelta(days=3)
-            later = datetime.now(timezone.utc) - timedelta(days=1)
+            start = datetime.now(UTC) - timedelta(days=3)
+            later = datetime.now(UTC) - timedelta(days=1)
             write_jsonl(
                 home / ".claude" / "projects" / "-Users-alice-demo" / "long-session.jsonl",
                 [

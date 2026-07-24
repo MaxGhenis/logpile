@@ -15,7 +15,6 @@ from logpile.stats import (
     format_stats,
 )
 
-
 # ── fixtures ──────────────────────────────────────────────────────────
 
 

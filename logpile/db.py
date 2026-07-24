@@ -5,12 +5,11 @@ import sqlite3
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
 from .origins import SESSION_ORIGINS
-
 
 SESSION_VISIBILITIES = ("private", "unlisted", "public")
 PROFILE_VISIBILITIES = ("private", "unlisted", "public")
@@ -603,7 +602,7 @@ END;
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def normalize_username(value: str) -> str:

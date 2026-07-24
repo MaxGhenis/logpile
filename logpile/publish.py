@@ -4,22 +4,25 @@ from __future__ import annotations
 import base64
 import binascii
 import codecs
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import errno
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
 import secrets
 import shutil
 import sqlite3
 import stat
 import tempfile
-from typing import Callable, Iterator, Pattern, TextIO
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from itertools import pairwise
+from pathlib import Path
+from re import Pattern
+from typing import TextIO
 
 
 @dataclass(frozen=True)
@@ -169,7 +172,7 @@ def _valid_us_phone(match: re.Match[str]) -> bool:
     # commonly appear as sample IDs and otherwise satisfy the NANP shape.
     deltas = [
         (int(right) - int(left)) % 10
-        for left, right in zip(digits, digits[1:])
+        for left, right in pairwise(digits)
     ]
     return not (
         all(delta == 1 for delta in deltas)
@@ -1293,7 +1296,7 @@ def preserve_reviewed_artifact(
     finally:
         os.close(source_fd)
 
-    reviewed_at = datetime.now(timezone.utc).isoformat()
+    reviewed_at = datetime.now(UTC).isoformat()
     cur = conn.execute(
         """
         INSERT INTO publication_reviews (

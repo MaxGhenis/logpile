@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from typing import ClassVar
 
 from logpile.db import (
     CLAIMS_TOKEN_VERSION,
@@ -23,7 +24,6 @@ from logpile.db import (
 )
 from logpile.parsers import parse_claudecode_session
 from logpile.sync import SESSION_TOKEN_VERSION, sync_sessions
-
 
 FIXTURES = Path(__file__).parent / "fixtures" / "claudecode"
 
@@ -222,7 +222,7 @@ class ApplyMessageClaimsTests(unittest.TestCase):
             )
         }
 
-    EXPECTED_OWNERS = {
+    EXPECTED_OWNERS: ClassVar[dict[str, str]] = {
         "msg-1:req-1": "zzz-parent",
         "msg-2:req-2": "zzz-parent",
         "msg-3:req-3": "aaa-child",
@@ -251,16 +251,18 @@ class ApplyMessageClaimsTests(unittest.TestCase):
 
     def test_ownership_is_order_independent(self) -> None:
         for order in ((self.parent, self.child), (self.child, self.parent)):
-            with self.subTest(first=order[0].session_id):
-                with get_db(self.db_path) as conn:
-                    conn.execute("DELETE FROM message_claims")
-                    conn.execute("DELETE FROM sessions")
-                    for info in order:
-                        self._register(conn, info)
-                    for info in order:
-                        apply_message_claims(conn, info.session_id, info.message_usage)
-                    self.assertEqual(self._owners(conn), self.EXPECTED_OWNERS)
-                    self.assertEqual(len(self._occurrences(conn)), 5)
+            with (
+                self.subTest(first=order[0].session_id),
+                get_db(self.db_path) as conn,
+            ):
+                conn.execute("DELETE FROM message_claims")
+                conn.execute("DELETE FROM sessions")
+                for info in order:
+                    self._register(conn, info)
+                for info in order:
+                    apply_message_claims(conn, info.session_id, info.message_usage)
+                self.assertEqual(self._owners(conn), self.EXPECTED_OWNERS)
+                self.assertEqual(len(self._occurrences(conn)), 5)
 
     def test_steal_reports_previous_owner_as_affected(self) -> None:
         with get_db(self.db_path) as conn:

@@ -5,7 +5,6 @@ from pathlib import Path
 
 from logpile.db import init_db
 
-
 FIXTURES = Path(__file__).parent / "fixtures" / "migrations"
 
 

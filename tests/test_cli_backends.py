@@ -197,7 +197,7 @@ class CliBackendTests(unittest.TestCase):
         )
 
     def test_cloud_search_uses_supabase_archive(self) -> None:
-        import logpile.backup as backup
+        from logpile import backup
 
         class FakeArchive:
             def __init__(self, db_url):
@@ -242,7 +242,7 @@ class CliBackendTests(unittest.TestCase):
         self.assertIn("specific thing", payload["results"][0]["excerpt"])
 
     def test_cloud_show_prints_indexed_chunks(self) -> None:
-        import logpile.backup as backup
+        from logpile import backup
 
         class FakeArchive:
             def __init__(self, db_url):

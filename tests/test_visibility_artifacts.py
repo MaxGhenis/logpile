@@ -98,9 +98,11 @@ class VisibilityArtifactTests(unittest.TestCase):
             root = Path(td)
             _home, shared, db_path, _source = self._sync_private(root)
 
-            with _connect(db_path) as conn:
-                with self.assertRaisesRegex(ValueError, "Unsupported visibility"):
-                    update_user(conn, "alice", default_session_visibility="typo-public")
+            with (
+                _connect(db_path) as conn,
+                self.assertRaisesRegex(ValueError, "Unsupported visibility"),
+            ):
+                update_user(conn, "alice", default_session_visibility="typo-public")
 
             result = CliRunner().invoke(
                 cli,
@@ -714,9 +716,11 @@ class VisibilityArtifactTests(unittest.TestCase):
                 os.chmod(dst, 0o600)
 
             first_stderr = io.StringIO()
-            with mock.patch("logpile.sync._secure_copy_file", side_effect=corrupt_copy):
-                with contextlib.redirect_stderr(first_stderr):
-                    sync_sessions(shared, db_path, "alice", "machine-1", home)
+            with (
+                mock.patch("logpile.sync._secure_copy_file", side_effect=corrupt_copy),
+                contextlib.redirect_stderr(first_stderr),
+            ):
+                sync_sessions(shared, db_path, "alice", "machine-1", home)
 
             self.assertIn("Archival shared-copy preflight plans", first_stderr.getvalue())
             self.assertIn("across 1 transcript(s)", first_stderr.getvalue())
@@ -766,10 +770,12 @@ class VisibilityArtifactTests(unittest.TestCase):
             _write_session(source, "planned copy")
             usage = namedtuple("usage", "total used free")(100, 100, 0)
             stderr = io.StringIO()
-            with mock.patch("logpile.sync.shutil.disk_usage", return_value=usage):
-                with contextlib.redirect_stderr(stderr):
-                    with self.assertRaises(StorageSafetyError):
-                        sync_sessions(shared, db_path, "alice", "machine-1", home)
+            with (
+                mock.patch("logpile.sync.shutil.disk_usage", return_value=usage),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(StorageSafetyError),
+            ):
+                sync_sessions(shared, db_path, "alice", "machine-1", home)
             self.assertIn("preflight plans", stderr.getvalue())
             self.assertIn("0.0 B free", stderr.getvalue())
             with _connect(db_path) as conn:

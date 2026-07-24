@@ -13,14 +13,14 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from logpile.cli import cli
 import logpile.db as db_module
 import logpile.publish as publish_module
+from logpile.cli import cli
 from logpile.db import ensure_user, init_db, set_session_visibility, update_user
 from logpile.publish import (
     preserve_reviewed_artifact,
-    review_staging_dir,
     review_publish_session,
+    review_staging_dir,
     serialize_publish_review,
 )
 from logpile.sync import sync_sessions

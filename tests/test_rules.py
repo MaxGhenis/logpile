@@ -13,8 +13,8 @@ from logpile.db import (
     ensure_user,
     init_db,
     recompute_session_visibility,
-    update_user,
     set_session_visibility,
+    update_user,
 )
 from logpile.sync import sync_sessions
 

@@ -1,9 +1,9 @@
-from datetime import datetime, timezone
 import json
 import os
 import tempfile
 import tracemalloc
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -26,7 +26,6 @@ from logpile.parsers import (
     render_codex_transcript,
 )
 from logpile.sync import _annotate_session_paths, _derive_session_activity
-
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -1310,7 +1309,7 @@ class CodexReplayAccountingTests(unittest.TestCase):
         parent = _codex_meta("2026-06-08T12:00:00.001Z", "parent-thread")
         live_timestamp = "2026-06-08T12:00:10.000Z"
         live_started_at = int(
-            datetime.fromisoformat(live_timestamp.replace("Z", "+00:00")).timestamp()
+            datetime.fromisoformat(live_timestamp).timestamp()
         )
         info = self._parse([
             leaf,
@@ -1660,7 +1659,7 @@ class DailyResidualUsageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "mtime-session.jsonl"
             write_jsonl(path, records)
-            mtime = datetime(2026, 1, 2, 12, tzinfo=timezone.utc).timestamp()
+            mtime = datetime(2026, 1, 2, 12, tzinfo=UTC).timestamp()
             os.utime(path, (mtime, mtime))
             info = parse_claudecode_session(path)
 

@@ -6,7 +6,7 @@ import hashlib
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -16,7 +16,6 @@ from .parsers import (
     clean_search_text,
     iter_session_search_text,
 )
-
 
 STRUCTURED_FIELDS = (
     ("session_goal", "session_goal", True),
@@ -98,7 +97,7 @@ class SearchBackfillStats:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _value(row: Any, key: str) -> Any:

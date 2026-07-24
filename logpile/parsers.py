@@ -13,10 +13,9 @@ import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Optional, TextIO
-
+from typing import Any, TextIO
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +23,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ToolCall:
     tool_name: str
-    command: Optional[str] = None
-    timestamp: Optional[str] = None
+    command: str | None = None
+    timestamp: str | None = None
     is_error: bool = False
     operation: str = "other"
     input_paths: list[str] = field(default_factory=list)
     command_paths: list[str] = field(default_factory=list)
-    call_id: Optional[str] = None
+    call_id: str | None = None
 
 
 @dataclass
@@ -71,8 +70,8 @@ class MessageUsage:
     """
 
     claim_key: str
-    day: Optional[str]  # YYYY-MM-DD (UTC), None when the record has no timestamp
-    model: Optional[str]
+    day: str | None  # YYYY-MM-DD (UTC), None when the record has no timestamp
+    model: str | None
     fresh_input_tokens: int = 0
     cached_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
@@ -87,12 +86,12 @@ class SessionPath:
     raw_path: str
     normalized_path: str
     display_path: str
-    relative_path: Optional[str]
+    relative_path: str | None
     operation: str
     source: str
-    repo_relative_path: Optional[str] = None
-    tool_name: Optional[str] = None
-    timestamp: Optional[str] = None
+    repo_relative_path: str | None = None
+    tool_name: str | None = None
+    timestamp: str | None = None
 
 
 @dataclass
@@ -100,8 +99,8 @@ class SessionInfo:
     session_id: str
     source: str  # 'claudecode' or 'codex'
     project: str
-    first_timestamp: Optional[str] = None
-    last_timestamp: Optional[str] = None
+    first_timestamp: str | None = None
+    last_timestamp: str | None = None
     user_message_count: int = 0
     assistant_message_count: int = 0
     tool_call_count: int = 0
@@ -116,11 +115,11 @@ class SessionInfo:
     cache_creation_unknown_input_tokens: int = 0
     reasoning_output_tokens: int = 0
     first_user_message: str = ""
-    model: Optional[str] = None
-    workspace_root: Optional[str] = None
-    thread_id: Optional[str] = None
-    parent_thread_id: Optional[str] = None
-    parent_session_id: Optional[str] = None
+    model: str | None = None
+    workspace_root: str | None = None
+    thread_id: str | None = None
+    parent_thread_id: str | None = None
+    parent_session_id: str | None = None
     spawn_depth: int = 0
     tool_calls: Sequence[ToolCall] = field(default_factory=list)
     session_paths: Sequence[SessionPath] = field(default_factory=list)
@@ -602,7 +601,7 @@ def _is_codex_agents_payload(text: str) -> bool:
     remainder = text[len(_CODEX_AGENTS_INSTRUCTIONS_PREFIX):].lstrip()
     # Injections continue with an absolute directory or the wrapper block;
     # prose like "for beginners: …" matches neither.
-    return remainder.startswith("for /") or remainder.startswith("<INSTRUCTIONS>")
+    return remainder.startswith(("for /", "<INSTRUCTIONS>"))
 # Long opaque tokens are not useful transcript prose and are commonly image,
 # encrypted-thinking, or other base64 payloads. Standard MIME base64 wraps at
 # 76 columns, so remove both continuous tokens and multi-line wrapped runs.
@@ -1255,7 +1254,7 @@ def _iter_jsonl(
     stream_context = (
         nullcontext(path)
         if hasattr(path, "read")
-        else open(path, encoding="utf-8", errors="replace")
+        else open(path, encoding="utf-8", errors="replace")  # noqa: SIM115 - entered via `with stream_context` below
     )
     try:
         if hasattr(path, "seek"):
@@ -1303,7 +1302,7 @@ def _iter_jsonl(
             )
 
 
-def _normalize_codex_record(record: dict) -> tuple[str, dict, Optional[str]]:
+def _normalize_codex_record(record: dict) -> tuple[str, dict, str | None]:
     """Return (record_type, payload, timestamp) for old and new Codex formats."""
     record_type = record.get("type", record.get("record_type", ""))
     timestamp = record.get("timestamp")
@@ -1386,7 +1385,7 @@ def _is_explicit_codex_counter_reset(record_type: str, payload: dict) -> bool:
         return False
 
 
-def _day_of(timestamp: Optional[str]) -> Optional[str]:
+def _day_of(timestamp: str | None) -> str | None:
     if not isinstance(timestamp, str) or not timestamp.strip():
         return None
     value = timestamp.strip()
@@ -1397,11 +1396,11 @@ def _day_of(timestamp: Optional[str]) -> Optional[str]:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).date().isoformat()
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).date().isoformat()
 
 
-def _daily_bucket(daily: dict, timestamp: Optional[str]) -> Optional[DailyUsage]:
+def _daily_bucket(daily: dict, timestamp: str | None) -> DailyUsage | None:
     day = _day_of(timestamp)
     if day is None:
         return None
@@ -1415,13 +1414,13 @@ def _sorted_daily(daily: dict) -> list[DailyUsage]:
     return [daily[day] for day in sorted(daily)]
 
 
-def _string_id(value: Any) -> Optional[str]:
+def _string_id(value: Any) -> str | None:
     if isinstance(value, (str, int)) and str(value):
         return str(value)
     return None
 
 
-def _timestamp_epoch_second(timestamp: Optional[str]) -> Optional[int]:
+def _timestamp_epoch_second(timestamp: str | None) -> int | None:
     if not isinstance(timestamp, str) or not timestamp.strip():
         return None
     value = timestamp.strip()
@@ -1432,11 +1431,11 @@ def _timestamp_epoch_second(timestamp: Optional[str]) -> Optional[int]:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return int(parsed.timestamp())
 
 
-def _started_at_epoch_second(value: Any) -> Optional[int]:
+def _started_at_epoch_second(value: Any) -> int | None:
     try:
         started_at = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -1487,7 +1486,7 @@ def _codex_replay_window(records: list) -> tuple[int, int]:
     return 1, len(records)
 
 
-def _extract_command(arguments: dict) -> Optional[str]:
+def _extract_command(arguments: dict) -> str | None:
     raw_cmd = arguments.get("command") or arguments.get("cmd")
     if isinstance(raw_cmd, list):
         if len(raw_cmd) >= 3 and raw_cmd[1] == "-lc":
@@ -1530,17 +1529,14 @@ def _key_suggests_path(key: str | None) -> bool:
     return (
         lowered in _ARG_PATH_KEYS
         or lowered in _ARG_PATH_LIST_KEYS
-        or lowered.endswith("_path")
-        or lowered.endswith("_file")
-        or lowered.endswith("_files")
+        or lowered.endswith(("_path", "_file", "_files"))
     )
 
 
 def _clean_path_candidate(value: str) -> str:
     candidate = str(value).strip().strip("\"'")
     candidate = candidate.rstrip(",;")
-    if candidate.startswith("file://"):
-        candidate = candidate[7:]
+    candidate = candidate.removeprefix("file://")
     line_match = re.match(r"^(.*?)(?::\d+(?::\d+)?)$", candidate)
     if line_match:
         base = line_match.group(1)
@@ -1934,7 +1930,7 @@ def _fallback_usage_day(path: Path, records: list[dict]) -> str:
         # The file was readable moments earlier, so this is only a final
         # deterministic guard for a concurrent rotation.
         return "1970-01-01"
-    return datetime.fromtimestamp(modified, tz=timezone.utc).date().isoformat()
+    return datetime.fromtimestamp(modified, tz=UTC).date().isoformat()
 
 
 def _reconcile_daily_usage(
@@ -2036,7 +2032,7 @@ def _claude_cache_creation_split(usage: dict) -> tuple[int, int, int]:
 def _claude_session_identity(
     path: Path,
     records: list[dict],
-) -> tuple[str, str, Optional[str], Optional[str], int]:
+) -> tuple[str, str, str | None, str | None, int]:
     """Return canonical id, raw thread id, raw/canonical parent, and depth."""
     raw_session_id = None
     agent_id = None
@@ -2062,7 +2058,7 @@ def _claude_session_identity_from_observations(
     raw_session_id: str | None,
     agent_id: str | None,
     sidechain_flag: bool,
-) -> tuple[str, str, Optional[str], Optional[str], int]:
+) -> tuple[str, str, str | None, str | None, int]:
     """Resolve Claude identity from compact fields gathered while streaming."""
 
     parts = path.parts
@@ -2089,7 +2085,7 @@ def _claude_session_identity_from_observations(
     return path.stem, thread_id, None, None, 0
 
 
-def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessionMarker]:
+def parse_claudecode_session(path: Path) -> SessionInfo | PrivateSessionMarker | None:
     """Parse a Claude Code JSONL file and return a SessionInfo."""
     record_count = 0
     private_marker = None
@@ -2346,12 +2342,12 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
     )
 
 
-def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMarker]:
+def parse_codex_session(path: Path) -> SessionInfo | PrivateSessionMarker | None:
     """Parse a Codex JSONL file and return a SessionInfo."""
     inspection_stats = JsonlLoadStats()
     record_count = 0
     first_rec: dict | None = None
-    first_normalized: tuple[str, dict, Optional[str]] | None = None
+    first_normalized: tuple[str, dict, str | None] | None = None
     replay_candidate = False
     replay_boundary: int | None = None
     private_marker = None

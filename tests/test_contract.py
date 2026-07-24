@@ -9,8 +9,8 @@ from logpile.db import (
     get_db,
     init_db,
     transition_session_visibility,
-    upsert_session,
     update_user,
+    upsert_session,
 )
 from logpile.publish import publication_metadata_sha256
 

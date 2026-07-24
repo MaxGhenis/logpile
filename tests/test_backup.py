@@ -9,8 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from logpile.backup import (
-    R2Config,
     SUPABASE_SCHEMA_SQL,
+    R2Config,
     build_candidate,
     create_sqlite_snapshot,
     discover_raw_paths,
@@ -254,22 +254,24 @@ class BackupTests(unittest.TestCase):
                 pass
             failing_connection = FailingSessionsQueryConnection()
 
-            with patch(
-                "logpile.discovery.sqlite3.connect",
-                return_value=failing_connection,
-            ):
-                with self.assertRaisesRegex(
+            with (
+                patch(
+                    "logpile.discovery.sqlite3.connect",
+                    return_value=failing_connection,
+                ),
+                self.assertRaisesRegex(
                     RuntimeError,
                     r"Could not read configured Logpile database.*injected sessions query failure",
-                ):
-                    list(
-                        discover_raw_paths(
-                            home,
-                            db_path=db_path,
-                            shared_dir=shared,
-                            include_codex_db=False,
-                        )
+                ),
+            ):
+                list(
+                    discover_raw_paths(
+                        home,
+                        db_path=db_path,
+                        shared_dir=shared,
+                        include_codex_db=False,
                     )
+                )
             self.assertTrue(failing_connection.closed)
 
     def test_valid_non_logpile_or_missing_db_remains_optional(self) -> None:
@@ -322,10 +324,12 @@ class BackupTests(unittest.TestCase):
                 paths = list(discover_raw_paths(home, include_codex_db=True))
                 self.assertEqual(paths, [source])
 
-                with snapshot_candidate(source, home=home) as candidate:
-                    with sqlite3.connect(candidate.payload_path) as snapshot:
-                        values = snapshot.execute("SELECT value FROM events").fetchall()
-                        check = snapshot.execute("PRAGMA quick_check").fetchone()[0]
+                with (
+                    snapshot_candidate(source, home=home) as candidate,
+                    sqlite3.connect(candidate.payload_path) as snapshot,
+                ):
+                    values = snapshot.execute("SELECT value FROM events").fetchall()
+                    check = snapshot.execute("PRAGMA quick_check").fetchone()[0]
             finally:
                 writer.close()
 
@@ -580,7 +584,7 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(infer_jsonl_source(claude_path), "claudecode")
 
     def test_push_backup_uploads_and_indexes_with_injected_clients(self) -> None:
-        import logpile.backup as backup
+        from logpile import backup
 
         uploaded_keys: list[str] = []
         upserted_files: list[str] = []

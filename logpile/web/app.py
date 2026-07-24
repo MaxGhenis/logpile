@@ -1,7 +1,7 @@
 """Flask web application for Logpile."""
 import re
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from flask import Flask, abort, g, jsonify, render_template, request
@@ -10,8 +10,14 @@ from werkzeug.exceptions import HTTPException
 from ..db import get_user_by_identifier, init_db, list_visibility_rules
 from ..objectives import (
     display_objective_label as _core_display_objective_label,
+)
+from ..objectives import (
     first_nonempty_line as _core_first_nonempty_line,
+)
+from ..objectives import (
     normalize_objective_family as _core_normalize_objective_family,
+)
+from ..objectives import (
     objective_seed_text as _core_objective_seed_text,
 )
 from ..origins import SESSION_ORIGINS
@@ -149,7 +155,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         if not ts:
             return "—"
         try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(ts)
             return dt.strftime("%Y-%m-%d %H:%M")
         except Exception:
             return ts[:16]
@@ -168,9 +174,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         if not value:
             return "0"
         if value >= 1_000_000:
-            return f"{int(round(value / 1_000_000)):,}M"
+            return f"{round(value / 1_000_000):,}M"
         if value >= 1_000:
-            return f"{int(round(value / 1_000)):,}K"
+            return f"{round(value / 1_000):,}K"
         return f"{value:,}"
 
     def _display_project(project: str | None) -> str:
@@ -504,7 +510,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             ).fetchone()
             summary["active_days"] = active_days_row["active_days"] if active_days_row else 0
 
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+        cutoff = (datetime.now(UTC) - timedelta(days=60)).isoformat()
         activity_rows = db.execute(
             f"""
             SELECT
@@ -682,7 +688,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
     @app.route("/api/messages-per-day")
     def api_messages_per_day():
         db = _db()
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat()
         origin_clause = _origin_clause(request.args.get("origin", ""), "s", allow_all=True)
         origin_sql = f" AND {origin_clause}" if origin_clause else ""
         rows = db.execute(
@@ -738,7 +744,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
     @app.route("/api/messages-per-tool")
     def api_messages_per_tool():
         db = _db()
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat()
         origin_clause = _origin_clause(request.args.get("origin", ""), "s", allow_all=True)
         origin_sql = f" AND {origin_clause}" if origin_clause else ""
         rows = db.execute(
@@ -1243,7 +1249,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             """
         ).fetchall()
 
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat()
         objective_seed_rows = db.execute(
             f"""
             SELECT
@@ -1356,7 +1362,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
              AND { _listed_session_clause("root") }
             ORDER BY root.first_timestamp DESC, s.first_timestamp DESC
             """,
-            ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),),
+            ((datetime.now(UTC) - timedelta(days=7)).isoformat(),),
         ).fetchall()
         context_rows = _group_context_explosion_rows(context_seed_rows)
 
