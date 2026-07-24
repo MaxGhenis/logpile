@@ -6,13 +6,19 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from click.testing import CliRunner
 
 from logpile.cli import cli
-from logpile.db import create_visibility_rule, ensure_user, init_db, set_session_visibility, update_user
+from logpile.db import (
+    create_visibility_rule,
+    ensure_user,
+    init_db,
+    set_session_visibility,
+    update_user,
+)
 from logpile.objectives import normalize_objective_family
 from logpile.sync import sync_sessions
 from logpile.web.app import create_app
@@ -63,7 +69,7 @@ class WebAppTests(unittest.TestCase):
     ) -> None:
         # Relative to now so fixtures stay inside the rolling 30-day windows
         # the chart/analysis endpoints query (a fixed date silently ages out).
-        recent = datetime.now(timezone.utc) - timedelta(days=1)
+        recent = datetime.now(UTC) - timedelta(days=1)
         write_jsonl(
             home / ".claude" / "projects" / "-Users-alice-demo" / f"{session_id}.jsonl",
             [
@@ -74,13 +80,16 @@ class WebAppTests(unittest.TestCase):
                     "message": {"content": message},
                 },
                 {
-                    "timestamp": (recent + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
+                    "timestamp": (recent + timedelta(seconds=5))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
                     "type": "assistant",
                     "message": {
                         "id": "msg-1",
                         "model": "claude-3.7",
                         "usage": {"input_tokens": 1, "output_tokens": 2},
-                        "content": assistant_content or [{"type": "text", "text": "hi"}],
+                        "content": assistant_content
+                        or [{"type": "text", "text": "hi"}],
                     },
                 },
             ],
@@ -133,7 +142,9 @@ class WebAppTests(unittest.TestCase):
                     "payload": meta_payload,
                 },
                 {
-                    "timestamp": (timestamp + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
+                    "timestamp": (timestamp + timedelta(seconds=1))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
                     "type": "response_item",
                     "payload": {
                         "type": "message",
@@ -142,7 +153,9 @@ class WebAppTests(unittest.TestCase):
                     },
                 },
                 {
-                    "timestamp": (timestamp + timedelta(seconds=2)).isoformat().replace("+00:00", "Z"),
+                    "timestamp": (timestamp + timedelta(seconds=2))
+                    .isoformat()
+                    .replace("+00:00", "Z"),
                     "type": "event_msg",
                     "payload": {
                         "type": "token_count",
@@ -151,7 +164,8 @@ class WebAppTests(unittest.TestCase):
                                 "input_tokens": total_input_tokens,
                                 "cached_input_tokens": cached_input_tokens,
                                 "output_tokens": total_output_tokens,
-                                "total_tokens": total_input_tokens + total_output_tokens,
+                                "total_tokens": total_input_tokens
+                                + total_output_tokens,
                             }
                         },
                     },
@@ -216,7 +230,7 @@ class WebAppTests(unittest.TestCase):
         shared = root / "shared"
         db_path = root / "logpile.db"
         self._prepare_user(db_path, username="alice")
-        now = datetime.now(timezone.utc) - timedelta(days=1)
+        now = datetime.now(UTC) - timedelta(days=1)
         self._write_codex_session(
             home,
             session_id="private-root",
@@ -270,7 +284,9 @@ class WebAppTests(unittest.TestCase):
     def _init_git_repo(self, root: Path) -> tuple[Path, str]:
         repo = root / "repo"
         repo.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "init", str(repo)], check=True, capture_output=True, text=True
+        )
         subprocess.run(
             ["git", "-C", str(repo), "config", "user.email", "tests@example.com"],
             check=True,
@@ -284,7 +300,12 @@ class WebAppTests(unittest.TestCase):
             text=True,
         )
         (repo / "README.md").write_text("hello\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "README.md"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         subprocess.run(
             ["git", "-C", str(repo), "commit", "-m", "init"],
             check=True,
@@ -313,7 +334,9 @@ class WebAppTests(unittest.TestCase):
                 self.assertEqual(client.get("/u/alice").status_code, 404)
                 self.assertEqual(client.get("/api/users/alice").status_code, 404)
                 self.assertEqual(client.get("/api/users/alice/stats").status_code, 404)
-                self.assertEqual(client.get("/api/users/alice/sessions").status_code, 404)
+                self.assertEqual(
+                    client.get("/api/users/alice/sessions").status_code, 404
+                )
                 self.assertEqual(client.get("/api/sessions").get_json(), [])
                 sessions_page = client.get("/sessions")
                 self.assertEqual(sessions_page.status_code, 200)
@@ -362,8 +385,12 @@ class WebAppTests(unittest.TestCase):
             app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
             with app.test_client() as client:
                 self.assertEqual(client.get("/sessions?page=x").status_code, 400)
-                self.assertEqual(client.get("/api/users/alice/sessions?limit=foo").status_code, 400)
-                self.assertEqual(client.get("/api/users/alice/sessions?offset=foo").status_code, 400)
+                self.assertEqual(
+                    client.get("/api/users/alice/sessions?limit=foo").status_code, 400
+                )
+                self.assertEqual(
+                    client.get("/api/users/alice/sessions?offset=foo").status_code, 400
+                )
 
     def test_sessions_page_invalid_activity_filter_is_inline_error(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -384,7 +411,9 @@ class WebAppTests(unittest.TestCase):
             home = root / "alice"
             shared = root / "shared"
             db_path = root / "logpile.db"
-            self._write_claude_session(home, session_id="direct-1", message="make more progress on logpile")
+            self._write_claude_session(
+                home, session_id="direct-1", message="make more progress on logpile"
+            )
             self._write_claude_session(
                 home,
                 session_id="eval-1",
@@ -418,15 +447,21 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(pipeline_rows[0]["session_origin"], "pipeline_eval")
             self.assertEqual(direct_payload["total"], 1)
             self.assertEqual(direct_payload["sessions"][0]["session_id"], "direct-1")
-            self.assertEqual(direct_payload["sessions"][0]["session_origin"], "human_direct")
+            self.assertEqual(
+                direct_payload["sessions"][0]["session_origin"], "human_direct"
+            )
 
-    def test_dashboard_defaults_to_human_direct_and_profile_stats_accept_origin(self) -> None:
+    def test_dashboard_defaults_to_human_direct_and_profile_stats_accept_origin(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "alice"
             shared = root / "shared"
             db_path = root / "logpile.db"
-            self._write_claude_session(home, session_id="direct-1", message="make more progress on logpile")
+            self._write_claude_session(
+                home, session_id="direct-1", message="make more progress on logpile"
+            )
             self._write_claude_session(
                 home,
                 session_id="eval-1",
@@ -447,8 +482,12 @@ class WebAppTests(unittest.TestCase):
             with app.test_client() as client:
                 dashboard = client.get("/")
                 pipeline_dashboard = client.get("/?origin=pipeline_eval")
-                direct_profile = client.get("/api/users/alice?origin=human_direct").get_json()
-                pipeline_profile = client.get("/api/users/alice/stats?origin=pipeline_eval").get_json()
+                direct_profile = client.get(
+                    "/api/users/alice?origin=human_direct"
+                ).get_json()
+                pipeline_profile = client.get(
+                    "/api/users/alice/stats?origin=pipeline_eval"
+                ).get_json()
 
             self.assertEqual(dashboard.status_code, 200)
             self.assertIn(b"make more progress on logpile", dashboard.data)
@@ -590,7 +629,7 @@ class WebAppTests(unittest.TestCase):
             db_path = root / "logpile.db"
             self._prepare_user(db_path, username="alice")
 
-            now = datetime.now(timezone.utc) - timedelta(days=1)
+            now = datetime.now(UTC) - timedelta(days=1)
             self._write_codex_session(
                 home,
                 session_id="root-codex",
@@ -741,12 +780,16 @@ class WebAppTests(unittest.TestCase):
                 home=home,
             )
 
-            objective = normalize_objective_family("Make more progress on Logpile analytics.")
+            objective = normalize_objective_family(
+                "Make more progress on Logpile analytics."
+            )
             self.assertIsNotNone(objective)
 
             app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
             with app.test_client() as client:
-                page = client.get(f"/sessions?objective={objective}&objectiveLabel=Logpile")
+                page = client.get(
+                    f"/sessions?objective={objective}&objectiveLabel=Logpile"
+                )
                 payload = client.get(f"/api/sessions?objective={objective}").get_json()
 
             self.assertEqual(page.status_code, 200)
@@ -755,7 +798,9 @@ class WebAppTests(unittest.TestCase):
             self.assertIn(b"match-1", page.data)
             self.assertIn(b"match-2", page.data)
             self.assertNotIn(b"other-1", page.data)
-            self.assertEqual(sorted(row["session_id"] for row in payload), ["match-1", "match-2"])
+            self.assertEqual(
+                sorted(row["session_id"] for row in payload), ["match-1", "match-2"]
+            )
 
     def test_invalid_objective_filter_is_rejected_consistently(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -805,7 +850,9 @@ class WebAppTests(unittest.TestCase):
                 default_stats = client.get("/api/users/alice/stats").get_json()
                 default_sessions = client.get("/api/users/alice/sessions").get_json()
                 all_profile = client.get("/api/users/alice?origin=all").get_json()
-                all_sessions = client.get("/api/users/alice/sessions?origin=all").get_json()
+                all_sessions = client.get(
+                    "/api/users/alice/sessions?origin=all"
+                ).get_json()
 
             self.assertEqual(default_profile["summary"]["total_sessions"], 1)
             self.assertEqual(default_stats["summary"]["total_sessions"], 1)
@@ -841,14 +888,18 @@ class WebAppTests(unittest.TestCase):
                 messages_payload = client.get("/api/messages-per-day").get_json()
                 error_payload = client.get("/api/error-rate").get_json()
 
-            message_labels = [dataset["label"] for dataset in messages_payload["datasets"]]
+            message_labels = [
+                dataset["label"] for dataset in messages_payload["datasets"]
+            ]
             self.assertEqual(len(message_labels), 2)
             self.assertEqual(len(set(message_labels)), 2)
             self.assertTrue(all(label.startswith("Sam (@") for label in message_labels))
 
             self.assertEqual(len(error_payload["labels"]), 2)
             self.assertEqual(len(set(error_payload["labels"])), 2)
-            self.assertTrue(all(label.startswith("Sam (@") for label in error_payload["labels"]))
+            self.assertTrue(
+                all(label.startswith("Sam (@") for label in error_payload["labels"])
+            )
 
     def test_messages_per_day_buckets_by_event_day_not_session_start(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -858,10 +909,14 @@ class WebAppTests(unittest.TestCase):
             db_path = root / "logpile.db"
             self._prepare_user(db_path, username="alice")
 
-            start = datetime.now(timezone.utc) - timedelta(days=3)
-            later = datetime.now(timezone.utc) - timedelta(days=1)
+            start = datetime.now(UTC) - timedelta(days=3)
+            later = datetime.now(UTC) - timedelta(days=1)
             write_jsonl(
-                home / ".claude" / "projects" / "-Users-alice-demo" / "long-session.jsonl",
+                home
+                / ".claude"
+                / "projects"
+                / "-Users-alice-demo"
+                / "long-session.jsonl",
                 [
                     {
                         "timestamp": start.isoformat().replace("+00:00", "Z"),
@@ -876,7 +931,9 @@ class WebAppTests(unittest.TestCase):
                             "id": "msg-late",
                             "model": "claude-3.7",
                             "usage": {"input_tokens": 1, "output_tokens": 2},
-                            "content": [{"type": "text", "text": "done two days later"}],
+                            "content": [
+                                {"type": "text", "text": "done two days later"}
+                            ],
                         },
                     },
                 ],
@@ -927,8 +984,12 @@ class WebAppTests(unittest.TestCase):
             with app.test_client() as client:
                 projects = client.get("/api/projects").get_json()
                 paths = client.get("/api/paths?project=demo").get_json()
-                filtered_sessions = client.get("/api/sessions?path=src/app.py").get_json()
-                user_sessions = client.get("/api/users/alice/sessions?path=tests/test_sync.py").get_json()
+                filtered_sessions = client.get(
+                    "/api/sessions?path=src/app.py"
+                ).get_json()
+                user_sessions = client.get(
+                    "/api/users/alice/sessions?path=tests/test_sync.py"
+                ).get_json()
 
             self.assertEqual(projects[0]["project"], "demo")
             self.assertEqual(projects[0]["sessions"], 1)
@@ -936,7 +997,10 @@ class WebAppTests(unittest.TestCase):
             self.assertEqual(projects[0]["tool_calls"], 2)
             self.assertNotIn("workspace_root", projects[0])
             self.assertEqual(
-                [(row["display_path"], row["writes"], row["reads"], row["searches"]) for row in paths],
+                [
+                    (row["display_path"], row["writes"], row["reads"], row["searches"])
+                    for row in paths
+                ],
                 [
                     ("src/app.py", 1, 0, 1),
                     ("tests/test_sync.py", 0, 0, 1),
@@ -972,7 +1036,9 @@ class WebAppTests(unittest.TestCase):
                 repos = client.get("/api/repos").get_json()
                 projects = client.get(f"/api/projects?repo={repo.name}").get_json()
                 paths = client.get(f"/api/paths?repo={repo.name}").get_json()
-                sessions = client.get(f"/api/sessions?repo={repo.name}&branch={branch}").get_json()
+                sessions = client.get(
+                    f"/api/sessions?repo={repo.name}&branch={branch}"
+                ).get_json()
                 user_sessions = client.get(
                     f"/api/users/alice/sessions?repo={repo.name}&branch={branch}&path=packages/src/app.py"
                 ).get_json()
@@ -1025,10 +1091,30 @@ class WebAppTests(unittest.TestCase):
                             "model": "claude-3.7",
                             "usage": {"input_tokens": 1, "output_tokens": 2},
                             "content": [
-                                {"type": "tool_use", "name": "Edit", "id": "edit-1", "input": {"file_path": "src/app.py"}},
-                                {"type": "tool_use", "name": "Bash", "id": "test-1", "input": {"command": "pytest -q"}},
-                                {"type": "tool_use", "name": "Bash", "id": "build-1", "input": {"command": "npm run build"}},
-                                {"type": "tool_use", "name": "Bash", "id": "commit-1", "input": {"command": "git commit -m ship"}},
+                                {
+                                    "type": "tool_use",
+                                    "name": "Edit",
+                                    "id": "edit-1",
+                                    "input": {"file_path": "src/app.py"},
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": "test-1",
+                                    "input": {"command": "pytest -q"},
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": "build-1",
+                                    "input": {"command": "npm run build"},
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": "commit-1",
+                                    "input": {"command": "git commit -m ship"},
+                                },
                             ],
                         },
                     },
@@ -1037,9 +1123,24 @@ class WebAppTests(unittest.TestCase):
                         "type": "user",
                         "message": {
                             "content": [
-                                {"type": "tool_result", "tool_use_id": "test-1", "is_error": True, "content": "1 failed"},
-                                {"type": "tool_result", "tool_use_id": "build-1", "is_error": False, "content": "built"},
-                                {"type": "tool_result", "tool_use_id": "commit-1", "is_error": False, "content": "[main abc123] ship"},
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "test-1",
+                                    "is_error": True,
+                                    "content": "1 failed",
+                                },
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "build-1",
+                                    "is_error": False,
+                                    "content": "built",
+                                },
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "commit-1",
+                                    "is_error": False,
+                                    "content": "[main abc123] ship",
+                                },
                             ]
                         },
                     },
@@ -1056,9 +1157,15 @@ class WebAppTests(unittest.TestCase):
 
             app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
             with app.test_client() as client:
-                test_failed = client.get("/api/sessions?activity=test_failed").get_json()
-                writes = client.get("/api/users/alice/sessions?activity=write").get_json()
-                commits = client.get("/api/users/alice/sessions?activity=git_commit").get_json()
+                test_failed = client.get(
+                    "/api/sessions?activity=test_failed"
+                ).get_json()
+                writes = client.get(
+                    "/api/users/alice/sessions?activity=write"
+                ).get_json()
+                commits = client.get(
+                    "/api/users/alice/sessions?activity=git_commit"
+                ).get_json()
                 bad_filter = client.get("/api/sessions?activity=unknown")
                 stats = client.get("/api/users/alice/stats").get_json()
 
@@ -1091,22 +1198,32 @@ class WebAppTests(unittest.TestCase):
             root = Path(td)
             shared, db_path = self._seed_user(root=root, message="Publish this safely.")
 
-            private_app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
+            private_app = create_app(
+                db_path=db_path, shared_dir=shared, public_mode=False
+            )
             with private_app.test_client() as client:
-                queue_payload = client.get("/api/publish/queue?visibility=all&reviews=1").get_json()
+                queue_payload = client.get(
+                    "/api/publish/queue?visibility=all&reviews=1"
+                ).get_json()
                 review_payload = client.get("/api/publish/review/session-1").get_json()
 
             self.assertEqual(queue_payload["total"], 1)
             self.assertEqual(queue_payload["candidates"][0]["session_id"], "session-1")
             self.assertEqual(queue_payload["candidates"][0]["visibility"], "public")
-            self.assertEqual(queue_payload["candidates"][0]["review_recommendation"], "public")
+            self.assertEqual(
+                queue_payload["candidates"][0]["review_recommendation"], "public"
+            )
             self.assertEqual(review_payload["session_id"], "session-1")
             self.assertEqual(review_payload["recommendation"], "public")
 
-            public_app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
+            public_app = create_app(
+                db_path=db_path, shared_dir=shared, public_mode=True
+            )
             with public_app.test_client() as client:
                 self.assertEqual(client.get("/api/publish/queue").status_code, 404)
-                self.assertEqual(client.get("/api/publish/review/session-1").status_code, 404)
+                self.assertEqual(
+                    client.get("/api/publish/review/session-1").status_code, 404
+                )
 
     def test_unlisted_profiles_are_direct_only_in_public_mode(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1145,8 +1262,12 @@ class WebAppTests(unittest.TestCase):
                 set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
                 conn.commit()
 
-            public_app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
-            private_app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
+            public_app = create_app(
+                db_path=db_path, shared_dir=shared, public_mode=True
+            )
+            private_app = create_app(
+                db_path=db_path, shared_dir=shared, public_mode=False
+            )
 
             with public_app.test_client() as client:
                 self.assertEqual(client.get("/api/sessions").get_json(), [])
@@ -1157,7 +1278,9 @@ class WebAppTests(unittest.TestCase):
 
             with private_app.test_client() as client:
                 self.assertEqual(len(client.get("/api/sessions").get_json()), 1)
-                self.assertEqual(client.get("/api/users/alice/sessions").get_json()["total"], 1)
+                self.assertEqual(
+                    client.get("/api/users/alice/sessions").get_json()["total"], 1
+                )
 
     def test_private_sessions_return_404(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1168,8 +1291,12 @@ class WebAppTests(unittest.TestCase):
                 set_session_visibility(conn, "session-1", "private", shared_dir=shared)
                 conn.commit()
 
-            public_app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
-            private_app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
+            public_app = create_app(
+                db_path=db_path, shared_dir=shared, public_mode=True
+            )
+            private_app = create_app(
+                db_path=db_path, shared_dir=shared, public_mode=False
+            )
 
             with public_app.test_client() as client:
                 self.assertEqual(client.get("/sessions/session-1").status_code, 404)
@@ -1183,8 +1310,15 @@ class WebAppTests(unittest.TestCase):
             with private_app.test_client() as client:
                 self.assertEqual(client.get("/sessions/session-1").status_code, 404)
                 self.assertEqual(client.get("/api/sessions").get_json(), [])
-                self.assertEqual(client.get("/api/users/alice").get_json()["summary"]["total_sessions"], 0)
-                self.assertEqual(client.get("/api/users/alice/sessions").get_json()["total"], 0)
+                self.assertEqual(
+                    client.get("/api/users/alice").get_json()["summary"][
+                        "total_sessions"
+                    ],
+                    0,
+                )
+                self.assertEqual(
+                    client.get("/api/users/alice/sessions").get_json()["total"], 0
+                )
 
     def test_private_mode_session_filter_lists_private_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1221,20 +1355,36 @@ class WebAppTests(unittest.TestCase):
                 )
                 conn.commit()
 
-            public_app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
-            private_app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
+            public_app = create_app(
+                db_path=db_path, shared_dir=shared, public_mode=True
+            )
+            private_app = create_app(
+                db_path=db_path, shared_dir=shared, public_mode=False
+            )
 
             with public_app.test_client() as client:
-                self.assertEqual(client.get("/api/messages-per-day").get_json()["datasets"], [])
-                self.assertEqual(client.get("/api/messages-per-tool").get_json()["datasets"], [])
+                self.assertEqual(
+                    client.get("/api/messages-per-day").get_json()["datasets"], []
+                )
+                self.assertEqual(
+                    client.get("/api/messages-per-tool").get_json()["datasets"], []
+                )
                 self.assertEqual(client.get("/api/top-tools").get_json()["labels"], [])
                 self.assertEqual(client.get("/api/error-rate").get_json()["labels"], [])
 
             with private_app.test_client() as client:
-                self.assertEqual(len(client.get("/api/messages-per-day").get_json()["datasets"]), 1)
-                self.assertEqual(len(client.get("/api/messages-per-tool").get_json()["datasets"]), 1)
-                self.assertEqual(client.get("/api/top-tools").get_json()["labels"], ["Bash"])
-                self.assertEqual(len(client.get("/api/error-rate").get_json()["labels"]), 1)
+                self.assertEqual(
+                    len(client.get("/api/messages-per-day").get_json()["datasets"]), 1
+                )
+                self.assertEqual(
+                    len(client.get("/api/messages-per-tool").get_json()["datasets"]), 1
+                )
+                self.assertEqual(
+                    client.get("/api/top-tools").get_json()["labels"], ["Bash"]
+                )
+                self.assertEqual(
+                    len(client.get("/api/error-rate").get_json()["labels"]), 1
+                )
 
     def test_user_rules_api_is_private_only(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1252,8 +1402,12 @@ class WebAppTests(unittest.TestCase):
                 )
                 conn.commit()
 
-            public_app = create_app(db_path=db_path, shared_dir=shared, public_mode=True)
-            private_app = create_app(db_path=db_path, shared_dir=shared, public_mode=False)
+            public_app = create_app(
+                db_path=db_path, shared_dir=shared, public_mode=True
+            )
+            private_app = create_app(
+                db_path=db_path, shared_dir=shared, public_mode=False
+            )
 
             with public_app.test_client() as client:
                 self.assertEqual(client.get("/api/users/alice/rules").status_code, 404)

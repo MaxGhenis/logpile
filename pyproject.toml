@@ -19,6 +19,12 @@ cloud = [
     "psycopg[binary]>=3.2",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "ruff==0.16.0",
+]
+
 [project.scripts]
 logpile = "logpile.cli:cli"
 agentus = "logpile.cli:cli"
@@ -26,3 +32,13 @@ agentus = "logpile.cli:cli"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["logpile*"]
+
+[tool.ruff.lint]
+ignore = [
+    # Broad `except` is deliberate: sync/parse/serve must survive one
+    # malformed session file or request without aborting the whole run.
+    "BLE001",
+    # DB rows are sqlite3.Row, where `.keys()` is required: `x in row`
+    # tests column values, not names, so the suggested fix changes behavior.
+    "SIM118",
+]

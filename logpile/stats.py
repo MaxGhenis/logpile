@@ -16,7 +16,6 @@ import sqlite3
 from collections import defaultdict
 from datetime import date, datetime
 
-
 BEHAVIORAL_PATTERNS = (
     "subagent",
     "marathon",
@@ -454,8 +453,8 @@ def compute_by_period(
         return []
 
     try:
-        first_dt = datetime.fromisoformat(first_date.replace("Z", "+00:00"))
-        last_dt = datetime.fromisoformat(last_date.replace("Z", "+00:00"))
+        first_dt = datetime.fromisoformat(first_date)
+        last_dt = datetime.fromisoformat(last_date)
     except (ValueError, AttributeError):
         return []
 
@@ -481,7 +480,7 @@ def compute_by_period(
         params,
     ).fetchall()
 
-    today = datetime.now().date()
+    today = datetime.now().date()  # noqa: DTZ005 - local calendar day bounds the partial current month
 
     def _range_date(value: str | None) -> date | None:
         if not value:
@@ -622,7 +621,9 @@ def format_stats(data: dict) -> list[str]:
     if periods:
         lines.append("")
         lines.append("=== By month (event-dated) ===")
-        hdr = f"  {'Month':<10}{'Sessions':>10}{'Input':>16}{'Output':>14}{'Tok/day':>12}"
+        hdr = (
+            f"  {'Month':<10}{'Sessions':>10}{'Input':>16}{'Output':>14}{'Tok/day':>12}"
+        )
         lines.append(hdr)
         for p in periods:
             lines.append(

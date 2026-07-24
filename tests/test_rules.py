@@ -13,8 +13,8 @@ from logpile.db import (
     ensure_user,
     init_db,
     recompute_session_visibility,
-    update_user,
     set_session_visibility,
+    update_user,
 )
 from logpile.sync import sync_sessions
 
@@ -48,11 +48,7 @@ class SessionRuleTests(unittest.TestCase):
         message: str = "hello world",
     ) -> Path:
         session_path = (
-            home
-            / ".claude"
-            / "projects"
-            / "-Users-alice-demo"
-            / f"{session_id}.jsonl"
+            home / ".claude" / "projects" / "-Users-alice-demo" / f"{session_id}.jsonl"
         )
         write_jsonl(
             session_path,
@@ -121,7 +117,9 @@ class SessionRuleTests(unittest.TestCase):
             self.assertIsNotNone(row["visibility_rule_id"])
             self.assertIn("project contains", row["visibility_reason"])
             self._assert_private_archive(row["shared_path"], shared)
-            self.assertFalse((shared / "alice" / "claudecode" / "demo" / "session-1.jsonl").exists())
+            self.assertFalse(
+                (shared / "alice" / "claudecode" / "demo" / "session-1.jsonl").exists()
+            )
 
     def test_fuzzy_rule_applies_during_sync(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -197,7 +195,12 @@ class SessionRuleTests(unittest.TestCase):
             )
 
             with open_sqlite(db_path) as conn:
-                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "no publish review was required"
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
                 conn.commit()
 
             with session_path.open("a", encoding="utf-8") as fh:
@@ -264,7 +267,9 @@ class SessionRuleTests(unittest.TestCase):
                     pattern="demo",
                     visibility="unlisted",
                 )
-                updated = recompute_session_visibility(conn, identifier="alice", shared_dir=shared)
+                updated = recompute_session_visibility(
+                    conn, identifier="alice", shared_dir=shared
+                )
                 conn.commit()
 
                 row = conn.execute(
@@ -307,7 +312,9 @@ class SessionRuleTests(unittest.TestCase):
                     pattern="demo",
                     visibility="private",
                 )
-                updated = recompute_session_visibility(conn, identifier="alice", shared_dir=shared)
+                updated = recompute_session_visibility(
+                    conn, identifier="alice", shared_dir=shared
+                )
                 conn.commit()
                 row = conn.execute(
                     """
@@ -323,7 +330,9 @@ class SessionRuleTests(unittest.TestCase):
             self.assertEqual(row["visibility_source"], "rule")
             self._assert_private_archive(row["shared_path"], shared)
 
-    def test_raw_recompute_rolls_back_storage_when_shared_path_update_fails(self) -> None:
+    def test_raw_recompute_rolls_back_storage_when_shared_path_update_fails(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -433,7 +442,9 @@ class SessionRuleTests(unittest.TestCase):
             self.assertEqual(row["visibility_source"], "rule")
             self._assert_private_archive(row["shared_path"], shared)
 
-    def test_rules_apply_with_unknown_user_exits_without_touching_sessions(self) -> None:
+    def test_rules_apply_with_unknown_user_exits_without_touching_sessions(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -513,7 +524,12 @@ class SessionRuleTests(unittest.TestCase):
                     pattern="demo",
                     visibility="public",
                 )
-                updated = recompute_session_visibility(conn, identifier="alice", shared_dir=shared)
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "kept this session unlisted"
+                ):
+                    updated = recompute_session_visibility(
+                        conn, identifier="alice", shared_dir=shared
+                    )
                 conn.commit()
                 self.assertEqual(updated, 1)
 

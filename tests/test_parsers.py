@@ -1,9 +1,9 @@
-from datetime import datetime, timezone
 import json
 import os
 import tempfile
 import tracemalloc
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -26,7 +26,6 @@ from logpile.parsers import (
     render_codex_transcript,
 )
 from logpile.sync import _annotate_session_paths, _derive_session_activity
-
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -125,7 +124,9 @@ class JsonlLoadingTests(unittest.TestCase):
     def test_loader_discards_partial_records_after_midstream_io_error(self) -> None:
         class FailingReader:
             def __init__(self) -> None:
-                self._lines = iter(['{"type": "user", "message": {"content": "partial"}}\n'])
+                self._lines = iter(
+                    ['{"type": "user", "message": {"content": "partial"}}\n']
+                )
 
             def __enter__(self):
                 return self
@@ -266,9 +267,7 @@ class JsonlLoadingTests(unittest.TestCase):
                 "timestamp": "2026-07-01T10:00:03Z",
                 "payload": {
                     "source": {
-                        "subagent": {
-                            "thread_spawn": {"parent_thread_id": {"bad": 1}}
-                        }
+                        "subagent": {"thread_spawn": {"parent_thread_id": {"bad": 1}}}
                     }
                 },
             },
@@ -423,7 +422,13 @@ class CodexParserTests(unittest.TestCase):
                     "type": "function_call",
                     "name": "exec_command",
                     "arguments": json.dumps(
-                        {"command": ["bash", "-lc", "python scripts/fix.py src/parser.py"]}
+                        {
+                            "command": [
+                                "bash",
+                                "-lc",
+                                "python scripts/fix.py src/parser.py",
+                            ]
+                        }
                     ),
                     "call_id": "call-1",
                 },
@@ -486,7 +491,9 @@ class CodexParserTests(unittest.TestCase):
             self.assertEqual(info.cached_input_tokens, 300)
             self.assertEqual(info.first_user_message, "Fix the parser")
             self.assertEqual(info.model, "gpt-5.4")
-            self.assertEqual(info.tool_calls[0].command, "python scripts/fix.py src/parser.py")
+            self.assertEqual(
+                info.tool_calls[0].command, "python scripts/fix.py src/parser.py"
+            )
             self.assertTrue(info.tool_calls[0].is_error)
             self.assertEqual(info.workspace_root, "/tmp/project")
             self.assertEqual(
@@ -495,13 +502,16 @@ class CodexParserTests(unittest.TestCase):
             )
 
             turns = render_codex_transcript(path)
-            self.assertEqual([turn["type"] for turn in turns], [
-                "user",
-                "assistant",
-                "tool_use",
-                "tool_result",
-                "thinking",
-            ])
+            self.assertEqual(
+                [turn["type"] for turn in turns],
+                [
+                    "user",
+                    "assistant",
+                    "tool_use",
+                    "tool_result",
+                    "thinking",
+                ],
+            )
             self.assertEqual(turns[0]["content"], "Fix the parser")
             self.assertEqual(
                 turns[2]["input"]["command"],
@@ -514,7 +524,11 @@ class CodexParserTests(unittest.TestCase):
             {
                 "timestamp": "2026-04-10T10:00:00Z",
                 "type": "session_meta",
-                "payload": {"id": "sess-token", "timestamp": "2026-04-10T10:00:00Z", "cwd": "/tmp/project"},
+                "payload": {
+                    "id": "sess-token",
+                    "timestamp": "2026-04-10T10:00:00Z",
+                    "cwd": "/tmp/project",
+                },
             },
             {
                 "timestamp": "2026-04-10T10:00:01Z",
@@ -755,7 +769,7 @@ class CodexParserTests(unittest.TestCase):
                 "payload": {
                     "type": "message",
                     "role": "user",
-                            "content": [{"type": "input_text", "text": "# logpile:private"}],
+                    "content": [{"type": "input_text", "text": "# logpile:private"}],
                 },
             },
         ]
@@ -820,38 +834,52 @@ class CodexParserTests(unittest.TestCase):
             path = root / "high-cardinality.jsonl"
             with path.open("w", encoding="utf-8") as handle:
                 for index in range(count):
-                    handle.write(json.dumps({
-                        "type": "assistant",
-                        "timestamp": "2026-07-11T12:00:00Z",
-                        "requestId": f"req-{index}",
-                        "message": {
-                            "id": f"msg-{index}",
-                            "model": "claude-test",
-                            "usage": {
-                                "input_tokens": 1,
-                                "output_tokens": index + 1,
-                            },
-                            "content": [{
-                                "type": "tool_use",
-                                "id": f"tool-{index}",
-                                "name": "Bash",
-                                "input": {
-                                    "command": f"cat src/row-{index}.py",
-                                    "file_path": f"src/row-{index}.py",
+                    handle.write(
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "timestamp": "2026-07-11T12:00:00Z",
+                                "requestId": f"req-{index}",
+                                "message": {
+                                    "id": f"msg-{index}",
+                                    "model": "claude-test",
+                                    "usage": {
+                                        "input_tokens": 1,
+                                        "output_tokens": index + 1,
+                                    },
+                                    "content": [
+                                        {
+                                            "type": "tool_use",
+                                            "id": f"tool-{index}",
+                                            "name": "Bash",
+                                            "input": {
+                                                "command": f"cat src/row-{index}.py",
+                                                "file_path": f"src/row-{index}.py",
+                                            },
+                                        }
+                                    ],
                                 },
-                            }],
-                        },
-                    }))
+                            }
+                        )
+                    )
                     handle.write("\n")
-                    handle.write(json.dumps({
-                        "type": "user",
-                        "timestamp": "2026-07-11T12:00:01Z",
-                        "message": {"content": [{
-                            "type": "tool_result",
-                            "tool_use_id": f"tool-{index}",
-                            "is_error": index % 7 == 0,
-                        }]},
-                    }))
+                    handle.write(
+                        json.dumps(
+                            {
+                                "type": "user",
+                                "timestamp": "2026-07-11T12:00:01Z",
+                                "message": {
+                                    "content": [
+                                        {
+                                            "type": "tool_result",
+                                            "tool_use_id": f"tool-{index}",
+                                            "is_error": index % 7 == 0,
+                                        }
+                                    ]
+                                },
+                            }
+                        )
+                    )
                     handle.write("\n")
 
             tracemalloc.start()
@@ -902,11 +930,15 @@ class CodexParserTests(unittest.TestCase):
                         count,
                     )
                     self.assertEqual(
-                        conn.execute("SELECT COUNT(*) FROM message_claims").fetchone()[0],
+                        conn.execute("SELECT COUNT(*) FROM message_claims").fetchone()[
+                            0
+                        ],
                         count,
                     )
                     self.assertEqual(
-                        conn.execute("SELECT COUNT(*) FROM session_paths").fetchone()[0],
+                        conn.execute("SELECT COUNT(*) FROM session_paths").fetchone()[
+                            0
+                        ],
                         count * 2,
                     )
                     self.assertEqual(
@@ -927,44 +959,62 @@ class CodexParserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "codex-high-cardinality.jsonl"
             with path.open("w", encoding="utf-8") as handle:
-                handle.write(json.dumps({
-                    "type": "session_meta",
-                    "timestamp": "2026-07-11T12:00:00Z",
-                    "payload": {
-                        "id": "codex-high-cardinality",
-                        "cwd": "/tmp/project",
-                    },
-                }))
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "timestamp": "2026-07-11T12:00:00Z",
+                            "payload": {
+                                "id": "codex-high-cardinality",
+                                "cwd": "/tmp/project",
+                            },
+                        }
+                    )
+                )
                 handle.write("\n")
                 for index in range(count):
-                    handle.write(json.dumps({
-                        "type": "response_item",
-                        "timestamp": "2026-07-11T12:00:01Z",
-                        "payload": {
-                            "type": "function_call",
-                            "name": "exec_command",
-                            "call_id": f"call-{index}",
-                            "arguments": json.dumps({
-                                "cmd": f"cat src/codex-{index}.py",
-                                "file_path": f"src/codex-{index}.py",
-                            }),
-                        },
-                    }))
-                    handle.write("\n")
-                    handle.write(json.dumps({
-                        "type": "response_item",
-                        "timestamp": "2026-07-11T12:00:02Z",
-                        "payload": {
-                            "type": "function_call_output",
-                            "call_id": f"call-{index}",
-                            "output": json.dumps({
-                                "output": "",
-                                "metadata": {
-                                    "exit_code": 1 if index % 11 == 0 else 0,
+                    handle.write(
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "timestamp": "2026-07-11T12:00:01Z",
+                                "payload": {
+                                    "type": "function_call",
+                                    "name": "exec_command",
+                                    "call_id": f"call-{index}",
+                                    "arguments": json.dumps(
+                                        {
+                                            "cmd": f"cat src/codex-{index}.py",
+                                            "file_path": f"src/codex-{index}.py",
+                                        }
+                                    ),
                                 },
-                            }),
-                        },
-                    }))
+                            }
+                        )
+                    )
+                    handle.write("\n")
+                    handle.write(
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "timestamp": "2026-07-11T12:00:02Z",
+                                "payload": {
+                                    "type": "function_call_output",
+                                    "call_id": f"call-{index}",
+                                    "output": json.dumps(
+                                        {
+                                            "output": "",
+                                            "metadata": {
+                                                "exit_code": 1
+                                                if index % 11 == 0
+                                                else 0,
+                                            },
+                                        }
+                                    ),
+                                },
+                            }
+                        )
+                    )
                     handle.write("\n")
 
             tracemalloc.start()
@@ -1038,7 +1088,10 @@ class CodexParserTests(unittest.TestCase):
             self.assertFalse(info.tool_calls[0].is_error)
             self.assertFalse(info.tool_calls[1].is_error)
             self.assertEqual(
-                sorted((row.display_path, row.source, row.operation) for row in info.session_paths),
+                sorted(
+                    (row.display_path, row.source, row.operation)
+                    for row in info.session_paths
+                ),
                 [
                     ("src/app.py", "command", "search"),
                     ("src/app.py", "tool_input", "write"),
@@ -1224,9 +1277,7 @@ class CodexReplayAccountingTests(unittest.TestCase):
         return info
 
     def test_duplicate_snapshot_uses_leaf_metadata_and_live_deltas(self) -> None:
-        info = self._parse_fixture(
-            "rollout-2026-06-08T11-39-04-leaf-thread.jsonl"
-        )
+        info = self._parse_fixture("rollout-2026-06-08T11-39-04-leaf-thread.jsonl")
 
         # The filename stem is canonical; raw graph identity and immediate
         # lineage come only from the first leaf meta, never the copied parent.
@@ -1279,16 +1330,14 @@ class CodexReplayAccountingTests(unittest.TestCase):
     def test_nonmatching_second_meta_is_not_copied_prefix_evidence(self) -> None:
         leaf = _codex_meta("2026-06-08T11:39:04.000Z", "leaf-thread")
         leaf["payload"]["forked_from_id"] = "expected-parent"
-        info = self._parse([
-            leaf,
-            _codex_meta("2026-06-08T11:39:04.001Z", "other-thread"),
-            _codex_token_count(
-                "2026-06-08T11:39:04.200Z", 1_000, 600, 50, 10
-            ),
-            _codex_token_count(
-                "2026-06-08T11:39:04.900Z", 2_000, 1_400, 90, 20
-            ),
-        ])
+        info = self._parse(
+            [
+                leaf,
+                _codex_meta("2026-06-08T11:39:04.001Z", "other-thread"),
+                _codex_token_count("2026-06-08T11:39:04.200Z", 1_000, 600, 50, 10),
+                _codex_token_count("2026-06-08T11:39:04.900Z", 2_000, 1_400, 90, 20),
+            ]
+        )
 
         self.assertEqual(info.total_input_tokens, 2_000)
         self.assertEqual(info.total_output_tokens, 90)
@@ -1309,34 +1358,26 @@ class CodexReplayAccountingTests(unittest.TestCase):
         leaf["payload"]["forked_from_id"] = "parent-thread"
         parent = _codex_meta("2026-06-08T12:00:00.001Z", "parent-thread")
         live_timestamp = "2026-06-08T12:00:10.000Z"
-        live_started_at = int(
-            datetime.fromisoformat(live_timestamp.replace("Z", "+00:00")).timestamp()
-        )
-        info = self._parse([
-            leaf,
-            parent,
-            _codex_token_count(
-                "2026-06-08T12:00:00.100Z", 5_000, 4_000, 500, 100
-            ),
-            _codex_token_count(
-                "2026-06-08T12:00:00.200Z", 0, 0, 0, 0
-            ),
-            _codex_token_count(
-                "2026-06-08T12:00:00.300Z", 1_000, 800, 100, 20
-            ),
-            {
-                "timestamp": live_timestamp,
-                "type": "event_msg",
-                "payload": {
-                    "type": "task_started",
-                    "turn_id": "live-turn",
-                    "started_at": live_started_at,
+        live_started_at = int(datetime.fromisoformat(live_timestamp).timestamp())
+        info = self._parse(
+            [
+                leaf,
+                parent,
+                _codex_token_count("2026-06-08T12:00:00.100Z", 5_000, 4_000, 500, 100),
+                _codex_token_count("2026-06-08T12:00:00.200Z", 0, 0, 0, 0),
+                _codex_token_count("2026-06-08T12:00:00.300Z", 1_000, 800, 100, 20),
+                {
+                    "timestamp": live_timestamp,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_started",
+                        "turn_id": "live-turn",
+                        "started_at": live_started_at,
+                    },
                 },
-            },
-            _codex_token_count(
-                "2026-06-08T12:01:00.000Z", 1_200, 900, 130, 30
-            ),
-        ])
+                _codex_token_count("2026-06-08T12:01:00.000Z", 1_200, 900, 130, 30),
+            ]
+        )
 
         self.assertEqual(info.total_input_tokens, 200)
         self.assertEqual(info.fresh_input_tokens, 100)
@@ -1346,59 +1387,69 @@ class CodexReplayAccountingTests(unittest.TestCase):
         assert_daily_matches_session(self, info)
 
     def test_small_all_component_wobble_does_not_start_an_epoch(self) -> None:
-        info = self._parse([
-            _codex_meta("2026-05-01T00:00:00.000Z"),
-            _codex_token_count(
-                "2026-05-01T01:00:00.000Z", 1_000, 800, 100, 40
-            ),
-            _codex_token_count(
-                "2026-05-01T02:00:00.000Z", 999, 799, 99, 39
-            ),
-            _codex_token_count(
-                "2026-05-01T03:00:00.000Z", 1_100, 900, 120, 50
-            ),
-        ])
+        info = self._parse(
+            [
+                _codex_meta("2026-05-01T00:00:00.000Z"),
+                _codex_token_count("2026-05-01T01:00:00.000Z", 1_000, 800, 100, 40),
+                _codex_token_count("2026-05-01T02:00:00.000Z", 999, 799, 99, 39),
+                _codex_token_count("2026-05-01T03:00:00.000Z", 1_100, 900, 120, 50),
+            ]
+        )
         self.assertEqual(info.total_input_tokens, 1_100)
         self.assertEqual(info.cached_input_tokens, 900)
         self.assertEqual(info.total_output_tokens, 120)
         self.assertEqual(info.reasoning_output_tokens, 50)
 
     def test_rate_limit_only_token_event_is_not_a_counter_reset(self) -> None:
-        info = self._parse([
-            _codex_meta("2026-05-01T00:00:00.000Z"),
-            _codex_token_count(
-                "2026-05-01T01:00:00.000Z", 1_000, 800, 100, 40
-            ),
-            {
-                "timestamp": "2026-05-01T02:00:00.000Z",
-                "type": "event_msg",
-                "payload": {"type": "token_count", "rate_limits": {}},
-            },
-            _codex_token_count(
-                "2026-05-01T03:00:00.000Z", 1_100, 900, 120, 50
-            ),
-        ])
+        info = self._parse(
+            [
+                _codex_meta("2026-05-01T00:00:00.000Z"),
+                _codex_token_count("2026-05-01T01:00:00.000Z", 1_000, 800, 100, 40),
+                {
+                    "timestamp": "2026-05-01T02:00:00.000Z",
+                    "type": "event_msg",
+                    "payload": {"type": "token_count", "rate_limits": {}},
+                },
+                _codex_token_count("2026-05-01T03:00:00.000Z", 1_100, 900, 120, 50),
+            ]
+        )
         self.assertEqual(info.total_input_tokens, 1_100)
         self.assertEqual(info.cached_input_tokens, 900)
         self.assertEqual(info.total_output_tokens, 120)
         self.assertEqual(info.reasoning_output_tokens, 50)
 
     def test_reasoning_tokens_accumulate_as_deltas(self) -> None:
-        info = self._parse([
-            _codex_meta("2026-05-01T00:00:00.000Z"),
-            _codex_token_count("2026-05-01T01:00:00.000Z", 1_000, 0, 100, reasoning_output_tokens=40),
-            _codex_token_count("2026-05-01T02:00:00.000Z", 2_000, 0, 300, reasoning_output_tokens=90),
-        ])
+        info = self._parse(
+            [
+                _codex_meta("2026-05-01T00:00:00.000Z"),
+                _codex_token_count(
+                    "2026-05-01T01:00:00.000Z",
+                    1_000,
+                    0,
+                    100,
+                    reasoning_output_tokens=40,
+                ),
+                _codex_token_count(
+                    "2026-05-01T02:00:00.000Z",
+                    2_000,
+                    0,
+                    300,
+                    reasoning_output_tokens=90,
+                ),
+            ]
+        )
         self.assertEqual(info.reasoning_output_tokens, 90)
         self.assertEqual(info.total_output_tokens, 300)
 
     def test_daily_usage_buckets_by_event_day(self) -> None:
-        info = self._parse([
-            _codex_meta("2026-06-30T23:00:00.000Z"),
-            _codex_user_message("2026-06-30T23:00:30.000Z", "Cross-midnight task"),
-            _codex_token_count("2026-06-30T23:01:00.000Z", 1_000, 600, 50),
-            _codex_token_count("2026-07-01T01:00:00.000Z", 3_000, 2_400, 120),
-        ])
+        info = self._parse(
+            [
+                _codex_meta("2026-06-30T23:00:00.000Z"),
+                _codex_user_message("2026-06-30T23:00:30.000Z", "Cross-midnight task"),
+                _codex_token_count("2026-06-30T23:01:00.000Z", 1_000, 600, 50),
+                _codex_token_count("2026-07-01T01:00:00.000Z", 3_000, 2_400, 120),
+            ]
+        )
         days = {d.day: d for d in info.daily_usage}
         self.assertEqual(sorted(days), ["2026-06-30", "2026-07-01"])
         june = days["2026-06-30"]
@@ -1496,24 +1547,30 @@ class ClaudeCacheCreationTests(unittest.TestCase):
         }
 
     def test_cache_creation_with_breakdown(self) -> None:
-        info = self._parse([
-            {
-                "timestamp": "2026-07-02T10:00:00Z",
-                "type": "user",
-                "cwd": "/tmp/demo",
-                "message": {"content": "hello"},
-            },
-            self._assistant("2026-07-02T10:00:05Z", "msg-1", {
-                "input_tokens": 10,
-                "cache_creation_input_tokens": 9_000,
-                "cache_creation": {
-                    "ephemeral_5m_input_tokens": 1_000,
-                    "ephemeral_1h_input_tokens": 8_000,
+        info = self._parse(
+            [
+                {
+                    "timestamp": "2026-07-02T10:00:00Z",
+                    "type": "user",
+                    "cwd": "/tmp/demo",
+                    "message": {"content": "hello"},
                 },
-                "cache_read_input_tokens": 20_000,
-                "output_tokens": 50,
-            }),
-        ])
+                self._assistant(
+                    "2026-07-02T10:00:05Z",
+                    "msg-1",
+                    {
+                        "input_tokens": 10,
+                        "cache_creation_input_tokens": 9_000,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 1_000,
+                            "ephemeral_1h_input_tokens": 8_000,
+                        },
+                        "cache_read_input_tokens": 20_000,
+                        "output_tokens": 50,
+                    },
+                ),
+            ]
+        )
         self.assertEqual(info.cache_creation_input_tokens, 9_000)
         self.assertEqual(info.cache_creation_5m_input_tokens, 1_000)
         self.assertEqual(info.cache_creation_1h_input_tokens, 8_000)
@@ -1524,14 +1581,20 @@ class ClaudeCacheCreationTests(unittest.TestCase):
         self.assertEqual(info.total_input_tokens, 10 + 9_000 + 20_000)
 
     def test_cache_creation_without_breakdown_is_explicitly_unknown(self) -> None:
-        info = self._parse([
-            self._assistant("2026-07-02T10:00:05Z", "msg-1", {
-                "input_tokens": 100,
-                "cache_creation_input_tokens": 5_000,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 300,
-            }),
-        ])
+        info = self._parse(
+            [
+                self._assistant(
+                    "2026-07-02T10:00:05Z",
+                    "msg-1",
+                    {
+                        "input_tokens": 100,
+                        "cache_creation_input_tokens": 5_000,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 300,
+                    },
+                ),
+            ]
+        )
         self.assertEqual(info.cache_creation_input_tokens, 5_000)
         self.assertEqual(info.cache_creation_5m_input_tokens, 0)
         self.assertEqual(info.cache_creation_1h_input_tokens, 0)
@@ -1567,25 +1630,35 @@ class ClaudeCacheCreationTests(unittest.TestCase):
         assert_daily_matches_session(self, info)
 
     def test_daily_usage_buckets_by_event_day(self) -> None:
-        info = self._parse([
-            {
-                "timestamp": "2026-04-30T23:00:00Z",
-                "type": "user",
-                "cwd": "/tmp/demo",
-                "message": {"content": "start of a long session"},
-            },
-            self._assistant("2026-04-30T23:10:00Z", "msg-1", {
-                "input_tokens": 100,
-                "cache_read_input_tokens": 400,
-                "output_tokens": 40,
-            }),
-            self._assistant("2026-05-02T08:00:00Z", "msg-2", {
-                "input_tokens": 200,
-                "cache_creation_input_tokens": 1_000,
-                "cache_read_input_tokens": 800,
-                "output_tokens": 60,
-            }),
-        ])
+        info = self._parse(
+            [
+                {
+                    "timestamp": "2026-04-30T23:00:00Z",
+                    "type": "user",
+                    "cwd": "/tmp/demo",
+                    "message": {"content": "start of a long session"},
+                },
+                self._assistant(
+                    "2026-04-30T23:10:00Z",
+                    "msg-1",
+                    {
+                        "input_tokens": 100,
+                        "cache_read_input_tokens": 400,
+                        "output_tokens": 40,
+                    },
+                ),
+                self._assistant(
+                    "2026-05-02T08:00:00Z",
+                    "msg-2",
+                    {
+                        "input_tokens": 200,
+                        "cache_creation_input_tokens": 1_000,
+                        "cache_read_input_tokens": 800,
+                        "output_tokens": 60,
+                    },
+                ),
+            ]
+        )
         days = {d.day: d for d in info.daily_usage}
         self.assertEqual(sorted(days), ["2026-04-30", "2026-05-02"])
         self.assertEqual(days["2026-04-30"].total_input_tokens, 500)
@@ -1599,18 +1672,28 @@ class ClaudeCacheCreationTests(unittest.TestCase):
         )
 
     def test_deduplicated_retries_keep_highest_output_copy(self) -> None:
-        info = self._parse([
-            self._assistant("2026-07-02T10:00:05Z", "msg-1", {
-                "input_tokens": 100,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 5,
-            }),
-            self._assistant("2026-07-02T10:00:09Z", "msg-1", {
-                "input_tokens": 100,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 80,
-            }),
-        ])
+        info = self._parse(
+            [
+                self._assistant(
+                    "2026-07-02T10:00:05Z",
+                    "msg-1",
+                    {
+                        "input_tokens": 100,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 5,
+                    },
+                ),
+                self._assistant(
+                    "2026-07-02T10:00:09Z",
+                    "msg-1",
+                    {
+                        "input_tokens": 100,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 80,
+                    },
+                ),
+            ]
+        )
         self.assertEqual(info.assistant_message_count, 1)
         self.assertEqual(info.total_output_tokens, 80)
         self.assertEqual(len(info.daily_usage), 1)
@@ -1619,9 +1702,7 @@ class ClaudeCacheCreationTests(unittest.TestCase):
 
 class DailyResidualUsageTests(unittest.TestCase):
     def test_untimestamped_usage_uses_first_valid_event_day(self) -> None:
-        info = parse_claudecode_session(
-            FIXTURES / "claudecode" / "residual-day.jsonl"
-        )
+        info = parse_claudecode_session(FIXTURES / "claudecode" / "residual-day.jsonl")
         self.assertIsNotNone(info)
         assert info is not None
 
@@ -1660,7 +1741,7 @@ class DailyResidualUsageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "mtime-session.jsonl"
             write_jsonl(path, records)
-            mtime = datetime(2026, 1, 2, 12, tzinfo=timezone.utc).timestamp()
+            mtime = datetime(2026, 1, 2, 12, tzinfo=UTC).timestamp()
             os.utime(path, (mtime, mtime))
             info = parse_claudecode_session(path)
 

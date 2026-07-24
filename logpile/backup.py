@@ -1,4 +1,5 @@
 """Cloud backup and exact raw-text indexing for Logpile."""
+
 from __future__ import annotations
 
 import hashlib
@@ -8,10 +9,10 @@ import os
 import re
 import sqlite3
 import tempfile
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Iterator
 
 from .discovery import (
     DiscoveredTranscript,
@@ -19,7 +20,6 @@ from .discovery import (
     transcript_roots,
 )
 from .parsers import _extract_text, _normalize_codex_record
-
 
 MAX_TEXT_CHARS = 12_000
 CHUNK_OVERLAP_CHARS = 400
@@ -135,7 +135,9 @@ class BackupPlan:
     def source_bytes(self) -> dict[str, int]:
         totals: dict[str, int] = {}
         for candidate in self.candidates:
-            totals[candidate.source] = totals.get(candidate.source, 0) + candidate.size_bytes
+            totals[candidate.source] = (
+                totals.get(candidate.source, 0) + candidate.size_bytes
+            )
         return totals
 
 
@@ -213,7 +215,9 @@ def verify_sqlite_snapshot(path: Path) -> None:
         with sqlite3.connect(_sqlite_readonly_uri(path), uri=True) as conn:
             results = [str(row[0]) for row in conn.execute("PRAGMA quick_check")]
     except (OSError, sqlite3.Error) as exc:
-        raise RuntimeError(f"SQLite snapshot verification failed for {path}: {exc}") from exc
+        raise RuntimeError(
+            f"SQLite snapshot verification failed for {path}: {exc}"
+        ) from exc
     if results != ["ok"]:
         detail = "; ".join(results) if results else "quick_check returned no result"
         raise RuntimeError(f"SQLite snapshot verification failed for {path}: {detail}")
@@ -231,7 +235,9 @@ def create_sqlite_snapshot(source: Path, destination: Path) -> Path:
     if not source.is_file():
         raise RuntimeError(f"SQLite database not found: {source}")
     if source.resolve() == destination.resolve():
-        raise RuntimeError("SQLite backup destination must differ from the source database.")
+        raise RuntimeError(
+            "SQLite backup destination must differ from the source database."
+        )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
@@ -246,15 +252,19 @@ def create_sqlite_snapshot(source: Path, destination: Path) -> Path:
     temp_path.unlink()
     try:
         try:
-            with _private_umask():
-                with sqlite3.connect(
+            with (
+                _private_umask(),
+                sqlite3.connect(
                     _sqlite_readonly_uri(source),
                     uri=True,
                     timeout=30,
-                ) as conn:
-                    conn.execute("VACUUM INTO ?", (str(temp_path),))
+                ) as conn,
+            ):
+                conn.execute("VACUUM INTO ?", (str(temp_path),))
         except sqlite3.Error as exc:
-            raise RuntimeError(f"Could not snapshot SQLite database {source}: {exc}") from exc
+            raise RuntimeError(
+                f"Could not snapshot SQLite database {source}: {exc}"
+            ) from exc
 
         os.chmod(temp_path, 0o600)
         verify_sqlite_snapshot(temp_path)
@@ -329,13 +339,21 @@ def _raw_suffix(path: Path) -> str:
 
 def object_key_for(sha256: str, path: Path) -> str:
     suffix = _raw_suffix(path)
-    if suffix not in {".jsonl", ".json", ".sqlite", ".wal", ".shm", ".sqlite-wal", ".sqlite-shm"}:
+    if suffix not in {
+        ".jsonl",
+        ".json",
+        ".sqlite",
+        ".wal",
+        ".shm",
+        ".sqlite-wal",
+        ".sqlite-shm",
+    }:
         suffix = ".bin"
     return f"raw/sha256/{sha256[:2]}/{sha256}{suffix}"
 
 
 def file_id_for(relative_path: str, sha256: str) -> str:
-    return hashlib.sha256(f"{relative_path}\0{sha256}".encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{relative_path}\0{sha256}".encode()).hexdigest()
 
 
 def build_candidate(
@@ -580,7 +598,9 @@ def _fragment_from_content(
             text = _normalize_text(_extract_text(payload) or _json_dumps(payload))
         else:
             text = _normalize_text(_json_dumps(payload))
-        return [TextFragment(record_type, "tool_result", tool_name, text)] if text else []
+        return (
+            [TextFragment(record_type, "tool_result", tool_name, text)] if text else []
+        )
 
     if "text" in content:
         text = _normalize_text(str(content.get("text") or ""))
@@ -599,7 +619,9 @@ def _fragment_from_content(
     return [TextFragment(record_type, role, tool_name, text)] if text else []
 
 
-def _record_session_id(record: dict, record_type: str | None, payload: dict | None) -> str | None:
+def _record_session_id(
+    record: dict, record_type: str | None, payload: dict | None
+) -> str | None:
     for container in (payload, record):
         if not isinstance(container, dict):
             continue
@@ -607,7 +629,11 @@ def _record_session_id(record: dict, record_type: str | None, payload: dict | No
             value = container.get(key)
             if value:
                 return str(value)
-    if record_type == "session_meta" and isinstance(payload, dict) and payload.get("id"):
+    if (
+        record_type == "session_meta"
+        and isinstance(payload, dict)
+        and payload.get("id")
+    ):
         return str(payload["id"])
     return None
 
@@ -631,7 +657,9 @@ def _codex_fragments(record: dict) -> tuple[list[TextFragment], str | None, str 
     if record_type == "function_call" and isinstance(payload, dict):
         arguments = payload.get("arguments")
         text = arguments if isinstance(arguments, str) else _json_dumps(arguments or {})
-        fragment = TextFragment(record_type, "tool_use", payload.get("name"), _normalize_text(text))
+        fragment = TextFragment(
+            record_type, "tool_use", payload.get("name"), _normalize_text(text)
+        )
         return ([fragment] if fragment.content else []), timestamp, session_id
 
     if record_type == "function_call_output" and isinstance(payload, dict):
@@ -654,20 +682,26 @@ def _codex_fragments(record: dict) -> tuple[list[TextFragment], str | None, str 
     if record_type == "event_msg" and isinstance(payload, dict):
         if payload.get("type") == "token_count":
             return [], timestamp, session_id
-        text = _extract_text(payload.get("message") or payload.get("content") or payload.get("text"))
+        text = _extract_text(
+            payload.get("message") or payload.get("content") or payload.get("text")
+        )
         fragment = TextFragment(record_type, "event", None, _normalize_text(text))
         return ([fragment] if fragment.content else []), timestamp, session_id
 
     return [], timestamp, session_id
 
 
-def _claude_fragments(record: dict) -> tuple[list[TextFragment], str | None, str | None]:
+def _claude_fragments(
+    record: dict,
+) -> tuple[list[TextFragment], str | None, str | None]:
     record_type = record.get("type")
     timestamp = record.get("timestamp")
     session_id = _record_session_id(record, record_type, record.get("message"))
 
     if record_type in {"user", "assistant", "system"}:
-        message = record.get("message") if isinstance(record.get("message"), dict) else record
+        message = (
+            record.get("message") if isinstance(record.get("message"), dict) else record
+        )
         role = message.get("role") or record_type
         content = message.get("content") or record.get("content")
         return (
@@ -679,13 +713,17 @@ def _claude_fragments(record: dict) -> tuple[list[TextFragment], str | None, str
     return [], timestamp, session_id
 
 
-def _generic_fragments(record: dict) -> tuple[list[TextFragment], str | None, str | None]:
+def _generic_fragments(
+    record: dict,
+) -> tuple[list[TextFragment], str | None, str | None]:
     record_type = record.get("type")
     timestamp = record.get("timestamp")
     session_id = _record_session_id(record, record_type, record)
     content = record.get("message") or record.get("content") or record.get("text")
     return (
-        _fragment_from_content(content, record_type=record_type, role=record.get("role")),
+        _fragment_from_content(
+            content, record_type=record_type, role=record.get("role")
+        ),
         timestamp,
         session_id,
     )
@@ -1048,7 +1086,9 @@ class SupabaseArchive:
         *,
         batch_size: int = 1000,
     ) -> int:
-        conn.execute("DELETE FROM logpile_raw_chunks WHERE file_id = %s", (candidate.file_id,))
+        conn.execute(
+            "DELETE FROM logpile_raw_chunks WHERE file_id = %s", (candidate.file_id,)
+        )
         inserted = 0
         batch: list[tuple] = []
         sql = """
@@ -1204,7 +1244,7 @@ class SupabaseArchive:
                     o.content_type
                 FROM logpile_raw_files f
                 JOIN logpile_raw_objects o ON o.sha256 = f.sha256
-                WHERE {' AND '.join(clauses)}
+                WHERE {" AND ".join(clauses)}
                 ORDER BY f.discovered_at, f.relative_path
                 {limit_sql}
                 """,
@@ -1334,7 +1374,12 @@ def push_backup(
             include_codex_db=include_codex_db,
             limit=limit,
         )
-        return {"plan": plan_to_dict(plan), "uploaded": 0, "indexed_chunks": 0, "dry_run": True}
+        return {
+            "plan": plan_to_dict(plan),
+            "uploaded": 0,
+            "indexed_chunks": 0,
+            "dry_run": True,
+        }
 
     store = S3ObjectStore(storage_config)
     archive = SupabaseArchive(db_url)
@@ -1497,7 +1542,10 @@ def index_cloud_backup(
     skipped = 0
 
     for row in rows:
-        suffix = _raw_suffix(Path(row["source_path"] or row["filename"] or "raw.jsonl")) or ".jsonl"
+        suffix = (
+            _raw_suffix(Path(row["source_path"] or row["filename"] or "raw.jsonl"))
+            or ".jsonl"
+        )
         fd, temp_name = tempfile.mkstemp(prefix="logpile-r2-index-", suffix=suffix)
         os.close(fd)
         temp_path = Path(temp_name)
@@ -1573,7 +1621,9 @@ def index_r2_objects(
         os.close(fd)
         temp_path = Path(temp_name)
         try:
-            store.client.download_file(storage_config.bucket, object_key, str(temp_path))
+            store.client.download_file(
+                storage_config.bucket, object_key, str(temp_path)
+            )
             actual_size = temp_path.stat().st_size
             expected_size = int(obj.get("Size") or 0)
             if actual_size != expected_size or sha256_file(temp_path) != sha256:

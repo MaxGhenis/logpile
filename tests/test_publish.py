@@ -13,14 +13,14 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from logpile.cli import cli
 import logpile.db as db_module
 import logpile.publish as publish_module
+from logpile.cli import cli
 from logpile.db import ensure_user, init_db, set_session_visibility, update_user
 from logpile.publish import (
     preserve_reviewed_artifact,
-    review_staging_dir,
     review_publish_session,
+    review_staging_dir,
     serialize_publish_review,
 )
 from logpile.sync import sync_sessions
@@ -49,11 +49,7 @@ class PublishTests(unittest.TestCase):
         body: str = "hello world",
     ) -> Path:
         session_path = (
-            home
-            / ".claude"
-            / "projects"
-            / "-Users-alice-demo"
-            / f"{session_id}.jsonl"
+            home / ".claude" / "projects" / "-Users-alice-demo" / f"{session_id}.jsonl"
         )
         write_jsonl(
             session_path,
@@ -130,9 +126,13 @@ class PublishTests(unittest.TestCase):
             self._prepare_db(db_path)
 
             def jwt_part(value: dict) -> str:
-                return base64.urlsafe_b64encode(
-                    json.dumps(value, separators=(",", ":")).encode()
-                ).decode().rstrip("=")
+                return (
+                    base64.urlsafe_b64encode(
+                        json.dumps(value, separators=(",", ":")).encode()
+                    )
+                    .decode()
+                    .rstrip("=")
+                )
 
             jwt = (
                 f"{jwt_part({'alg': 'HS256', 'typ': 'JWT'})}."
@@ -161,11 +161,7 @@ class PublishTests(unittest.TestCase):
             entropy_token = "Q7mK2vN9xR4pL8sT1wY6aB3cD5eF0hJ2"
             pem_payload = "MIIE" + "A" * 92
             pem_end = "-----END PRIVATE KEY-----"
-            pem_block = (
-                "-----BEGIN PRIVATE KEY-----\n"
-                f"{pem_payload}\n"
-                f"{pem_end}"
-            )
+            pem_block = f"-----BEGIN PRIVATE KEY-----\n{pem_payload}\n{pem_end}"
             prefix = "ordinary context " * 40
             body = " | ".join(
                 (
@@ -244,9 +240,15 @@ class PublishTests(unittest.TestCase):
             ]
             self.assertEqual(len(slack_findings), 2)
             self.assertEqual({finding.match_count for finding in slack_findings}, {2})
-            self.assertEqual({finding.match_index for finding in slack_findings}, {1, 2})
-            self.assertGreater(min(finding.match_start or 0 for finding in slack_findings), 500)
-            self.assertTrue(all("[MASKED]" in finding.evidence for finding in review.findings))
+            self.assertEqual(
+                {finding.match_index for finding in slack_findings}, {1, 2}
+            )
+            self.assertGreater(
+                min(finding.match_start or 0 for finding in slack_findings), 500
+            )
+            self.assertTrue(
+                all("[MASKED]" in finding.evidence for finding in review.findings)
+            )
             self.assertTrue(
                 any(finding.source == "metadata.bio" for finding in review.findings)
             )
@@ -389,10 +391,13 @@ class PublishTests(unittest.TestCase):
             self._write_session(home, body="Clean staged review.")
             sync_sessions(shared, db_path, "alice", "machine-1", home)
 
-            with open_sqlite(db_path) as conn, mock.patch.object(
-                Path,
-                "read_bytes",
-                side_effect=AssertionError("whole-file read used"),
+            with (
+                open_sqlite(db_path) as conn,
+                mock.patch.object(
+                    Path,
+                    "read_bytes",
+                    side_effect=AssertionError("whole-file read used"),
+                ),
             ):
                 review = review_publish_session(
                     conn,
@@ -456,7 +461,9 @@ class PublishTests(unittest.TestCase):
             )
             self.assertLess(peak, 32 * 1024 * 1024)
 
-    def test_scanner_detects_and_masks_long_home_path_across_chunk_boundary(self) -> None:
+    def test_scanner_detects_and_masks_long_home_path_across_chunk_boundary(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -474,7 +481,9 @@ class PublishTests(unittest.TestCase):
             distance_before_boundary = 5_000
             match_start = publish_module._SCAN_CHUNK_BYTES - distance_before_boundary
             self.assertGreater(distance_before_boundary, 4_096)
-            self.assertLess(distance_before_boundary, publish_module._SCAN_OVERLAP_CHARS)
+            self.assertLess(
+                distance_before_boundary, publish_module._SCAN_OVERLAP_CHARS
+            )
             self.assertGreater(
                 match_start + len(long_home_path),
                 publish_module._SCAN_CHUNK_BYTES,
@@ -528,9 +537,7 @@ class PublishTests(unittest.TestCase):
 
         for title, secret in cases:
             with self.subTest(title=title):
-                suffix_length = (
-                    publish_module._SCAN_OVERLAP_CHARS - len(secret) + 1
-                )
+                suffix_length = publish_module._SCAN_OVERLAP_CHARS - len(secret) + 1
                 first_chunk = " " * match_start + secret + " " * suffix_length
                 self.assertEqual(
                     len(first_chunk) - publish_module._SCAN_OVERLAP_CHARS,
@@ -581,10 +588,7 @@ class PublishTests(unittest.TestCase):
         scanner.feed("", final=True)
 
         self.assertFalse(
-            any(
-                finding.title == "Google API key"
-                for finding in accumulator.finalize()
-            )
+            any(finding.title == "Google API key" for finding in accumulator.finalize())
         )
 
     def test_scanner_patterns_have_finite_width_within_overlap(self) -> None:
@@ -689,7 +693,9 @@ class PublishTests(unittest.TestCase):
             self.assertTrue(payload["reviews"])
             self.assertEqual(payload["total"], 1)
             self.assertEqual(payload["candidates"][0]["session_id"], "session-1")
-            self.assertEqual(payload["candidates"][0]["review_recommendation"], "public")
+            self.assertEqual(
+                payload["candidates"][0]["review_recommendation"], "public"
+            )
 
     def test_publish_queue_json_can_filter_by_origin(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -698,7 +704,9 @@ class PublishTests(unittest.TestCase):
             shared = root / "shared"
             db_path = root / "logpile.db"
             self._prepare_db(db_path)
-            self._write_session(home, session_id="direct-1", body="make more progress on logpile")
+            self._write_session(
+                home, session_id="direct-1", body="make more progress on logpile"
+            )
             self._write_session(
                 home,
                 session_id="eval-1",
@@ -734,16 +742,22 @@ class PublishTests(unittest.TestCase):
             self.assertEqual(payload["origin"], "pipeline_eval")
             self.assertEqual(payload["total"], 1)
             self.assertEqual(payload["candidates"][0]["session_id"], "eval-1")
-            self.assertEqual(payload["candidates"][0]["session_origin"], "pipeline_eval")
+            self.assertEqual(
+                payload["candidates"][0]["session_origin"], "pipeline_eval"
+            )
 
-    def test_publish_queue_needs_changes_surfaces_public_sessions_with_tighter_recommendation(self) -> None:
+    def test_publish_queue_needs_changes_surfaces_public_sessions_with_tighter_recommendation(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
             shared = root / "shared"
             db_path = root / "logpile.db"
             self._prepare_db(db_path)
-            self._write_session(home, body="Please follow up with alice@example.com about the release.")
+            self._write_session(
+                home, body="Please follow up with alice@example.com about the release."
+            )
 
             sync_sessions(
                 shared_dir=shared,
@@ -790,7 +804,9 @@ class PublishTests(unittest.TestCase):
             self.assertEqual(payload["total"], 1)
             self.assertEqual(payload["candidates"][0]["session_id"], "session-1")
             self.assertEqual(payload["candidates"][0]["visibility"], "public")
-            self.assertEqual(payload["candidates"][0]["review_recommendation"], "unlisted")
+            self.assertEqual(
+                payload["candidates"][0]["review_recommendation"], "unlisted"
+            )
             self.assertTrue(payload["candidates"][0]["needs_visibility_change"])
 
     def test_publish_queue_json_total_is_not_truncated_by_limit(self) -> None:
@@ -867,7 +883,14 @@ class PublishTests(unittest.TestCase):
 
             result = CliRunner().invoke(
                 cli,
-                ["publish", "review", "missing-session", "--db", str(db_path), "--json"],
+                [
+                    "publish",
+                    "review",
+                    "missing-session",
+                    "--db",
+                    str(db_path),
+                    "--json",
+                ],
             )
 
             self.assertEqual(result.exit_code, 1)
@@ -973,7 +996,9 @@ class PublishTests(unittest.TestCase):
             self.assertTrue(private_archive.exists())
             self.assertFalse(private_archive.is_relative_to(shared))
             self.assertEqual(private_archive.stat().st_mode & 0o777, 0o600)
-            self.assertFalse((shared / "alice" / "claudecode" / "demo" / "session-1.jsonl").exists())
+            self.assertFalse(
+                (shared / "alice" / "claudecode" / "demo" / "session-1.jsonl").exists()
+            )
 
     def test_review_scans_rendered_home_path_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1017,14 +1042,18 @@ class PublishTests(unittest.TestCase):
             self.assertIn("Absolute home path", result.output)
             self.assertNotIn("/Users/alice/work/logpile", result.output)
 
-    def test_review_prefers_shared_publish_artifact_over_private_source_log(self) -> None:
+    def test_review_prefers_shared_publish_artifact_over_private_source_log(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
             shared = root / "shared"
             db_path = root / "logpile.db"
             self._prepare_db(db_path)
-            session_path = self._write_session(home, body="Publishable shared artifact.")
+            session_path = self._write_session(
+                home, body="Publishable shared artifact."
+            )
 
             sync_sessions(
                 shared_dir=shared,
@@ -1035,7 +1064,12 @@ class PublishTests(unittest.TestCase):
             )
 
             with open_sqlite(db_path) as conn:
-                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "no publish review was required"
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
                 conn.commit()
 
             session_path.write_text(
@@ -1062,14 +1096,18 @@ class PublishTests(unittest.TestCase):
             self.assertIn("Recommendation: public", result.output)
             self.assertNotIn("Token or credential", result.output)
 
-    def test_approve_keeps_reviewed_shared_artifact_when_promoting_visibility(self) -> None:
+    def test_approve_keeps_reviewed_shared_artifact_when_promoting_visibility(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
             shared = root / "shared"
             db_path = root / "logpile.db"
             self._prepare_db(db_path)
-            session_path = self._write_session(home, body="Publishable shared artifact.")
+            session_path = self._write_session(
+                home, body="Publishable shared artifact."
+            )
 
             sync_sessions(
                 shared_dir=shared,
@@ -1080,7 +1118,12 @@ class PublishTests(unittest.TestCase):
             )
 
             with open_sqlite(db_path) as conn:
-                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "no publish review was required"
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
                 conn.commit()
 
             session_path.write_text(
@@ -1118,7 +1161,9 @@ class PublishTests(unittest.TestCase):
             self.assertTrue(shared_path.exists())
             self.assertNotIn("sk-ant-", shared_path.read_text(encoding="utf-8"))
 
-    def test_preserve_reviewed_artifact_rejects_shared_symlink_without_touching_source(self) -> None:
+    def test_preserve_reviewed_artifact_rejects_shared_symlink_without_touching_source(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -1158,7 +1203,9 @@ class PublishTests(unittest.TestCase):
             self.assertIn("reviewed bytes", source.read_text(encoding="utf-8"))
             self.assertTrue(artifact.is_symlink())
 
-    def test_preserve_reviewed_artifact_rejects_non_directory_shared_root_without_chmod(self) -> None:
+    def test_preserve_reviewed_artifact_rejects_non_directory_shared_root_without_chmod(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -1201,7 +1248,9 @@ class PublishTests(unittest.TestCase):
             shared = root / "shared"
             db_path = root / "logpile.db"
             self._prepare_db(db_path)
-            session_path = self._write_session(home, body="Publishable source artifact.")
+            session_path = self._write_session(
+                home, body="Publishable source artifact."
+            )
 
             sync_sessions(
                 shared_dir=shared,
@@ -1235,7 +1284,9 @@ class PublishTests(unittest.TestCase):
                     shared_dir=shared_dir,
                 )
 
-            with mock.patch("logpile.db.set_session_visibility", side_effect=race_set_visibility):
+            with mock.patch(
+                "logpile.db.set_session_visibility", side_effect=race_set_visibility
+            ):
                 result = CliRunner().invoke(
                     cli,
                     [

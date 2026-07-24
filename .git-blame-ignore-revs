@@ -1,0 +1,6 @@
+# Style-only commits for git blame to skip. GitHub's blame view reads this
+# file automatically; locally, run:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Apply ruff format across logpile/ and tests/ (26 files)
+b21fe3b6fb8a27f4397bad87eddb12f748d10287

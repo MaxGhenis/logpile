@@ -1,25 +1,29 @@
 """Local-first publish review helpers."""
+
 from __future__ import annotations
 
 import base64
 import binascii
 import codecs
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import errno
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
 import secrets
 import shutil
 import sqlite3
 import stat
 import tempfile
-from typing import Callable, Iterator, Pattern, TextIO
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from itertools import pairwise
+from pathlib import Path
+from re import Pattern
+from typing import TextIO
 
 
 @dataclass(frozen=True)
@@ -117,7 +121,12 @@ def _valid_basic_auth(match: re.Match[str]) -> bool:
 
 def _valid_ssn(match: re.Match[str]) -> bool:
     area, group, serial = match.group("secret").split("-")
-    return area not in {"000", "666"} and not area.startswith("9") and group != "00" and serial != "0000"
+    return (
+        area not in {"000", "666"}
+        and not area.startswith("9")
+        and group != "00"
+        and serial != "0000"
+    )
 
 
 def _valid_luhn_card(match: re.Match[str]) -> bool:
@@ -167,13 +176,9 @@ def _valid_us_phone(match: re.Match[str]) -> bool:
 
     # Reject wraparound counters such as 2345678901 and 9876543210. These
     # commonly appear as sample IDs and otherwise satisfy the NANP shape.
-    deltas = [
-        (int(right) - int(left)) % 10
-        for left, right in zip(digits, digits[1:])
-    ]
+    deltas = [(int(right) - int(left)) % 10 for left, right in pairwise(digits)]
     return not (
-        all(delta == 1 for delta in deltas)
-        or all(delta == 9 for delta in deltas)
+        all(delta == 1 for delta in deltas) or all(delta == 9 for delta in deltas)
     )
 
 
@@ -181,20 +186,41 @@ def _valid_high_entropy(match: re.Match[str]) -> bool:
     token = match.group("secret")
     lowered = token.lower()
     if lowered.startswith(
-        ("sk-", "sk_", "xox", "aiza", "npm_", "pypi-", "github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "eyj")
+        (
+            "sk-",
+            "sk_",
+            "xox",
+            "aiza",
+            "npm_",
+            "pypi-",
+            "github_pat_",
+            "ghp_",
+            "gho_",
+            "ghu_",
+            "ghs_",
+            "ghr_",
+            "eyj",
+        )
     ):
         return False
     if re.fullmatch(r"[0-9A-Fa-f]+", token) or len(set(token)) < 10:
         return False
     classes = sum(
         bool(regex.search(token))
-        for regex in (re.compile(r"[a-z]"), re.compile(r"[A-Z]"), re.compile(r"[0-9]"), re.compile(r"[_+/=-]"))
+        for regex in (
+            re.compile(r"[a-z]"),
+            re.compile(r"[A-Z]"),
+            re.compile(r"[0-9]"),
+            re.compile(r"[_+/=-]"),
+        )
     )
     if classes < 3:
         return False
     entropy = -sum(
         (count / len(token)) * math.log2(count / len(token))
-        for count in {character: token.count(character) for character in set(token)}.values()
+        for count in {
+            character: token.count(character) for character in set(token)
+        }.values()
     )
     return entropy >= 4.0
 
@@ -246,14 +272,19 @@ _SLACK_TOKEN_RULE = PatternRule(
     category="secret",
     severity="high",
     title="Slack token",
-    regex=re.compile(r"(?<![A-Za-z0-9_-])(?P<secret>xox[a-z]-[A-Za-z0-9-]{10,255})(?![A-Za-z0-9-])", re.IGNORECASE),
+    regex=re.compile(
+        r"(?<![A-Za-z0-9_-])(?P<secret>xox[a-z]-[A-Za-z0-9-]{10,255})(?![A-Za-z0-9-])",
+        re.IGNORECASE,
+    ),
     secret_group="secret",
 )
 _JWT_RULE = PatternRule(
     category="secret",
     severity="high",
     title="JSON Web Token",
-    regex=re.compile(r"(?<![A-Za-z0-9_-])(?P<secret>[A-Za-z0-9_-]{8,512}\.[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{16,1024})(?![A-Za-z0-9_-])"),
+    regex=re.compile(
+        r"(?<![A-Za-z0-9_-])(?P<secret>[A-Za-z0-9_-]{8,512}\.[A-Za-z0-9_-]{8,2048}\.[A-Za-z0-9_-]{16,1024})(?![A-Za-z0-9_-])"
+    ),
     secret_group="secret",
     validator=_valid_jwt,
 )
@@ -261,14 +292,18 @@ _GOOGLE_API_KEY_RULE = PatternRule(
     category="secret",
     severity="high",
     title="Google API key",
-    regex=re.compile(r"(?<![A-Za-z0-9_-])(?P<secret>AIza[0-9A-Za-z_-]{35})(?![0-9A-Za-z_-])"),
+    regex=re.compile(
+        r"(?<![A-Za-z0-9_-])(?P<secret>AIza[0-9A-Za-z_-]{35})(?![0-9A-Za-z_-])"
+    ),
     secret_group="secret",
 )
 _STRIPE_LIVE_KEY_RULE = PatternRule(
     category="secret",
     severity="high",
     title="Stripe live key",
-    regex=re.compile(r"(?<![A-Za-z0-9_])(?P<secret>(?:sk|rk)_live_[0-9A-Za-z]{16,255})(?![0-9A-Za-z])"),
+    regex=re.compile(
+        r"(?<![A-Za-z0-9_])(?P<secret>(?:sk|rk)_live_[0-9A-Za-z]{16,255})(?![0-9A-Za-z])"
+    ),
     secret_group="secret",
 )
 _CONNECTION_URI_RULE = PatternRule(
@@ -320,14 +355,18 @@ _NPM_TOKEN_RULE = PatternRule(
     category="secret",
     severity="high",
     title="Package registry token",
-    regex=re.compile(r"(?<![A-Za-z0-9_])(?P<secret>npm_[A-Za-z0-9]{30,128})(?![A-Za-z0-9])"),
+    regex=re.compile(
+        r"(?<![A-Za-z0-9_])(?P<secret>npm_[A-Za-z0-9]{30,128})(?![A-Za-z0-9])"
+    ),
     secret_group="secret",
 )
 _PYPI_TOKEN_RULE = PatternRule(
     category="secret",
     severity="high",
     title="Package registry token",
-    regex=re.compile(r"(?<![A-Za-z0-9_-])(?P<secret>pypi-[A-Za-z0-9_-]{40,255})(?![A-Za-z0-9_-])"),
+    regex=re.compile(
+        r"(?<![A-Za-z0-9_-])(?P<secret>pypi-[A-Za-z0-9_-]{40,255})(?![A-Za-z0-9_-])"
+    ),
     secret_group="secret",
 )
 _REGISTRY_ASSIGNMENT_RULE = PatternRule(
@@ -534,10 +573,14 @@ def publication_metadata_sha256(row) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _needs_visibility_tightening(current_visibility: str, recommendation: str | None) -> bool:
+def _needs_visibility_tightening(
+    current_visibility: str, recommendation: str | None
+) -> bool:
     if recommendation not in _VISIBILITY_ORDER:
         return False
-    current_rank = _VISIBILITY_ORDER.get(current_visibility, max(_VISIBILITY_ORDER.values()))
+    current_rank = _VISIBILITY_ORDER.get(
+        current_visibility, max(_VISIBILITY_ORDER.values())
+    )
     recommended_rank = _VISIBILITY_ORDER[recommendation]
     return recommended_rank < current_rank
 
@@ -735,10 +778,7 @@ def _mask_detected_values(value: str | None) -> str | None:
     """Mask every configured match before metadata/path output is exposed."""
     if not value:
         return value
-    ranges = sorted(
-        (start, end)
-        for _, _, start, end in _matching_candidates(value)
-    )
+    ranges = sorted((start, end) for _, _, start, end in _matching_candidates(value))
     if not ranges:
         return value
     merged: list[tuple[int, int]] = []
@@ -777,16 +817,12 @@ def _scan_text(
     candidates = _matching_candidates(text)
 
     sensitive_ranges = [
-        (secret_start, secret_end)
-        for _, _, secret_start, secret_end in candidates
+        (secret_start, secret_end) for _, _, secret_start, secret_end in candidates
     ]
     emitted_in_window: set[tuple[str, str, str, int, int]] = set()
     for rule, match, secret_start, secret_end in candidates:
         full_start = base_offset + match.start()
-        if (
-            emit_start_at_or_after is not None
-            and full_start < emit_start_at_or_after
-        ):
+        if emit_start_at_or_after is not None and full_start < emit_start_at_or_after:
             continue
         if emit_start_before is not None and full_start >= emit_start_before:
             continue
@@ -835,9 +871,13 @@ class _StreamingTextScanner:
         window = self.tail + text
         window_base = self.total_chars - len(self.tail)
         window_end = window_base + len(window)
-        cutoff = window_end if final else max(
-            window_base,
-            window_end - _SCAN_OVERLAP_CHARS,
+        cutoff = (
+            window_end
+            if final
+            else max(
+                window_base,
+                window_end - _SCAN_OVERLAP_CHARS,
+            )
         )
         _scan_text(
             window,
@@ -907,7 +947,11 @@ def _scan_file(
             os.fsync(stage_file.fileno())
             stage_file.close()
             stage_file = None
-        return digest.hexdigest(), inspected_size, str(staged_path) if staged_path else None
+        return (
+            digest.hexdigest(),
+            inspected_size,
+            str(staged_path) if staged_path else None,
+        )
     except Exception:
         if stage_file is not None:
             stage_file.close()
@@ -1174,10 +1218,7 @@ def preserve_reviewed_artifact(
             "Session source changed since its indexed revision; sync and review it again."
         )
     current_metadata_sha256 = publication_metadata_sha256(row)
-    if (
-        not review.metadata_sha256
-        or review.metadata_sha256 != current_metadata_sha256
-    ):
+    if not review.metadata_sha256 or review.metadata_sha256 != current_metadata_sha256:
         raise ValueError(
             "Session metadata changed during review; review the current metadata again."
         )
@@ -1208,15 +1249,17 @@ def preserve_reviewed_artifact(
     try:
         source_stat = os.fstat(source_fd)
         if not stat.S_ISREG(source_stat.st_mode):
-            raise ValueError(f"Review staging artifact is not a regular file: {staged_path}")
+            raise ValueError(
+                f"Review staging artifact is not a regular file: {staged_path}"
+            )
         if source_stat.st_size != review.inspected_size:
             raise ValueError("Review staging size changed before approval")
         if _digest_fd(source_fd) != review.inspected_sha256:
             raise ValueError("Review staging hash changed before approval")
 
-        safe_session_id = re.sub(
-            r"[^A-Za-z0-9._-]+", "-", review.session_id
-        ).strip(".-") or "session"
+        safe_session_id = (
+            re.sub(r"[^A-Za-z0-9._-]+", "-", review.session_id).strip(".-") or "session"
+        )
         artifact_parent = publish_root / safe_session_id
         _secure_managed_directory(artifact_parent, publish_root)
         artifact_path = artifact_parent / f"{review.inspected_sha256}.jsonl"
@@ -1236,8 +1279,12 @@ def preserve_reviewed_artifact(
             except FileNotFoundError:
                 target_stat = None
             if target_stat is not None:
-                if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(target_stat.st_mode):
-                    raise ValueError(f"Reviewed artifact is not a regular file: {artifact_path}")
+                if stat.S_ISLNK(target_stat.st_mode) or not stat.S_ISREG(
+                    target_stat.st_mode
+                ):
+                    raise ValueError(
+                        f"Reviewed artifact is not a regular file: {artifact_path}"
+                    )
                 target_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
                 target_flags |= getattr(os, "O_NOFOLLOW", 0)
                 target_fd = os.open(artifact_path.name, target_flags, dir_fd=parent_fd)
@@ -1250,7 +1297,9 @@ def preserve_reviewed_artifact(
                     os.close(target_fd)
             else:
                 if shutil.disk_usage(artifact_parent).free < review.inspected_size:
-                    raise OSError(errno.ENOSPC, "not enough free space for reviewed artifact")
+                    raise OSError(
+                        errno.ENOSPC, "not enough free space for reviewed artifact"
+                    )
                 temp_fd = os.open(
                     temp_name,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL,
@@ -1279,7 +1328,9 @@ def preserve_reviewed_artifact(
                 verify_fd = os.open(artifact_path.name, verify_flags, dir_fd=parent_fd)
                 try:
                     if _digest_fd(verify_fd) != review.inspected_sha256:
-                        raise ValueError("Reviewed artifact failed post-copy verification")
+                        raise ValueError(
+                            "Reviewed artifact failed post-copy verification"
+                        )
                 finally:
                     os.close(verify_fd)
         finally:
@@ -1293,7 +1344,7 @@ def preserve_reviewed_artifact(
     finally:
         os.close(source_fd)
 
-    reviewed_at = datetime.now(timezone.utc).isoformat()
+    reviewed_at = datetime.now(UTC).isoformat()
     cur = conn.execute(
         """
         INSERT INTO publication_reviews (
@@ -1479,7 +1530,9 @@ def list_publish_candidates(
         origin=origin,
     )
     normalized_visibility = (visibility or "pending").strip().lower()
-    fetch_limit = None if normalized_visibility == "needs_changes" else max(1, min(limit, 200))
+    fetch_limit = (
+        None if normalized_visibility == "needs_changes" else max(1, min(limit, 200))
+    )
 
     query = f"""
         SELECT
@@ -1535,17 +1588,26 @@ def list_publish_candidates(
                 candidate.review_recommendation = review.recommendation
                 candidate.review_rationale = review.rationale
                 candidate.finding_count = len(review.findings)
-                candidate.high_findings = sum(1 for finding in review.findings if finding.severity == "high")
-                candidate.medium_findings = sum(1 for finding in review.findings if finding.severity == "medium")
-                if normalized_visibility == "needs_changes" and not _needs_visibility_tightening(
-                    candidate.visibility,
-                    review.recommendation,
+                candidate.high_findings = sum(
+                    1 for finding in review.findings if finding.severity == "high"
+                )
+                candidate.medium_findings = sum(
+                    1 for finding in review.findings if finding.severity == "medium"
+                )
+                if (
+                    normalized_visibility == "needs_changes"
+                    and not _needs_visibility_tightening(
+                        candidate.visibility,
+                        review.recommendation,
+                    )
                 ):
                     continue
         elif normalized_visibility == "needs_changes":
             continue
         candidates.append(candidate)
-        if normalized_visibility == "needs_changes" and len(candidates) >= max(1, min(limit, 200)):
+        if normalized_visibility == "needs_changes" and len(candidates) >= max(
+            1, min(limit, 200)
+        ):
             break
     return candidates
 
@@ -1581,7 +1643,9 @@ def count_publish_candidates(
         count = 0
         for row in rows:
             review = review_publish_session(conn, row["session_id"])
-            if review and _needs_visibility_tightening(row["visibility"], review.recommendation):
+            if review and _needs_visibility_tightening(
+                row["visibility"], review.recommendation
+            ):
                 count += 1
         return count
     row = conn.execute(
@@ -1718,8 +1782,7 @@ def format_publish_review(review: PublishReview) -> list[str]:
         if finding.match_index == 1 and finding.omitted_count:
             location = f"{location}; {finding.omitted_count} evidence item(s) omitted"
         lines.append(
-            f"- [{finding.severity}] {finding.category}: {finding.title} "
-            f"({location})"
+            f"- [{finding.severity}] {finding.category}: {finding.title} ({location})"
         )
         lines.append(f"  {finding.evidence}")
     return lines
@@ -1751,7 +1814,9 @@ def format_publish_queue(candidates: list[PublishCandidate]) -> list[str]:
     return lines
 
 
-def can_apply_visibility(review: PublishReview, target_visibility: str, force: bool = False) -> tuple[bool, str]:
+def can_apply_visibility(
+    review: PublishReview, target_visibility: str, force: bool = False
+) -> tuple[bool, str]:
     target_rank = _VISIBILITY_ORDER[target_visibility]
     recommendation_rank = _VISIBILITY_ORDER[review.recommendation]
     if target_rank <= recommendation_rank:

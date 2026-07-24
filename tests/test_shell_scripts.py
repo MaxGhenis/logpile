@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -62,7 +61,7 @@ def test_logpile_wrapper_bootstraps_with_locked_uv_sync(tmp_path: Path) -> None:
     fake_uv = clean_path / "uv"
     fake_uv.write_text(
         "#!/bin/bash\n"
-        "printf '%s\\n' \"$*\" >\"$UV_LOG\"\n"
+        'printf \'%s\\n\' "$*" >"$UV_LOG"\n'
         "mkdir -p .venv/bin\n"
         "printf '%s\\n' '#!/bin/bash' 'printf \"uv bootstrapped\\\\n\"' "
         ">.venv/bin/logpile\n"
@@ -114,9 +113,7 @@ def test_logpile_wrapper_uses_frozen_bun_lockfile(tmp_path: Path) -> None:
     clean_path = _clean_path(tmp_path, "mkdir")
     fake_bun = clean_path / "bun"
     fake_bun.write_text(
-        "#!/bin/bash\n"
-        "printf '%s\\n' \"$*\" >\"$BUN_LOG\"\n"
-        "mkdir -p node_modules\n"
+        '#!/bin/bash\nprintf \'%s\\n\' "$*" >"$BUN_LOG"\nmkdir -p node_modules\n'
     )
     fake_bun.chmod(0o755)
 
@@ -142,10 +139,7 @@ def test_logpile_wrapper_reconciles_existing_node_modules(tmp_path: Path) -> Non
     bun_log = tmp_path / "bun.log"
     clean_path = _clean_path(tmp_path)
     fake_bun = clean_path / "bun"
-    fake_bun.write_text(
-        "#!/bin/bash\n"
-        "printf '%s\\n' \"$*\" >\"$BUN_LOG\"\n"
-    )
+    fake_bun.write_text('#!/bin/bash\nprintf \'%s\\n\' "$*" >"$BUN_LOG"\n')
     fake_bun.chmod(0o755)
 
     result = subprocess.run(
@@ -222,7 +216,7 @@ def _deploy_path(tmp_path: Path) -> Path:
 def _write_fake_curl(bin_dir: Path) -> None:
     curl = bin_dir / "curl"
     curl.write_text(
-        r'''#!/bin/bash
+        r"""#!/bin/bash
 printf '%s\n' "$*" >>"$CURL_LOG"
 
 config=""
@@ -279,7 +273,7 @@ case " $* " in
     printf '%s\n' '{"success":false,"errors":[{"message":"unexpected request"}]}'
     ;;
 esac
-'''
+"""
     )
     curl.chmod(0o755)
 
@@ -359,10 +353,13 @@ def test_deploy_landing_exits_nonzero_on_hash_mismatch(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "deployment verification failed" in result.stderr
     assert "deployed https://logpile.ai" not in result.stdout
-    assert sum(
-        "https://logpile.ai/?logpile-deploy-verify=" in line
-        for line in curl_log.splitlines()
-    ) == 3
+    assert (
+        sum(
+            "https://logpile.ai/?logpile-deploy-verify=" in line
+            for line in curl_log.splitlines()
+        )
+        == 3
+    )
 
 
 def test_landing_distinct_repo_metric_is_labeled_repos() -> None:

@@ -9,8 +9,8 @@ from logpile.db import (
     get_db,
     init_db,
     transition_session_visibility,
-    upsert_session,
     update_user,
+    upsert_session,
 )
 from logpile.publish import publication_metadata_sha256
 
@@ -82,7 +82,15 @@ class ContractViewTests(unittest.TestCase):
             with get_db(db_path) as conn:
                 username = ensure_user(conn, "alice")
                 update_user(conn, username, profile_visibility="unlisted")
-                upsert_session(conn, make_session("public-1", username=username, visibility="public"))
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "kept this session unlisted"
+                ):
+                    upsert_session(
+                        conn,
+                        make_session(
+                            "public-1", username=username, visibility="public"
+                        ),
+                    )
                 public_row = conn.execute(
                     "SELECT * FROM sessions WHERE session_id = 'public-1'"
                 ).fetchone()
@@ -130,8 +138,16 @@ class ContractViewTests(unittest.TestCase):
                     publication_review_id=review_id,
                     manage_storage=False,
                 )
-                upsert_session(conn, make_session("unlisted-1", username=username, visibility="unlisted"))
-                upsert_session(conn, make_session("private-1", username=username, visibility="private"))
+                upsert_session(
+                    conn,
+                    make_session(
+                        "unlisted-1", username=username, visibility="unlisted"
+                    ),
+                )
+                upsert_session(
+                    conn,
+                    make_session("private-1", username=username, visibility="private"),
+                )
 
             with open_sqlite(db_path) as conn:
                 rows = conn.execute(

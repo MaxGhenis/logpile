@@ -9,8 +9,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from logpile.backup import (
-    R2Config,
     SUPABASE_SCHEMA_SQL,
+    R2Config,
     build_candidate,
     create_sqlite_snapshot,
     discover_raw_paths,
@@ -32,7 +32,9 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
 
 
 class BackupTests(unittest.TestCase):
-    def test_plan_discovers_all_roots_rotated_shared_rows_and_deduplicates_sha256(self) -> None:
+    def test_plan_discovers_all_roots_rotated_shared_rows_and_deduplicates_sha256(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
             shared = home / "logpile" / "shared"
@@ -63,16 +65,28 @@ class BackupTests(unittest.TestCase):
                 / "sessions"
                 / "openclaw.jsonl"
             )
-            write_jsonl(codex_2, [{"type": "session_meta", "payload": {"id": "codex-2"}}])
-            write_jsonl(codex_3, [{"type": "session_meta", "payload": {"id": "codex-3"}}])
-            write_jsonl(openclaw, [{"type": "session_meta", "payload": {"id": "openclaw"}}])
+            write_jsonl(
+                codex_2, [{"type": "session_meta", "payload": {"id": "codex-2"}}]
+            )
+            write_jsonl(
+                codex_3, [{"type": "session_meta", "payload": {"id": "codex-3"}}]
+            )
+            write_jsonl(
+                openclaw, [{"type": "session_meta", "payload": {"id": "openclaw"}}]
+            )
             # A second native path with byte-identical content must not produce
             # a second backup candidate/object manifest.
             duplicate = home / ".codex-2" / "sessions" / "duplicate.jsonl"
             write_jsonl(duplicate, primary_records)
             write_jsonl(
                 home / ".claude" / "projects" / "-tmp-project" / "claude.jsonl",
-                [{"type": "user", "sessionId": "claude-1", "message": {"content": "hi"}}],
+                [
+                    {
+                        "type": "user",
+                        "sessionId": "claude-1",
+                        "message": {"content": "hi"},
+                    }
+                ],
             )
             rotated_shared = shared / "alice" / "claudecode" / "demo" / "rotated.jsonl"
             write_jsonl(
@@ -119,19 +133,34 @@ class BackupTests(unittest.TestCase):
                 shared_dir=shared,
             )
 
-            self.assertTrue({codex_2, codex_3, openclaw, duplicate, rotated_shared} <= discovered)
+            self.assertTrue(
+                {codex_2, codex_3, openclaw, duplicate, rotated_shared} <= discovered
+            )
             self.assertEqual(len(discovered), 9)
             self.assertEqual(len(plan.candidates), 8)
-            self.assertEqual(len({candidate.sha256 for candidate in plan.candidates}), 8)
+            self.assertEqual(
+                len({candidate.sha256 for candidate in plan.candidates}), 8
+            )
             self.assertEqual(plan.source_counts["codex"], 4)
             self.assertEqual(plan.source_counts["codex_archive"], 1)
             self.assertEqual(plan.source_counts["claudecode"], 2)
             self.assertEqual(plan.source_counts["codex_db"], 1)
-            self.assertIn(rotated_shared, {candidate.path for candidate in plan.candidates})
-            self.assertTrue(all(len(candidate.sha256) == 64 for candidate in plan.candidates))
-            self.assertTrue(all(candidate.object_key.startswith("raw/sha256/") for candidate in plan.candidates))
+            self.assertIn(
+                rotated_shared, {candidate.path for candidate in plan.candidates}
+            )
+            self.assertTrue(
+                all(len(candidate.sha256) == 64 for candidate in plan.candidates)
+            )
+            self.assertTrue(
+                all(
+                    candidate.object_key.startswith("raw/sha256/")
+                    for candidate in plan.candidates
+                )
+            )
 
-    def test_db_managed_private_reviewed_and_reused_artifacts_are_included(self) -> None:
+    def test_db_managed_private_reviewed_and_reused_artifacts_are_included(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
             shared = home / "logpile" / "shared"
@@ -140,14 +169,25 @@ class BackupTests(unittest.TestCase):
 
             reused_source = home / ".codex" / "sessions" / "reused.jsonl"
             reused_archive = shared / "alice" / "codex" / "demo" / "reused.jsonl"
-            private_archive = private / "alice" / "claudecode" / "demo" / "private.jsonl"
+            private_archive = (
+                private / "alice" / "claudecode" / "demo" / "private.jsonl"
+            )
             reviewed_artifact = (
                 shared / ".published" / "reviewed" / ("a" * 64 + ".jsonl")
             )
-            write_jsonl(reused_source, [{"type": "session_meta", "payload": {"id": "new"}}])
-            write_jsonl(reused_archive, [{"type": "session_meta", "payload": {"id": "old"}}])
-            write_jsonl(private_archive, [{"type": "user", "message": {"content": "private"}}])
-            write_jsonl(reviewed_artifact, [{"type": "user", "message": {"content": "reviewed"}}])
+            write_jsonl(
+                reused_source, [{"type": "session_meta", "payload": {"id": "new"}}]
+            )
+            write_jsonl(
+                reused_archive, [{"type": "session_meta", "payload": {"id": "old"}}]
+            )
+            write_jsonl(
+                private_archive, [{"type": "user", "message": {"content": "private"}}]
+            )
+            write_jsonl(
+                reviewed_artifact,
+                [{"type": "user", "message": {"content": "reviewed"}}],
+            )
 
             init_db(db_path)
             with sqlite3.connect(db_path) as conn:
@@ -202,7 +242,9 @@ class BackupTests(unittest.TestCase):
                 include_codex_db=False,
             )
             self.assertEqual(len(plan.candidates), 4)
-            self.assertEqual(len({candidate.sha256 for candidate in plan.candidates}), 4)
+            self.assertEqual(
+                len({candidate.sha256 for candidate in plan.candidates}), 4
+            )
 
     def test_configured_corrupt_logpile_db_fails_backup_discovery_closed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -254,22 +296,24 @@ class BackupTests(unittest.TestCase):
                 pass
             failing_connection = FailingSessionsQueryConnection()
 
-            with patch(
-                "logpile.discovery.sqlite3.connect",
-                return_value=failing_connection,
-            ):
-                with self.assertRaisesRegex(
+            with (
+                patch(
+                    "logpile.discovery.sqlite3.connect",
+                    return_value=failing_connection,
+                ),
+                self.assertRaisesRegex(
                     RuntimeError,
                     r"Could not read configured Logpile database.*injected sessions query failure",
-                ):
-                    list(
-                        discover_raw_paths(
-                            home,
-                            db_path=db_path,
-                            shared_dir=shared,
-                            include_codex_db=False,
-                        )
+                ),
+            ):
+                list(
+                    discover_raw_paths(
+                        home,
+                        db_path=db_path,
+                        shared_dir=shared,
+                        include_codex_db=False,
                     )
+                )
             self.assertTrue(failing_connection.closed)
 
     def test_valid_non_logpile_or_missing_db_remains_optional(self) -> None:
@@ -322,10 +366,12 @@ class BackupTests(unittest.TestCase):
                 paths = list(discover_raw_paths(home, include_codex_db=True))
                 self.assertEqual(paths, [source])
 
-                with snapshot_candidate(source, home=home) as candidate:
-                    with sqlite3.connect(candidate.payload_path) as snapshot:
-                        values = snapshot.execute("SELECT value FROM events").fetchall()
-                        check = snapshot.execute("PRAGMA quick_check").fetchone()[0]
+                with (
+                    snapshot_candidate(source, home=home) as candidate,
+                    sqlite3.connect(candidate.payload_path) as snapshot,
+                ):
+                    values = snapshot.execute("SELECT value FROM events").fetchall()
+                    check = snapshot.execute("PRAGMA quick_check").fetchone()[0]
             finally:
                 writer.close()
 
@@ -339,7 +385,9 @@ class BackupTests(unittest.TestCase):
             destination = root / "backup.db"
             destination.write_bytes(b"old incomplete backup")
             with sqlite3.connect(source) as conn:
-                conn.execute("CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT)")
+                conn.execute(
+                    "CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT)"
+                )
                 conn.execute("INSERT INTO settings VALUES ('visibility', 'private')")
 
             previous_umask = os.umask(0o022)
@@ -349,7 +397,9 @@ class BackupTests(unittest.TestCase):
                 os.umask(previous_umask)
 
             with sqlite3.connect(destination) as conn:
-                row = conn.execute("SELECT value FROM settings WHERE name = 'visibility'").fetchone()
+                row = conn.execute(
+                    "SELECT value FROM settings WHERE name = 'visibility'"
+                ).fetchone()
                 check = conn.execute("PRAGMA quick_check").fetchone()[0]
             destination_mode = destination.stat().st_mode & 0o777
 
@@ -372,7 +422,9 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), b"last known good backup")
             self.assertEqual(list(root.glob(".last-good.db.*.tmp")), [])
 
-    def test_snapshot_candidate_reads_from_stable_payload_when_source_grows(self) -> None:
+    def test_snapshot_candidate_reads_from_stable_payload_when_source_grows(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
             path = home / ".codex" / "sessions" / "2026" / "05" / "16" / "rollout.jsonl"
@@ -385,7 +437,9 @@ class BackupTests(unittest.TestCase):
                         "payload": {
                             "type": "message",
                             "role": "user",
-                            "content": [{"type": "input_text", "text": "stable payload"}],
+                            "content": [
+                                {"type": "input_text", "text": "stable payload"}
+                            ],
                         },
                     },
                 ],
@@ -401,7 +455,9 @@ class BackupTests(unittest.TestCase):
                                 "payload": {
                                     "type": "message",
                                     "role": "user",
-                                    "content": [{"type": "input_text", "text": "later append"}],
+                                    "content": [
+                                        {"type": "input_text", "text": "later append"}
+                                    ],
                                 },
                             }
                         ).encode("utf-8")
@@ -490,7 +546,9 @@ class BackupTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
-            path = home / "logpile" / "shared" / "max" / "codex" / "demo" / "rollout.jsonl"
+            path = (
+                home / "logpile" / "shared" / "max" / "codex" / "demo" / "rollout.jsonl"
+            )
             write_jsonl(path, records)
 
             candidate = replace(
@@ -537,7 +595,9 @@ class BackupTests(unittest.TestCase):
             candidate = build_candidate(path, home=home)
             chunks = list(iter_text_chunks(candidate))
 
-        self.assertIn("find exact thing x", "\n".join(chunk.content for chunk in chunks))
+        self.assertIn(
+            "find exact thing x", "\n".join(chunk.content for chunk in chunks)
+        )
         tool_chunks = [chunk for chunk in chunks if chunk.role == "tool_use"]
         self.assertEqual(len(tool_chunks), 1)
         self.assertIn("rg 'exact thing x'", tool_chunks[0].content)
@@ -580,7 +640,7 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(infer_jsonl_source(claude_path), "claudecode")
 
     def test_push_backup_uploads_and_indexes_with_injected_clients(self) -> None:
-        import logpile.backup as backup
+        from logpile import backup
 
         uploaded_keys: list[str] = []
         upserted_files: list[str] = []
@@ -632,12 +692,23 @@ class BackupTests(unittest.TestCase):
                         "payload": {
                             "type": "message",
                             "role": "user",
-                            "content": [{"type": "input_text", "text": "find raw log cloud backup"}],
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "find raw log cloud backup",
+                                }
+                            ],
                         },
                     },
                 ]
                 write_jsonl(
-                    home / ".codex" / "sessions" / "2026" / "05" / "16" / "rollout.jsonl",
+                    home
+                    / ".codex"
+                    / "sessions"
+                    / "2026"
+                    / "05"
+                    / "16"
+                    / "rollout.jsonl",
                     records,
                 )
                 write_jsonl(

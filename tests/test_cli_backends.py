@@ -14,8 +14,11 @@ class CliBackendTests(unittest.TestCase):
     def test_lock_contended_sync_exits_with_retryable_status(self) -> None:
         from logpile.sync import SyncLockContended
 
-        with tempfile.TemporaryDirectory() as td, mock.patch(
-            "logpile.sync.sync_sessions", return_value=SyncLockContended(0, 0, 0)
+        with (
+            tempfile.TemporaryDirectory() as td,
+            mock.patch(
+                "logpile.sync.sync_sessions", return_value=SyncLockContended(0, 0, 0)
+            ),
         ):
             root = Path(td)
             result = CliRunner().invoke(
@@ -39,11 +42,7 @@ class CliBackendTests(unittest.TestCase):
             root = Path(td)
             home = root / "home"
             session = (
-                home
-                / ".claude"
-                / "projects"
-                / "-Users-bob-demo"
-                / "bob-session.jsonl"
+                home / ".claude" / "projects" / "-Users-bob-demo" / "bob-session.jsonl"
             )
             session.parent.mkdir(parents=True)
             session.write_text(
@@ -83,9 +82,7 @@ class CliBackendTests(unittest.TestCase):
                 row = conn.execute(
                     "SELECT username FROM sessions WHERE session_id = 'bob-session'"
                 ).fetchone()
-                users = {
-                    item[0] for item in conn.execute("SELECT username FROM users")
-                }
+                users = {item[0] for item in conn.execute("SELECT username FROM users")}
             self.assertEqual(row["username"], "bob")
             self.assertEqual(users, {"alice", "bob"})
 
@@ -109,7 +106,9 @@ class CliBackendTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertIn(f"Verified SQLite backup: {output}", result.output)
             with get_db(output) as conn:
-                username = conn.execute("SELECT username FROM users").fetchone()["username"]
+                username = conn.execute("SELECT username FROM users").fetchone()[
+                    "username"
+                ]
                 quick_check = conn.execute("PRAGMA quick_check").fetchone()[0]
 
         self.assertEqual(username, "alice")
@@ -197,7 +196,7 @@ class CliBackendTests(unittest.TestCase):
         )
 
     def test_cloud_search_uses_supabase_archive(self) -> None:
-        import logpile.backup as backup
+        from logpile import backup
 
         class FakeArchive:
             def __init__(self, db_url):
@@ -242,7 +241,7 @@ class CliBackendTests(unittest.TestCase):
         self.assertIn("specific thing", payload["results"][0]["excerpt"])
 
     def test_cloud_show_prints_indexed_chunks(self) -> None:
-        import logpile.backup as backup
+        from logpile import backup
 
         class FakeArchive:
             def __init__(self, db_url):
@@ -290,7 +289,9 @@ class CliBackendTests(unittest.TestCase):
             root = Path(td)
             db_path = root / "logpile.db"
             raw_path = root / "session.jsonl"
-            raw_path.write_text('{"message": "needle in raw local file"}\n', encoding="utf-8")
+            raw_path.write_text(
+                '{"message": "needle in raw local file"}\n', encoding="utf-8"
+            )
             init_db(db_path)
             with get_db(db_path) as conn:
                 conn.execute(

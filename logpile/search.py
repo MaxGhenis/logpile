@@ -6,7 +6,7 @@ import hashlib
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -16,7 +16,6 @@ from .parsers import (
     clean_search_text,
     iter_session_search_text,
 )
-
 
 STRUCTURED_FIELDS = (
     ("session_goal", "session_goal", True),
@@ -81,8 +80,7 @@ def _search_inputs_drifted(conn: sqlite3.Connection, row: Any) -> bool:
     if current is None:
         return True
     return any(
-        current[column] != _value(row, column)
-        for column in _SEARCH_INPUT_COLUMNS
+        current[column] != _value(row, column) for column in _SEARCH_INPUT_COLUMNS
     )
 
 
@@ -98,7 +96,7 @@ class SearchBackfillStats:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _value(row: Any, key: str) -> Any:
@@ -491,8 +489,7 @@ def backfill_search_index(
             attempted_since_commit = 0
         if verbose and (indexed + missing + errors) % 250 == 0:
             print(
-                "  Search backfill: "
-                f"{indexed + missing + errors}/{scanned} refreshed",
+                f"  Search backfill: {indexed + missing + errors}/{scanned} refreshed",
                 flush=True,
             )
 
@@ -616,7 +613,7 @@ def _fts_tier_candidates(
             return []
         eligible_ids: list[int] = []
         for start in range(0, len(eligible_sessions), _SQL_IN_CHUNK):
-            session_batch = eligible_sessions[start:start + _SQL_IN_CHUNK]
+            session_batch = eligible_sessions[start : start + _SQL_IN_CHUNK]
             session_placeholders = ", ".join("?" for _ in session_batch)
             eligible_ids.extend(
                 row[0]
@@ -631,7 +628,7 @@ def _fts_tier_candidates(
         if len(eligible_ids) <= _PUBLIC_PUSHDOWN_MAX_DOCS:
             rows: list[sqlite3.Row] = []
             for start in range(0, len(eligible_ids), _SQL_IN_CHUNK):
-                batch = eligible_ids[start:start + _SQL_IN_CHUNK]
+                batch = eligible_ids[start : start + _SQL_IN_CHUNK]
                 placeholders = ", ".join("?" for _ in batch)
                 rows.extend(
                     conn.execute(
@@ -658,8 +655,7 @@ def _fts_tier_candidates(
             return rows
 
     total_matches = conn.execute(
-        "SELECT count(*) FROM session_search_fts "
-        "WHERE session_search_fts MATCH ?",
+        "SELECT count(*) FROM session_search_fts WHERE session_search_fts MATCH ?",
         (match_expr,),
     ).fetchone()[0]
     cap = max(1, candidate_cap)
@@ -689,7 +685,7 @@ def _fts_tier_candidates(
         rows: list[sqlite3.Row] = []
         candidate_ids = list(scores)
         for start in range(0, len(candidate_ids), _SQL_IN_CHUNK):
-            batch = candidate_ids[start:start + _SQL_IN_CHUNK]
+            batch = candidate_ids[start : start + _SQL_IN_CHUNK]
             placeholders = ", ".join("?" for _ in batch)
             rows.extend(
                 conn.execute(
@@ -764,10 +760,13 @@ def search_sessions(
     phrase = _quoted_fts_phrase(query)
     if not phrase or limit <= 0:
         return []
-    if conn.execute(
-        "SELECT 1 FROM sqlite_master "
-        "WHERE type = 'table' AND name = 'session_search_fts'"
-    ).fetchone() is None:
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'session_search_fts'"
+        ).fetchone()
+        is None
+    ):
         raise SearchIndexUnavailable(
             "Extracted-text search index is unavailable; run `logpile sync` first."
         )
@@ -781,27 +780,31 @@ def search_sessions(
         conn.execute("BEGIN")
     try:
         tier_rows = [
-            (0, _fts_tier_candidates(
-                conn,
-                phrase=phrase,
-                column="structured_text",
-                candidate_cap=cap,
-                public_mode=public_mode,
-                limit=limit,
-            )),
-            (1, _fts_tier_candidates(
-                conn,
-                phrase=phrase,
-                column="transcript_text",
-                candidate_cap=cap,
-                public_mode=public_mode,
-                limit=limit,
-            )),
+            (
+                0,
+                _fts_tier_candidates(
+                    conn,
+                    phrase=phrase,
+                    column="structured_text",
+                    candidate_cap=cap,
+                    public_mode=public_mode,
+                    limit=limit,
+                ),
+            ),
+            (
+                1,
+                _fts_tier_candidates(
+                    conn,
+                    phrase=phrase,
+                    column="transcript_text",
+                    candidate_cap=cap,
+                    public_mode=public_mode,
+                    limit=limit,
+                ),
+            ),
         ]
 
-        best_per_session: dict[
-            str, tuple[tuple[int, float, int], sqlite3.Row]
-        ] = {}
+        best_per_session: dict[str, tuple[tuple[int, float, int], sqlite3.Row]] = {}
         for tier, rows in tier_rows:
             for row in rows:
                 order_key = (tier, row["score"], row["document_id"])
@@ -811,19 +814,15 @@ def search_sessions(
 
         # Stable multi-pass sort: newest first inside equal (tier, score),
         # then session id as the final deterministic tiebreak.
-        winners = sorted(
-            best_per_session.items(), key=lambda item: item[0]
-        )
-        winners.sort(
-            key=lambda item: item[1][1]["first_timestamp"] or "", reverse=True
-        )
+        winners = sorted(best_per_session.items(), key=lambda item: item[0])
+        winners.sort(key=lambda item: item[1][1]["first_timestamp"] or "", reverse=True)
         winners.sort(key=lambda item: item[1][0][:2])
         winners = winners[:limit]
 
         excerpts: dict[int, str] = {}
         winner_ids = [entry[0][2] for _, entry in winners]
         for start in range(0, len(winner_ids), _SQL_IN_CHUNK):
-            batch = winner_ids[start:start + _SQL_IN_CHUNK]
+            batch = winner_ids[start : start + _SQL_IN_CHUNK]
             placeholders = ", ".join("?" for _ in batch)
             excerpt_rows = conn.execute(
                 f"""

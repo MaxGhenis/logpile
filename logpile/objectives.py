@@ -2,7 +2,6 @@
 
 import re
 
-
 SESSION_OBJECTIVE_VERSION = 1
 
 

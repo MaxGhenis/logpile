@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 
-
 SESSION_ORIGINS = (
     "human_direct",
     "human_delegated",
@@ -69,10 +68,14 @@ def derive_session_origin(
         origin = "meta_scaffolding"
     elif any(marker in context for marker in _PIPELINE_MARKERS):
         origin = "pipeline_eval"
-    elif session_id.startswith("agent-") or any(marker in message for marker in _DELEGATED_MARKERS):
+    elif session_id.startswith("agent-") or any(
+        marker in message for marker in _DELEGATED_MARKERS
+    ):
         origin = "human_delegated"
     elif not message:
-        origin = "human_delegated" if session_id.startswith("agent-") else "system_generated"
+        origin = (
+            "human_delegated" if session_id.startswith("agent-") else "system_generated"
+        )
     elif message.startswith("# agents.md instructions for "):
         origin = "system_generated"
     else:

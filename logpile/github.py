@@ -1,10 +1,11 @@
 """GitHub activity sync — pulls contribution data via GraphQL, stores daily rollups."""
+
 from __future__ import annotations
 
 import json
 import os
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 
 class GitHubSyncError(Exception):
@@ -28,7 +29,11 @@ def _resolve_token() -> str:
         token = result.stdout.strip()
         if token:
             return token
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
         pass
 
     raise GitHubSyncError(
@@ -63,7 +68,9 @@ def _graphql(token: str, query: str, variables: dict | None = None) -> dict:
     return payload.get("data", {})
 
 
-def _fetch_year(token: str, github_user: str, start: datetime, end: datetime) -> list[dict]:
+def _fetch_year(
+    token: str, github_user: str, start: datetime, end: datetime
+) -> list[dict]:
     """Fetch contribution calendar for a window <= 1 year."""
     query = """
     query($login: String!, $from: DateTime!, $to: DateTime!) {
@@ -103,7 +110,9 @@ def _fetch_year(token: str, github_user: str, start: datetime, end: datetime) ->
     ]
 
 
-def _fetch_pr_counts_per_day(token: str, github_user: str, since: str) -> dict[str, int]:
+def _fetch_pr_counts_per_day(
+    token: str, github_user: str, since: str
+) -> dict[str, int]:
     """Fetch PR-opened counts per day via search (more accurate than calendar)."""
     query = """
     query($q: String!, $cursor: String) {
@@ -134,12 +143,14 @@ def _fetch_pr_counts_per_day(token: str, github_user: str, since: str) -> dict[s
     return counts
 
 
-def sync_user_github(conn, *, username: str, github_user: str, since: datetime | None = None) -> dict:
+def sync_user_github(
+    conn, *, username: str, github_user: str, since: datetime | None = None
+) -> dict:
     """Pull GitHub contributions for one user into `user_github_daily`. Returns sync stats."""
     token = _resolve_token()
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     start = since or (now - timedelta(days=540))  # ~18 months default
-    start = start.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = start.astimezone(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
 
     # GitHub GraphQL caps contributionsCollection at 1 year windows. Chunk.
     all_days: dict[str, int] = {}

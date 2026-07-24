@@ -56,13 +56,7 @@ class VisibilityArtifactTests(unittest.TestCase):
         home = root / "home"
         shared = root / "shared"
         db_path = root / "logpile.db"
-        source = (
-            home
-            / ".claude"
-            / "projects"
-            / "-Users-alice-demo"
-            / "session-1.jsonl"
-        )
+        source = home / ".claude" / "projects" / "-Users-alice-demo" / "session-1.jsonl"
         return home, shared, db_path, source
 
     def _sync_private(self, root: Path, body: str = "Clean publish candidate."):
@@ -98,9 +92,11 @@ class VisibilityArtifactTests(unittest.TestCase):
             root = Path(td)
             _home, shared, db_path, _source = self._sync_private(root)
 
-            with _connect(db_path) as conn:
-                with self.assertRaisesRegex(ValueError, "Unsupported visibility"):
-                    update_user(conn, "alice", default_session_visibility="typo-public")
+            with (
+                _connect(db_path) as conn,
+                self.assertRaisesRegex(ValueError, "Unsupported visibility"),
+            ):
+                update_user(conn, "alice", default_session_visibility="typo-public")
 
             result = CliRunner().invoke(
                 cli,
@@ -181,7 +177,9 @@ class VisibilityArtifactTests(unittest.TestCase):
                     ORDER BY id DESC LIMIT 1
                     """
                 ).fetchone()
-            self.assertEqual((row["from_visibility"], row["to_visibility"]), ("private", "unlisted"))
+            self.assertEqual(
+                (row["from_visibility"], row["to_visibility"]), ("private", "unlisted")
+            )
             self.assertIn("not served in public mode", row["warning"])
 
     def test_unlisted_approval_cannot_be_reused_as_public_approval(self) -> None:
@@ -315,9 +313,13 @@ class VisibilityArtifactTests(unittest.TestCase):
             self.assertEqual(row["visibility"], "unlisted")
             self.assertEqual(row["publication_state"], "source_drift")
             self.assertIn("revoked and requeued", row["visibility_reason"])
-            self.assertEqual(Path(row["reviewed_artifact_path"]).read_bytes(), reviewed_bytes)
-            response = create_app(db_path, shared, public_mode=True).test_client().get(
-                "/sessions/session-1"
+            self.assertEqual(
+                Path(row["reviewed_artifact_path"]).read_bytes(), reviewed_bytes
+            )
+            response = (
+                create_app(db_path, shared, public_mode=True)
+                .test_client()
+                .get("/sessions/session-1")
             )
             self.assertEqual(response.status_code, 404)
             self.assertNotIn(b"DRIFT-METADATA-SENTINEL", response.data)
@@ -337,8 +339,10 @@ class VisibilityArtifactTests(unittest.TestCase):
                 reviewed_path,
             )
             self.assertEqual(reviewed_path.read_bytes(), reviewed_bytes)
-            response = create_app(db_path, shared, public_mode=True).test_client().get(
-                "/sessions/session-1"
+            response = (
+                create_app(db_path, shared, public_mode=True)
+                .test_client()
+                .get("/sessions/session-1")
             )
             self.assertEqual(response.status_code, 200)
             self.assertIn(b"DRIFT-METADATA-SENTINEL", response.data)
@@ -394,13 +398,19 @@ class VisibilityArtifactTests(unittest.TestCase):
                 row["publication_metadata_sha256"],
                 row["reviewed_metadata_sha256"],
             )
-            self.assertIn("rotated transcript metadata drifted", row["visibility_reason"])
+            self.assertIn(
+                "rotated transcript metadata drifted", row["visibility_reason"]
+            )
             self.assertEqual(reviewed_path.read_bytes(), reviewed_bytes)
-            response = create_app(
-                db_path,
-                shared,
-                public_mode=True,
-            ).test_client().get("/sessions/session-1")
+            response = (
+                create_app(
+                    db_path,
+                    shared,
+                    public_mode=True,
+                )
+                .test_client()
+                .get("/sessions/session-1")
+            )
             self.assertEqual(response.status_code, 404)
             self.assertNotIn(b"STALE PARSER TITLE", response.data)
 
@@ -450,11 +460,15 @@ class VisibilityArtifactTests(unittest.TestCase):
                     """
                 )
 
-            response = create_app(
-                db_path,
-                shared,
-                public_mode=True,
-            ).test_client().get("/sessions/session-1")
+            response = (
+                create_app(
+                    db_path,
+                    shared,
+                    public_mode=True,
+                )
+                .test_client()
+                .get("/sessions/session-1")
+            )
             self.assertEqual(response.status_code, 404)
             self.assertNotIn(b"UNREVIEWED METADATA SENTINEL", response.data)
             with _connect(db_path) as conn:
@@ -570,11 +584,15 @@ class VisibilityArtifactTests(unittest.TestCase):
             shared.rename(real_shared)
             shared.symlink_to(real_shared, target_is_directory=True)
 
-            response = create_app(
-                db_path,
-                shared,
-                public_mode=True,
-            ).test_client().get("/sessions/session-1")
+            response = (
+                create_app(
+                    db_path,
+                    shared,
+                    public_mode=True,
+                )
+                .test_client()
+                .get("/sessions/session-1")
+            )
             self.assertEqual(response.status_code, 404)
 
     def test_public_mode_rejects_corrupt_or_symlinked_reviewed_artifact(self) -> None:
@@ -632,7 +650,9 @@ class VisibilityArtifactTests(unittest.TestCase):
             self.assertIn("ORIGINAL REVIEWED SENTINEL", rendered)
             self.assertNotIn("UNREVIEWED SWAP SENTINEL", rendered)
 
-    def test_copy_mismatch_persists_retry_without_advancing_source_metadata(self) -> None:
+    def test_copy_mismatch_persists_retry_without_advancing_source_metadata(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home, shared, db_path, source = self._sync_private(root)
@@ -714,11 +734,15 @@ class VisibilityArtifactTests(unittest.TestCase):
                 os.chmod(dst, 0o600)
 
             first_stderr = io.StringIO()
-            with mock.patch("logpile.sync._secure_copy_file", side_effect=corrupt_copy):
-                with contextlib.redirect_stderr(first_stderr):
-                    sync_sessions(shared, db_path, "alice", "machine-1", home)
+            with (
+                mock.patch("logpile.sync._secure_copy_file", side_effect=corrupt_copy),
+                contextlib.redirect_stderr(first_stderr),
+            ):
+                sync_sessions(shared, db_path, "alice", "machine-1", home)
 
-            self.assertIn("Archival shared-copy preflight plans", first_stderr.getvalue())
+            self.assertIn(
+                "Archival shared-copy preflight plans", first_stderr.getvalue()
+            )
             self.assertIn("across 1 transcript(s)", first_stderr.getvalue())
             with _connect(db_path) as conn:
                 failed = conn.execute(
@@ -737,7 +761,9 @@ class VisibilityArtifactTests(unittest.TestCase):
             second_stderr = io.StringIO()
             with contextlib.redirect_stderr(second_stderr):
                 sync_sessions(shared, db_path, "alice", "machine-1", home)
-            self.assertIn("Archival shared-copy preflight plans", second_stderr.getvalue())
+            self.assertIn(
+                "Archival shared-copy preflight plans", second_stderr.getvalue()
+            )
             with _connect(db_path) as conn:
                 healed = conn.execute(
                     """
@@ -766,10 +792,12 @@ class VisibilityArtifactTests(unittest.TestCase):
             _write_session(source, "planned copy")
             usage = namedtuple("usage", "total used free")(100, 100, 0)
             stderr = io.StringIO()
-            with mock.patch("logpile.sync.shutil.disk_usage", return_value=usage):
-                with contextlib.redirect_stderr(stderr):
-                    with self.assertRaises(StorageSafetyError):
-                        sync_sessions(shared, db_path, "alice", "machine-1", home)
+            with (
+                mock.patch("logpile.sync.shutil.disk_usage", return_value=usage),
+                contextlib.redirect_stderr(stderr),
+                self.assertRaises(StorageSafetyError),
+            ):
+                sync_sessions(shared, db_path, "alice", "machine-1", home)
             self.assertIn("preflight plans", stderr.getvalue())
             self.assertIn("0.0 B free", stderr.getvalue())
             with _connect(db_path) as conn:

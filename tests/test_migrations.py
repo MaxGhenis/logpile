@@ -5,17 +5,20 @@ from pathlib import Path
 
 from logpile.db import init_db
 
-
 FIXTURES = Path(__file__).parent / "fixtures" / "migrations"
 
 
 class IdentityMigrationTests(unittest.TestCase):
-    def test_collision_rebuild_preserves_every_nonidentity_column_and_snapshot(self) -> None:
+    def test_collision_rebuild_preserves_every_nonidentity_column_and_snapshot(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "legacy.db"
             with sqlite3.connect(db_path) as conn:
                 conn.executescript(
-                    (FIXTURES / "legacy-identity-collision.sql").read_text(encoding="utf-8")
+                    (FIXTURES / "legacy-identity-collision.sql").read_text(
+                        encoding="utf-8"
+                    )
                 )
 
             init_db(db_path)
@@ -23,10 +26,12 @@ class IdentityMigrationTests(unittest.TestCase):
             with sqlite3.connect(db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 user_columns = {
-                    row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(users)").fetchall()
                 }
                 session_columns = {
-                    row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
                 }
                 rule_columns = {
                     row[1]
@@ -108,13 +113,16 @@ class IdentityMigrationTests(unittest.TestCase):
             self.assertEqual(snapshots[0].stat().st_mode & 0o777, 0o600)
             with sqlite3.connect(snapshots[0]) as snapshot:
                 snapshot_user_columns = {
-                    row[1] for row in snapshot.execute("PRAGMA table_info(users)").fetchall()
+                    row[1]
+                    for row in snapshot.execute("PRAGMA table_info(users)").fetchall()
                 }
                 self.assertIn("slug", snapshot_user_columns)
                 self.assertEqual(
                     snapshot.execute("SELECT COUNT(*) FROM users").fetchone()[0], 2
                 )
-                self.assertEqual(snapshot.execute("PRAGMA quick_check").fetchone()[0], "ok")
+                self.assertEqual(
+                    snapshot.execute("PRAGMA quick_check").fetchone()[0], "ok"
+                )
 
             # The legacy marker columns are gone, so an idempotent migration
             # must not create another destructive-rebuild snapshot.

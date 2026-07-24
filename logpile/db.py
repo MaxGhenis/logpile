@@ -1,16 +1,16 @@
 """SQLite database for the Logpile session index."""
+
 import os
 import re
 import sqlite3
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
 from .origins import SESSION_ORIGINS
-
 
 SESSION_VISIBILITIES = ("private", "unlisted", "public")
 PROFILE_VISIBILITIES = ("private", "unlisted", "public")
@@ -57,7 +57,10 @@ NATIVE_TOKEN_COLUMNS = (
     ("native_cache_creation_input_tokens", "cache_creation_input_tokens"),
     ("native_cache_creation_5m_input_tokens", "cache_creation_5m_input_tokens"),
     ("native_cache_creation_1h_input_tokens", "cache_creation_1h_input_tokens"),
-    ("native_cache_creation_unknown_input_tokens", "cache_creation_unknown_input_tokens"),
+    (
+        "native_cache_creation_unknown_input_tokens",
+        "cache_creation_unknown_input_tokens",
+    ),
     ("native_reasoning_output_tokens", "reasoning_output_tokens"),
     ("native_assistant_message_count", "assistant_message_count"),
 )
@@ -603,7 +606,7 @@ END;
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def normalize_username(value: str) -> str:
@@ -730,7 +733,9 @@ def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
     return {row[1] for row in rows}
 
 
-def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, spec: str) -> None:
+def _ensure_column(
+    conn: sqlite3.Connection, table_name: str, column_name: str, spec: str
+) -> None:
     if column_name in _table_columns(conn, table_name):
         return
     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {spec}")
@@ -739,7 +744,9 @@ def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, 
 def _next_available_username(conn: sqlite3.Connection, base_username: str) -> str:
     username = base_username
     suffix = 2
-    while conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+    while conn.execute(
+        "SELECT 1 FROM users WHERE username = ?", (username,)
+    ).fetchone():
         username = f"{base_username}-{suffix}"
         suffix += 1
     return username
@@ -827,7 +834,9 @@ def _refresh_user_publication_metadata(
         )
 
 
-def ensure_user(conn: sqlite3.Connection, username: str, display_name: str | None = None) -> str:
+def ensure_user(
+    conn: sqlite3.Connection, username: str, display_name: str | None = None
+) -> str:
     canonical_username = normalize_username(username)
     row = conn.execute(
         "SELECT username, display_name FROM users WHERE username = ? LIMIT 1",
@@ -1040,7 +1049,9 @@ def transition_session_visibility(
     normalized = _normalize_visibility(visibility, SESSION_VISIBILITIES)
     normalized_source = (transition_source or "").strip().lower()
     if normalized_source not in VISIBILITY_SOURCES:
-        raise ValueError(f"Unsupported visibility transition source: {transition_source}")
+        raise ValueError(
+            f"Unsupported visibility transition source: {transition_source}"
+        )
     if public_without_review not in {"raise", "unlisted"}:
         raise ValueError(f"Unsupported public review fallback: {public_without_review}")
 
@@ -1070,9 +1081,7 @@ def transition_session_visibility(
     warning: str | None = None
     review = None
     if normalized == "public":
-        review = _successful_publication_review(
-            conn, session_id, publication_review_id
-        )
+        review = _successful_publication_review(conn, session_id, publication_review_id)
         if review is None:
             if public_without_review == "raise":
                 raise ValueError(
@@ -1098,7 +1107,9 @@ def transition_session_visibility(
     transition = storage_transition
     if manage_storage and transition is None and normalized != current:
         if shared_dir is None:
-            raise ValueError("shared_dir is required for a stored visibility transition")
+            raise ValueError(
+                "shared_dir is required for a stored visibility transition"
+            )
         if normalized == "private":
             from .sync import prepare_private_session_storage
 
@@ -1117,9 +1128,7 @@ def transition_session_visibility(
     )
     effective_reason = reason or f"{normalized_source} visibility transition"
     effective_rule_id = visibility_rule_id if normalized_source == "rule" else None
-    effective_review_id = (
-        review["id"] if review is not None else publication_review_id
-    )
+    effective_review_id = review["id"] if review is not None else publication_review_id
     stored_source = "manual" if normalized_source == "review" else normalized_source
     try:
         cur = conn.execute(
@@ -1213,7 +1222,9 @@ def set_session_visibility(
         visibility,
         shared_dir=shared_dir,
         transition_source="review" if publication_review_id is not None else "manual",
-        reason="reviewed publish approval" if publication_review_id is not None else "manual override",
+        reason="reviewed publish approval"
+        if publication_review_id is not None
+        else "manual override",
         publication_review_id=publication_review_id,
     )
     if result.warning:
@@ -1574,7 +1585,9 @@ def _rebuild_column_plan(
     """Return source metadata, source/target names, and dynamic CREATE SQL."""
     excluded = excluded or set()
     renamed = renamed or {}
-    info = conn.execute(f"PRAGMA table_info({_quote_identifier(table_name)})").fetchall()
+    info = conn.execute(
+        f"PRAGMA table_info({_quote_identifier(table_name)})"
+    ).fetchall()
     pairs: list[tuple[str, str]] = []
     declarations: list[str] = []
     seen: set[str] = set()
@@ -1651,9 +1664,12 @@ def _rebuild_identity_schema(conn: sqlite3.Connection) -> None:
     _snapshot_before_identity_rebuild(conn)
 
     user_rows = [dict(row) for row in conn.execute("SELECT * FROM users").fetchall()]
-    session_rows = [dict(row) for row in conn.execute("SELECT * FROM sessions").fetchall()]
+    session_rows = [
+        dict(row) for row in conn.execute("SELECT * FROM sessions").fetchall()
+    ]
     rule_rows = [
-        dict(row) for row in conn.execute("SELECT * FROM session_visibility_rules").fetchall()
+        dict(row)
+        for row in conn.execute("SELECT * FROM session_visibility_rules").fetchall()
     ]
     github_columns = _table_columns(conn, "user_github_daily")
     github_usernames = (
@@ -1709,10 +1725,14 @@ def _rebuild_identity_schema(conn: sqlite3.Connection) -> None:
     orphan_values: set[str] = set()
     for row in session_rows:
         if mapped_identity(row, legacy_slug="user_slug" in session_columns) is None:
-            orphan_values.add(str(row.get("user_slug") or row.get("username") or "user"))
+            orphan_values.add(
+                str(row.get("user_slug") or row.get("username") or "user")
+            )
     for row in rule_rows:
         if mapped_identity(row, legacy_slug="user_slug" in rule_columns) is None:
-            orphan_values.add(str(row.get("user_slug") or row.get("username") or "user"))
+            orphan_values.add(
+                str(row.get("user_slug") or row.get("username") or "user")
+            )
     for raw_username in github_usernames:
         if raw_username not in username_map and raw_username not in slug_map:
             orphan_values.add(raw_username)
@@ -1781,7 +1801,9 @@ def _rebuild_identity_schema(conn: sqlite3.Connection) -> None:
         # Insert only known profile columns so any additional legacy columns
         # retain their declared defaults instead of being overwritten.
         available_user_columns = set(user_target_names)
-        for raw_value, canonical in sorted(orphan_map.items(), key=lambda item: item[1]):
+        for raw_value, canonical in sorted(
+            orphan_map.items(), key=lambda item: item[1]
+        ):
             defaults = {
                 "username": canonical,
                 "display_name": raw_value,
@@ -1811,7 +1833,9 @@ def _rebuild_identity_schema(conn: sqlite3.Connection) -> None:
 
         session_target_names = [target for _source, target in session_pairs]
         for row in session_rows:
-            canonical = resolve_identity(row, legacy_slug="user_slug" in session_columns)
+            canonical = resolve_identity(
+                row, legacy_slug="user_slug" in session_columns
+            )
             values = [
                 canonical if target == "username" else row.get(source)
                 for source, target in session_pairs
@@ -1960,7 +1984,9 @@ def _migrate_message_claim_occurrences(conn: sqlite3.Connection) -> None:
 
 
 def migrate_db(conn: sqlite3.Connection) -> None:
-    conn.create_function("normalize_username_py", 1, lambda value: normalize_username(value or ""))
+    conn.create_function(
+        "normalize_username_py", 1, lambda value: normalize_username(value or "")
+    )
     search_index_existed = bool(
         conn.execute(
             "SELECT 1 FROM sqlite_master "
@@ -2029,7 +2055,9 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     # Add legacy rows closed, then explicitly audit the allowed private ->
     # unlisted migration below. Brand-new tables use the same private default.
     _ensure_column(conn, "sessions", "visibility", "TEXT NOT NULL DEFAULT 'private'")
-    _ensure_column(conn, "sessions", "visibility_source", "TEXT NOT NULL DEFAULT 'default'")
+    _ensure_column(
+        conn, "sessions", "visibility_source", "TEXT NOT NULL DEFAULT 'default'"
+    )
     _ensure_column(conn, "sessions", "visibility_rule_id", "INTEGER")
     _ensure_column(conn, "sessions", "visibility_reason", "TEXT")
     _ensure_column(conn, "sessions", "reviewed_sha256", "TEXT")
@@ -2047,7 +2075,9 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "users", "display_name", "TEXT")
     _ensure_column(conn, "users", "bio", "TEXT")
     _ensure_column(conn, "users", "avatar_url", "TEXT")
-    _ensure_column(conn, "users", "profile_visibility", "TEXT NOT NULL DEFAULT 'public'")
+    _ensure_column(
+        conn, "users", "profile_visibility", "TEXT NOT NULL DEFAULT 'public'"
+    )
     _ensure_column(
         conn,
         "users",
@@ -2082,8 +2112,12 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     # Keep these idempotent guards after the dynamic identity rebuild as well;
     # very old databases may not have had the columns before this migration.
     _ensure_column(conn, "sessions", "cache_creation_input_tokens", "INTEGER DEFAULT 0")
-    _ensure_column(conn, "sessions", "cache_creation_5m_input_tokens", "INTEGER DEFAULT 0")
-    _ensure_column(conn, "sessions", "cache_creation_1h_input_tokens", "INTEGER DEFAULT 0")
+    _ensure_column(
+        conn, "sessions", "cache_creation_5m_input_tokens", "INTEGER DEFAULT 0"
+    )
+    _ensure_column(
+        conn, "sessions", "cache_creation_1h_input_tokens", "INTEGER DEFAULT 0"
+    )
     _ensure_column(
         conn, "sessions", "cache_creation_unknown_input_tokens", "INTEGER DEFAULT 0"
     )
@@ -2133,7 +2167,9 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     )
     for native_column, _transcript_column in NATIVE_TOKEN_COLUMNS:
         _ensure_column(conn, "sessions", native_column, "INTEGER DEFAULT 0")
-        _ensure_column(conn, "session_daily_usage", native_column, "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(
+            conn, "session_daily_usage", native_column, "INTEGER NOT NULL DEFAULT 0"
+        )
     _migrate_message_claim_occurrences(conn)
     for table in ("sessions", "session_daily_usage", "message_claims"):
         conn.execute(
@@ -2290,9 +2326,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ).fetchall():
         raw_visibility = visibility_row["visibility"]
         normalized_visibility = (
-            str(raw_visibility).strip().lower()
-            if raw_visibility is not None
-            else ""
+            str(raw_visibility).strip().lower() if raw_visibility is not None else ""
         )
         if visibility_row["is_private"] == 1:
             desired_visibility = "private"
@@ -2462,9 +2496,8 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         "SELECT value FROM logpile_meta WHERE key = 'search_fts_generation'"
     ).fetchone()
     search_generation = search_generation_row[0] if search_generation_row else None
-    reset_search_storage = (
-        not search_index_existed
-        or search_generation != str(SEARCH_INDEX_VERSION)
+    reset_search_storage = not search_index_existed or search_generation != str(
+        SEARCH_INDEX_VERSION
     )
     if reset_search_storage:
         # Make the reset intent durable before touching the external-content
@@ -2561,9 +2594,7 @@ class _StorageTransactionConnection(sqlite3.Connection):
             try:
                 super().rollback()
             finally:
-                self._finish_storage_transitions(
-                    transitions, "rollback", reverse=True
-                )
+                self._finish_storage_transitions(transitions, "rollback", reverse=True)
             raise
 
         transitions = self._take_storage_transitions()
@@ -2574,9 +2605,7 @@ class _StorageTransactionConnection(sqlite3.Connection):
         try:
             super().rollback()
         finally:
-            self._finish_storage_transitions(
-                transitions, "rollback", reverse=True
-            )
+            self._finish_storage_transitions(transitions, "rollback", reverse=True)
 
 
 def defer_storage_transitions(
@@ -2725,7 +2754,9 @@ def upsert_session(conn, data: dict):
     if desired_source not in VISIBILITY_SOURCES:
         raise ValueError(f"Unsupported visibility transition source: {desired_source}")
     desired_rule_id = payload.get("visibility_rule_id")
-    desired_reason = payload.get("visibility_reason") or f"{desired_source}:{desired_visibility}"
+    desired_reason = (
+        payload.get("visibility_reason") or f"{desired_source}:{desired_visibility}"
+    )
     existing_visibility = conn.execute(
         """
         SELECT visibility, visibility_source, reviewed_sha256,
@@ -2745,13 +2776,17 @@ def upsert_session(conn, data: dict):
         payload["visibility"] = _normalize_visibility(
             existing_visibility["visibility"], SESSION_VISIBILITIES
         )
-        payload["visibility_source"] = existing_visibility["visibility_source"] or "default"
+        payload["visibility_source"] = (
+            existing_visibility["visibility_source"] or "default"
+        )
     else:
         payload["visibility"] = "private"
         payload["visibility_source"] = "default"
     payload["visibility_rule_id"] = None
-    payload["visibility_reason"] = "initial private guard" if not existing_visibility else (
-        payload.get("visibility_reason") or "preserved during metadata sync"
+    payload["visibility_reason"] = (
+        "initial private guard"
+        if not existing_visibility
+        else (payload.get("visibility_reason") or "preserved during metadata sync")
     )
     payload["is_private"] = 1 if payload["visibility"] == "private" else 0
     cache_creation = max(0, int(payload.get("cache_creation_input_tokens", 0) or 0))
@@ -3069,7 +3104,7 @@ def insert_session_daily_usage(conn, session_id: str, daily_usage: list):
 
 def _chunked(values: list, size: int = 500):
     for start in range(0, len(values), size):
-        yield values[start:start + size]
+        yield values[start : start + size]
 
 
 def _session_rank(last_timestamp, first_timestamp, session_id) -> tuple[str, str, str]:
@@ -3194,9 +3229,10 @@ def apply_message_claims(conn, session_id: str, message_usage) -> set[str]:
         SELECT claim_key FROM _logpile_current_message_claims
         """
     )
-    if conn.execute(
-        "SELECT 1 FROM _logpile_touched_message_claims LIMIT 1"
-    ).fetchone() is None:
+    if (
+        conn.execute("SELECT 1 FROM _logpile_touched_message_claims LIMIT 1").fetchone()
+        is None
+    ):
         return set()
 
     affected: set[str] = {session_id}
@@ -3274,8 +3310,12 @@ def _refresh_native_mirror(conn, session_ids=None) -> None:
     """native_* = transcript totals for rows not governed by claims:
     codex (parse-time replay handling already makes totals live-only) and
     claudecode rows below CLAIMS_TOKEN_VERSION (no re-parseable bytes)."""
-    assignments = ", ".join(f"{native} = {transcript}" for native, transcript in NATIVE_TOKEN_COLUMNS)
-    drift_guard = " OR ".join(f"{native} != {transcript}" for native, transcript in NATIVE_TOKEN_COLUMNS)
+    assignments = ", ".join(
+        f"{native} = {transcript}" for native, transcript in NATIVE_TOKEN_COLUMNS
+    )
+    drift_guard = " OR ".join(
+        f"{native} != {transcript}" for native, transcript in NATIVE_TOKEN_COLUMNS
+    )
     scope, params = _native_scope_clause(session_ids)
     predicate = (
         "session_id IN (SELECT session_id FROM sessions "
@@ -3382,7 +3422,13 @@ def insert_tool_calls(conn, session_id: str, tool_calls):
     conn.executemany(
         "INSERT INTO tool_calls (session_id, tool_name, command, timestamp, is_error) VALUES (?,?,?,?,?)",
         (
-            (session_id, tc.tool_name, tc.command, tc.timestamp, 1 if tc.is_error else 0)
+            (
+                session_id,
+                tc.tool_name,
+                tc.command,
+                tc.timestamp,
+                1 if tc.is_error else 0,
+            )
             for tc in tool_calls
         ),
     )

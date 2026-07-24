@@ -11,8 +11,8 @@ from unittest import mock
 
 from click.testing import CliRunner
 
-from logpile.cli import cli
 import logpile.db as db_module
+from logpile.cli import cli
 from logpile.db import (
     ensure_user,
     get_db,
@@ -65,11 +65,7 @@ class SyncTests(unittest.TestCase):
         cwd: str = "/tmp/demo",
     ) -> Path:
         session_path = (
-            home
-            / ".claude"
-            / "projects"
-            / "-Users-alice-demo"
-            / f"{session_id}.jsonl"
+            home / ".claude" / "projects" / "-Users-alice-demo" / f"{session_id}.jsonl"
         )
         write_jsonl(
             session_path,
@@ -87,7 +83,8 @@ class SyncTests(unittest.TestCase):
                         "id": "msg-1",
                         "model": "claude-3.7",
                         "usage": {"input_tokens": 1, "output_tokens": 2},
-                        "content": assistant_content or [{"type": "text", "text": "hi"}],
+                        "content": assistant_content
+                        or [{"type": "text", "text": "hi"}],
                     },
                 },
             ],
@@ -97,7 +94,9 @@ class SyncTests(unittest.TestCase):
     def _init_git_repo(self, root: Path) -> tuple[Path, str, str]:
         repo = root / "repo"
         repo.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "init", str(repo)], check=True, capture_output=True, text=True
+        )
         subprocess.run(
             ["git", "-C", str(repo), "config", "user.email", "tests@example.com"],
             check=True,
@@ -111,7 +110,12 @@ class SyncTests(unittest.TestCase):
             text=True,
         )
         (repo / "README.md").write_text("hello\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "README.md"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         subprocess.run(
             ["git", "-C", str(repo), "commit", "-m", "init"],
             check=True,
@@ -144,13 +148,7 @@ class SyncTests(unittest.TestCase):
         total_output_tokens: int = 45,
     ) -> Path:
         session_path = (
-            home
-            / ".codex"
-            / "sessions"
-            / "2026"
-            / "04"
-            / "10"
-            / f"{session_id}.jsonl"
+            home / ".codex" / "sessions" / "2026" / "04" / "10" / f"{session_id}.jsonl"
         )
         write_jsonl(
             session_path,
@@ -183,7 +181,8 @@ class SyncTests(unittest.TestCase):
                                 "input_tokens": total_input_tokens,
                                 "cached_input_tokens": cached_input_tokens,
                                 "output_tokens": total_output_tokens,
-                                "total_tokens": total_input_tokens + total_output_tokens,
+                                "total_tokens": total_input_tokens
+                                + total_output_tokens,
                             }
                         },
                     },
@@ -399,9 +398,7 @@ class SyncTests(unittest.TestCase):
             self._write_claude_session(home, session_id="zzz-valid")
             db_path = root / "logpile.db"
 
-            result = sync_sessions(
-                root / "shared", db_path, "alice", "machine-1", home
-            )
+            result = sync_sessions(root / "shared", db_path, "alice", "machine-1", home)
 
             self.assertEqual((result.new, result.skipped), (1, 1))
             with open_sqlite(db_path) as conn:
@@ -413,7 +410,9 @@ class SyncTests(unittest.TestCase):
                 ]
             self.assertEqual(session_ids, ["zzz-valid"])
 
-    def test_manual_private_reconciles_shared_copy_even_if_file_is_unchanged(self) -> None:
+    def test_manual_private_reconciles_shared_copy_even_if_file_is_unchanged(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -475,7 +474,9 @@ class SyncTests(unittest.TestCase):
             self.assertTrue(copied_path.exists())
 
             with open_sqlite(db_path) as conn:
-                count = set_session_visibility(conn, "session-1", "private", shared_dir=shared)
+                count = set_session_visibility(
+                    conn, "session-1", "private", shared_dir=shared
+                )
                 conn.commit()
 
             self.assertEqual(count, 1)
@@ -533,7 +534,9 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(row["visibility"], "private")
             self._assert_private_archive(row["shared_path"], shared)
 
-    def test_private_transition_moves_rotated_only_transcript_to_private_archive(self) -> None:
+    def test_private_transition_moves_rotated_only_transcript_to_private_archive(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -590,9 +593,13 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(Path(row["shared_path"]), shared_copy)
             self.assertEqual(shared_copy.read_bytes(), expected)
             private_root = root / ".shared-private"
-            self.assertFalse(private_root.exists() and any(private_root.rglob("*.jsonl")))
+            self.assertFalse(
+                private_root.exists() and any(private_root.rglob("*.jsonl"))
+            )
 
-    def test_private_transition_rolls_storage_back_on_explicit_db_rollback(self) -> None:
+    def test_private_transition_rolls_storage_back_on_explicit_db_rollback(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -604,9 +611,7 @@ class SyncTests(unittest.TestCase):
             expected = shared_copy.read_bytes()
 
             with get_db(db_path) as conn:
-                set_session_visibility(
-                    conn, "session-1", "private", shared_dir=shared
-                )
+                set_session_visibility(conn, "session-1", "private", shared_dir=shared)
                 archive = Path(
                     conn.execute(
                         "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
@@ -636,23 +641,23 @@ class SyncTests(unittest.TestCase):
             shared_copy = shared / "alice" / "claudecode" / "demo" / source.name
             expected = shared_copy.read_bytes()
 
-            with mock.patch.object(
-                db_module._StorageTransactionConnection,
-                "_commit_database",
-                side_effect=sqlite3.OperationalError("forced commit failure"),
-            ):
-                with self.assertRaisesRegex(
+            with (
+                mock.patch.object(
+                    db_module._StorageTransactionConnection,
+                    "_commit_database",
+                    side_effect=sqlite3.OperationalError("forced commit failure"),
+                ),
+                self.assertRaisesRegex(
                     sqlite3.OperationalError, "forced commit failure"
-                ):
-                    with get_db(db_path) as conn:
-                        set_session_visibility(
-                            conn, "session-1", "private", shared_dir=shared
-                        )
-                        archive = Path(
-                            conn.execute(
-                                "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
-                            ).fetchone()[0]
-                        )
+                ),
+                get_db(db_path) as conn,
+            ):
+                set_session_visibility(conn, "session-1", "private", shared_dir=shared)
+                archive = Path(
+                    conn.execute(
+                        "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
+                    ).fetchone()[0]
+                )
 
             with open_sqlite(db_path) as conn:
                 row = conn.execute(
@@ -685,14 +690,14 @@ class SyncTests(unittest.TestCase):
                     + "\n"
                 )
 
-            with mock.patch(
-                "logpile.sync.refresh_native_usage",
-                side_effect=RuntimeError("forced late sync failure"),
+            with (
+                mock.patch(
+                    "logpile.sync.refresh_native_usage",
+                    side_effect=RuntimeError("forced late sync failure"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "forced late sync failure"),
             ):
-                with self.assertRaisesRegex(
-                    RuntimeError, "forced late sync failure"
-                ):
-                    sync_sessions(shared, db_path, "alice", "machine-1", home)
+                sync_sessions(shared, db_path, "alice", "machine-1", home)
 
             with open_sqlite(db_path) as conn:
                 row = conn.execute(
@@ -716,9 +721,7 @@ class SyncTests(unittest.TestCase):
                 db_path = root / "logpile.db"
                 source = self._write_claude_session(home)
                 sync_sessions(shared, db_path, "alice", "machine-1", home)
-                shared_copy = (
-                    shared / "alice" / "claudecode" / "demo" / source.name
-                )
+                shared_copy = shared / "alice" / "claudecode" / "demo" / source.name
                 expected = shared_copy.read_bytes()
                 private_root = root / ".shared-private"
                 # Sync eagerly claims the private root; the attacker removes
@@ -737,14 +740,16 @@ class SyncTests(unittest.TestCase):
                     else:
                         nested.write_text("not a directory", encoding="utf-8")
 
-                with get_db(db_path) as conn:
-                    with self.assertRaisesRegex(
+                with (
+                    get_db(db_path) as conn,
+                    self.assertRaisesRegex(
                         _sync_module.StorageSafetyError,
                         "private archive component",
-                    ):
-                        set_session_visibility(
-                            conn, "session-1", "private", shared_dir=shared
-                        )
+                    ),
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "private", shared_dir=shared
+                    )
 
                 with open_sqlite(db_path) as conn:
                     row = conn.execute(
@@ -772,7 +777,12 @@ class SyncTests(unittest.TestCase):
                         "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
                     ).fetchone()[0]
                 )
-                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "no publish review was required"
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
                 conn.commit()
                 row = conn.execute(
                     "SELECT visibility, shared_path FROM sessions WHERE session_id = 'session-1'"
@@ -796,17 +806,16 @@ class SyncTests(unittest.TestCase):
             source.unlink()
 
             with get_db(db_path) as conn:
-                set_session_visibility(
-                    conn, "session-1", "private", shared_dir=shared
-                )
+                set_session_visibility(conn, "session-1", "private", shared_dir=shared)
 
             with get_db(db_path) as conn:
-                set_session_visibility(
-                    conn, "session-1", "unlisted", shared_dir=shared
-                )
-                set_session_visibility(
-                    conn, "session-1", "private", shared_dir=shared
-                )
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "no publish review was required"
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
+                set_session_visibility(conn, "session-1", "private", shared_dir=shared)
 
             with open_sqlite(db_path) as conn:
                 row = conn.execute(
@@ -896,9 +905,7 @@ class SyncTests(unittest.TestCase):
             sync_sessions(shared, db_path, "alice", "machine-1", home)
             source.unlink()
             with get_db(db_path) as conn:
-                set_session_visibility(
-                    conn, "session-1", "private", shared_dir=shared
-                )
+                set_session_visibility(conn, "session-1", "private", shared_dir=shared)
             with open_sqlite(db_path) as conn:
                 archive = Path(
                     conn.execute(
@@ -922,15 +929,17 @@ class SyncTests(unittest.TestCase):
                     BEGIN SELECT RAISE(ABORT, 'forced promotion failure'); END
                     """
                 )
-                with mock.patch.object(
-                    Path, "unlink", autospec=True, side_effect=fail_shared_unlink
-                ):
-                    with self.assertRaisesRegex(
+                with (
+                    mock.patch.object(
+                        Path, "unlink", autospec=True, side_effect=fail_shared_unlink
+                    ),
+                    self.assertRaisesRegex(
                         sqlite3.IntegrityError, "forced promotion failure"
-                    ):
-                        set_session_visibility(
-                            conn, "session-1", "unlisted", shared_dir=shared
-                        )
+                    ),
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
 
             self.assertFalse(shared_copy.exists())
             self.assertTrue(archive.exists())
@@ -951,9 +960,7 @@ class SyncTests(unittest.TestCase):
                 db_path = root / "logpile.db"
                 source = self._write_claude_session(home)
                 sync_sessions(shared, db_path, "alice", "machine-1", home)
-                shared_copy = (
-                    shared / "alice" / "claudecode" / "demo" / source.name
-                )
+                shared_copy = shared / "alice" / "claudecode" / "demo" / source.name
                 source.unlink()
                 shared_copy.unlink()
                 if kind == "directory":
@@ -961,14 +968,16 @@ class SyncTests(unittest.TestCase):
                 else:
                     os.mkfifo(shared_copy)
 
-                with get_db(db_path) as conn:
-                    with self.assertRaisesRegex(
+                with (
+                    get_db(db_path) as conn,
+                    self.assertRaisesRegex(
                         _sync_module.StorageSafetyError,
                         "non-regular or unsafe shared transcript",
-                    ):
-                        set_session_visibility(
-                            conn, "session-1", "private", shared_dir=shared
-                        )
+                    ),
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "private", shared_dir=shared
+                    )
 
                 self.assertTrue(shared_copy.exists())
                 with open_sqlite(db_path) as conn:
@@ -990,9 +999,7 @@ class SyncTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 _sync_module.StorageSafetyError, "symlink shared storage component"
             ):
-                sync_sessions(
-                    shared, root / "symlink.db", "alice", "machine-1", home
-                )
+                sync_sessions(shared, root / "symlink.db", "alice", "machine-1", home)
             self.assertEqual(list(outside.iterdir()), [])
 
         with tempfile.TemporaryDirectory() as td:
@@ -1007,14 +1014,14 @@ class SyncTests(unittest.TestCase):
             user_dir.rename(real_user_dir)
             user_dir.symlink_to(real_user_dir, target_is_directory=True)
 
-            with get_db(db_path) as conn:
-                with self.assertRaisesRegex(
+            with (
+                get_db(db_path) as conn,
+                self.assertRaisesRegex(
                     _sync_module.StorageSafetyError,
                     "non-regular or unsafe shared transcript",
-                ):
-                    set_session_visibility(
-                        conn, "session-1", "private", shared_dir=shared
-                    )
+                ),
+            ):
+                set_session_visibility(conn, "session-1", "private", shared_dir=shared)
 
             outside_copy = real_user_dir / "claudecode" / "demo" / source.name
             self.assertTrue(outside_copy.exists())
@@ -1047,26 +1054,22 @@ class SyncTests(unittest.TestCase):
             return mock.Mock()
 
         conn.execute.side_effect = execute
-        first = mock.Mock(
-            archive_path=Path("/private/first.jsonl"), changed=True
-        )
-        second = mock.Mock(
-            archive_path=Path("/private/second.jsonl"), changed=True
-        )
+        first = mock.Mock(archive_path=Path("/private/first.jsonl"), changed=True)
+        second = mock.Mock(archive_path=Path("/private/second.jsonl"), changed=True)
         second.rollback.side_effect = _sync_module.StorageSafetyError(
             "forced rollback failure"
         )
 
-        with mock.patch(
-            "logpile.sync._prepare_sync_shared_copy",
-            side_effect=[first, second],
-        ):
-            with self.assertRaisesRegex(
+        with (
+            mock.patch(
+                "logpile.sync._prepare_sync_shared_copy",
+                side_effect=[first, second],
+            ),
+            self.assertRaisesRegex(
                 _sync_module.StorageSafetyError, "forced rollback failure"
-            ):
-                _sync_module.reconcile_session_storage(
-                    conn, shared_dir=Path("/shared")
-                )
+            ),
+        ):
+            _sync_module.reconcile_session_storage(conn, shared_dir=Path("/shared"))
 
         second.rollback.assert_called_once_with()
         first.rollback.assert_called_once_with()
@@ -1114,9 +1117,7 @@ class SyncTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(result.exit_code, 1, result.output)
-            self.assertIn(
-                "no source or shared transcript survives", result.output
-            )
+            self.assertIn("no source or shared transcript survives", result.output)
 
     def test_private_marker_tightens_existing_claude_and_codex_rows(self) -> None:
         for source_name in ("claudecode", "codex"):
@@ -1159,7 +1160,10 @@ class SyncTests(unittest.TestCase):
                                         "type": "message",
                                         "role": "user",
                                         "content": [
-                                            {"type": "input_text", "text": "# logpile:private"}
+                                            {
+                                                "type": "input_text",
+                                                "text": "# logpile:private",
+                                            }
                                         ],
                                     },
                                 }
@@ -1260,7 +1264,15 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(session["project"], "demo")
             self.assertEqual(session["workspace_root"], "/tmp/demo")
             self.assertEqual(
-                [(row["display_path"], row["operation"], row["source"], row["occurrence_count"]) for row in paths],
+                [
+                    (
+                        row["display_path"],
+                        row["operation"],
+                        row["source"],
+                        row["occurrence_count"],
+                    )
+                    for row in paths
+                ],
                 [
                     ("src/app.py", "search", "command", 1),
                     ("src/app.py", "write", "tool_input", 1),
@@ -1397,7 +1409,17 @@ class SyncTests(unittest.TestCase):
             repo, _, commit = self._init_git_repo(root)
             worktree = root / "repo-feature"
             subprocess.run(
-                ["git", "-C", str(repo), "worktree", "add", "-b", "feature/logpile", str(worktree), "HEAD"],
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/logpile",
+                    str(worktree),
+                    "HEAD",
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -1475,14 +1497,54 @@ class SyncTests(unittest.TestCase):
                             "model": "claude-3.7",
                             "usage": {"input_tokens": 1, "output_tokens": 2},
                             "content": [
-                                {"type": "tool_use", "name": "Edit", "id": "edit-1", "input": {"file_path": "src/app.py"}},
-                                {"type": "tool_use", "name": "Bash", "id": "test-1", "input": {"command": "pytest -q"}},
-                                {"type": "tool_use", "name": "Bash", "id": "lint-1", "input": {"command": "ruff check src"}},
-                                {"type": "tool_use", "name": "Bash", "id": "build-1", "input": {"command": "npm run build"}},
-                                {"type": "tool_use", "name": "Bash", "id": "format-1", "input": {"command": "prettier --write src/app.ts"}},
-                                {"type": "tool_use", "name": "Bash", "id": "status-1", "input": {"command": "git status --short"}},
-                                {"type": "tool_use", "name": "Bash", "id": "diff-1", "input": {"command": "git diff --stat"}},
-                                {"type": "tool_use", "name": "Bash", "id": "commit-1", "input": {"command": "git commit -m ship"}},
+                                {
+                                    "type": "tool_use",
+                                    "name": "Edit",
+                                    "id": "edit-1",
+                                    "input": {"file_path": "src/app.py"},
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": "test-1",
+                                    "input": {"command": "pytest -q"},
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": "lint-1",
+                                    "input": {"command": "ruff check src"},
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": "build-1",
+                                    "input": {"command": "npm run build"},
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": "format-1",
+                                    "input": {"command": "prettier --write src/app.ts"},
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": "status-1",
+                                    "input": {"command": "git status --short"},
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": "diff-1",
+                                    "input": {"command": "git diff --stat"},
+                                },
+                                {
+                                    "type": "tool_use",
+                                    "name": "Bash",
+                                    "id": "commit-1",
+                                    "input": {"command": "git commit -m ship"},
+                                },
                             ],
                         },
                     },
@@ -1491,13 +1553,48 @@ class SyncTests(unittest.TestCase):
                         "type": "user",
                         "message": {
                             "content": [
-                                {"type": "tool_result", "tool_use_id": "test-1", "is_error": True, "content": "1 failed"},
-                                {"type": "tool_result", "tool_use_id": "lint-1", "is_error": True, "content": "E999"},
-                                {"type": "tool_result", "tool_use_id": "build-1", "is_error": False, "content": "built"},
-                                {"type": "tool_result", "tool_use_id": "format-1", "is_error": False, "content": "formatted"},
-                                {"type": "tool_result", "tool_use_id": "status-1", "is_error": False, "content": "M src/app.py"},
-                                {"type": "tool_result", "tool_use_id": "diff-1", "is_error": False, "content": " src/app.py | 2 +-"},
-                                {"type": "tool_result", "tool_use_id": "commit-1", "is_error": False, "content": "[main abc123] ship"},
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "test-1",
+                                    "is_error": True,
+                                    "content": "1 failed",
+                                },
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "lint-1",
+                                    "is_error": True,
+                                    "content": "E999",
+                                },
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "build-1",
+                                    "is_error": False,
+                                    "content": "built",
+                                },
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "format-1",
+                                    "is_error": False,
+                                    "content": "formatted",
+                                },
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "status-1",
+                                    "is_error": False,
+                                    "content": "M src/app.py",
+                                },
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "diff-1",
+                                    "is_error": False,
+                                    "content": " src/app.py | 2 +-",
+                                },
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "commit-1",
+                                    "is_error": False,
+                                    "content": "[main abc123] ship",
+                                },
                             ]
                         },
                     },
@@ -1717,7 +1814,9 @@ class SyncTests(unittest.TestCase):
 
             with open_sqlite(db_path) as conn:
                 conn.execute("DELETE FROM session_paths WHERE session_id = 'session-1'")
-                conn.execute("UPDATE sessions SET workspace_root = NULL WHERE session_id = 'session-1'")
+                conn.execute(
+                    "UPDATE sessions SET workspace_root = NULL WHERE session_id = 'session-1'"
+                )
                 conn.commit()
 
             counts = sync_sessions(
@@ -1764,7 +1863,10 @@ class SyncTests(unittest.TestCase):
                     SET shared_path = ?, source_path = ?
                     WHERE session_id = 'session-1'
                     """,
-                    ("/other/machine/shared/session-1.jsonl", "/missing/source/session-1.jsonl"),
+                    (
+                        "/other/machine/shared/session-1.jsonl",
+                        "/missing/source/session-1.jsonl",
+                    ),
                 )
                 conn.commit()
 
@@ -1784,7 +1886,9 @@ class SyncTests(unittest.TestCase):
             self._write_claude_session(home)
 
             (home / ".logpile-ignore").parent.mkdir(parents=True, exist_ok=True)
-            (home / ".logpile-ignore").write_text("*session-1.jsonl\n", encoding="utf-8")
+            (home / ".logpile-ignore").write_text(
+                "*session-1.jsonl\n", encoding="utf-8"
+            )
 
             counts = sync_sessions(
                 shared_dir=shared,
@@ -1916,13 +2020,14 @@ class SyncTests(unittest.TestCase):
                 conn.commit()
 
             self._write_claude_session(home, session_id="session-1", message="first")
-            sync_sessions(
-                shared_dir=shared,
-                db_path=db_path,
-                username="alice",
-                machine="machine-1",
-                home=home,
-            )
+            with self.assertWarnsRegex(RuntimeWarning, "kept this session unlisted"):
+                sync_sessions(
+                    shared_dir=shared,
+                    db_path=db_path,
+                    username="alice",
+                    machine="machine-1",
+                    home=home,
+                )
 
             with open_sqlite(db_path) as conn:
                 update_user(conn, "alice", default_session_visibility="unlisted")
@@ -1950,8 +2055,14 @@ class SyncTests(unittest.TestCase):
                     """
                 ).fetchone()
 
-            self.assertEqual((rows[0]["session_id"], rows[0]["visibility"]), ("session-1", "unlisted"))
-            self.assertEqual((rows[1]["session_id"], rows[1]["visibility"]), ("session-2", "unlisted"))
+            self.assertEqual(
+                (rows[0]["session_id"], rows[0]["visibility"]),
+                ("session-1", "unlisted"),
+            )
+            self.assertEqual(
+                (rows[1]["session_id"], rows[1]["visibility"]),
+                ("session-2", "unlisted"),
+            )
             self.assertEqual(guarded["to_visibility"], "unlisted")
             self.assertIn("successful review record", guarded["warning"])
 
@@ -1959,13 +2070,13 @@ class SyncTests(unittest.TestCase):
 # --- archive-integrity tests -------------------------------------------------
 # Imports are grouped here (not at top of file) so this block stays a single
 # self-contained appended hunk.
-import errno as _errno  # noqa: E402
-import fcntl as _fcntl  # noqa: E402
-import shutil as _shutil  # noqa: E402
-from unittest import mock as _mock  # noqa: E402
+import errno as _errno
+import fcntl as _fcntl
+import shutil as _shutil
+from unittest import mock as _mock
 
-from logpile import sync as _sync_module  # noqa: E402
-from logpile.sync import _copy_session  # noqa: E402
+from logpile import sync as _sync_module
+from logpile.sync import _copy_session
 
 
 class CopySessionAtomicityTests(unittest.TestCase):
@@ -2038,9 +2149,11 @@ class CopySessionAtomicityTests(unittest.TestCase):
             dst.write(b"partial")
             raise OSError(_errno.EIO, "boom")
 
-        with _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=boom):
-            with self.assertRaises(OSError):
-                _copy_session(self.src, self.dst)
+        with (
+            _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=boom),
+            self.assertRaises(OSError),
+        ):
+            _copy_session(self.src, self.dst)
         self.assertEqual(self.dst.read_text(), "previous complete copy\n")
         self.assertEqual(self._tmp_leftovers(), [])
 
@@ -2050,9 +2163,11 @@ class CopySessionAtomicityTests(unittest.TestCase):
         def full(src, dst):
             raise OSError(_errno.ENOSPC, "disk full")
 
-        with _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=full):
-            with self.assertRaises(OSError) as raised:
-                _copy_session(self.src, self.dst)
+        with (
+            _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=full),
+            self.assertRaises(OSError) as raised,
+        ):
+            _copy_session(self.src, self.dst)
         self.assertEqual(raised.exception.errno, _errno.ENOSPC)
         self.assertFalse(self.dst.is_symlink())
         self.assertEqual(self.dst.read_text(), "previous complete copy\n")
@@ -2061,9 +2176,11 @@ class CopySessionAtomicityTests(unittest.TestCase):
         def full(src, dst):
             raise OSError(_errno.ENOSPC, "disk full")
 
-        with _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=full):
-            with self.assertRaises(OSError) as raised:
-                _copy_session(self.src, self.dst)
+        with (
+            _mock.patch.object(_sync_module.shutil, "copyfileobj", side_effect=full),
+            self.assertRaises(OSError) as raised,
+        ):
+            _copy_session(self.src, self.dst)
         self.assertEqual(raised.exception.errno, _errno.ENOSPC)
         self.assertFalse(self.dst.exists())
         self.assertFalse(self.dst.is_symlink())
@@ -2533,7 +2650,9 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             root = Path(td)
             home = root / "home"
             archived = self._write_codex_rollout(
-                home, root=".codex/archived_sessions/2026/03/17", session_id="rollout-archived"
+                home,
+                root=".codex/archived_sessions/2026/03/17",
+                session_id="rollout-archived",
             )
             extra_home = self._write_codex_rollout(
                 home, root=".codex-2/sessions/2026/04/10", session_id="rollout-codex2"
@@ -2562,11 +2681,15 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             root = Path(td)
             home = root / "home"
             live = self._write_codex_rollout(
-                home, root=".codex/sessions/2026/04/10", session_id="rollout-dup",
+                home,
+                root=".codex/sessions/2026/04/10",
+                session_id="rollout-dup",
                 message="live continuation",
             )
             self._write_codex_rollout(
-                home, root=".codex/archived_sessions/2026/04/10", session_id="rollout-dup",
+                home,
+                root=".codex/archived_sessions/2026/04/10",
+                session_id="rollout-dup",
                 message="stale archived copy",
             )
 
@@ -2699,7 +2822,11 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             root = Path(td)
             home = root / "home"
             write_jsonl(
-                home / ".claude" / "projects" / "-Users-alice-demo" / "cache-writes.jsonl",
+                home
+                / ".claude"
+                / "projects"
+                / "-Users-alice-demo"
+                / "cache-writes.jsonl",
                 [
                     {
                         "timestamp": "2026-07-02T10:00:00Z",
@@ -2755,7 +2882,9 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
                 "logpile.sync.file_hash",
                 side_effect=AssertionError("file_hash called on unchanged files"),
             ):
-                new, updated, skipped = sync_sessions(shared, db_path, "alice", "m1", home)
+                new, updated, skipped = sync_sessions(
+                    shared, db_path, "alice", "m1", home
+                )
             self.assertEqual((new, updated), (0, 0))
             self.assertEqual(skipped, 2)
 
@@ -2823,7 +2952,9 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             self.assertEqual(row["source_path"], str(archived))
             self.assertEqual(row["total_input_tokens"], 1200)
 
-    def test_live_to_archive_rename_between_stat_and_hash_is_retried_in_archive_root(self) -> None:
+    def test_live_to_archive_rename_between_stat_and_hash_is_retried_in_archive_root(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -2852,7 +2983,9 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(row["source_path"], str(archived))
 
-    def test_live_to_archive_rename_between_hash_and_parse_is_retried_in_archive_root(self) -> None:
+    def test_live_to_archive_rename_between_hash_and_parse_is_retried_in_archive_root(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
@@ -2923,15 +3056,15 @@ class SyncLockTests(unittest.TestCase):
             root = Path(tmp)
             home = root / "home"
             home.mkdir()
-            with _mock.patch.object(
-                _sync_module.fcntl,
-                "flock",
-                side_effect=OSError(_errno.ENOTSUP, "locking unsupported"),
+            with (
+                _mock.patch.object(
+                    _sync_module.fcntl,
+                    "flock",
+                    side_effect=OSError(_errno.ENOTSUP, "locking unsupported"),
+                ),
+                self.assertRaises(_sync_module.SyncLockError),
             ):
-                with self.assertRaises(_sync_module.SyncLockError):
-                    sync_sessions(
-                        root / "shared", root / "logpile.db", "alice", "m1", home
-                    )
+                sync_sessions(root / "shared", root / "logpile.db", "alice", "m1", home)
 
     def test_sync_lock_rejects_symlink_without_touching_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2976,19 +3109,19 @@ class SyncLockTests(unittest.TestCase):
             home = root / "home"
             home.mkdir()
             fake_stat = _mock.Mock(st_mode=0o010600)
-            with _mock.patch.object(
-                _sync_module.os, "fstat", return_value=fake_stat
-            ):
-                with self.assertRaisesRegex(
+            with (
+                _mock.patch.object(_sync_module.os, "fstat", return_value=fake_stat),
+                self.assertRaisesRegex(
                     _sync_module.SyncLockError, "non-regular sync lock"
-                ):
-                    sync_sessions(
-                        root / "shared",
-                        root / "logpile.db",
-                        "alice",
-                        "m1",
-                        home,
-                    )
+                ),
+            ):
+                sync_sessions(
+                    root / "shared",
+                    root / "logpile.db",
+                    "alice",
+                    "m1",
+                    home,
+                )
 
 
 class RuntimePermissionTests(unittest.TestCase):
@@ -3025,7 +3158,11 @@ class RuntimePermissionTests(unittest.TestCase):
             lock_path = Path(f"{db_path}.sync.lock")
             self.assertEqual(runtime.stat().st_mode & 0o777, 0o700)
             self.assertEqual(shared.stat().st_mode & 0o777, 0o700)
-            for directory in (copied.parent, copied.parent.parent, copied.parent.parent.parent):
+            for directory in (
+                copied.parent,
+                copied.parent.parent,
+                copied.parent.parent.parent,
+            ):
                 self.assertEqual(directory.stat().st_mode & 0o777, 0o700, directory)
             self.assertEqual(db_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(lock_path.stat().st_mode & 0o777, 0o600)

@@ -13,10 +13,9 @@ import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Optional, TextIO
-
+from typing import Any, TextIO
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +23,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ToolCall:
     tool_name: str
-    command: Optional[str] = None
-    timestamp: Optional[str] = None
+    command: str | None = None
+    timestamp: str | None = None
     is_error: bool = False
     operation: str = "other"
     input_paths: list[str] = field(default_factory=list)
     command_paths: list[str] = field(default_factory=list)
-    call_id: Optional[str] = None
+    call_id: str | None = None
 
 
 @dataclass
@@ -71,8 +70,8 @@ class MessageUsage:
     """
 
     claim_key: str
-    day: Optional[str]  # YYYY-MM-DD (UTC), None when the record has no timestamp
-    model: Optional[str]
+    day: str | None  # YYYY-MM-DD (UTC), None when the record has no timestamp
+    model: str | None
     fresh_input_tokens: int = 0
     cached_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
@@ -87,12 +86,12 @@ class SessionPath:
     raw_path: str
     normalized_path: str
     display_path: str
-    relative_path: Optional[str]
+    relative_path: str | None
     operation: str
     source: str
-    repo_relative_path: Optional[str] = None
-    tool_name: Optional[str] = None
-    timestamp: Optional[str] = None
+    repo_relative_path: str | None = None
+    tool_name: str | None = None
+    timestamp: str | None = None
 
 
 @dataclass
@@ -100,8 +99,8 @@ class SessionInfo:
     session_id: str
     source: str  # 'claudecode' or 'codex'
     project: str
-    first_timestamp: Optional[str] = None
-    last_timestamp: Optional[str] = None
+    first_timestamp: str | None = None
+    last_timestamp: str | None = None
     user_message_count: int = 0
     assistant_message_count: int = 0
     tool_call_count: int = 0
@@ -116,16 +115,18 @@ class SessionInfo:
     cache_creation_unknown_input_tokens: int = 0
     reasoning_output_tokens: int = 0
     first_user_message: str = ""
-    model: Optional[str] = None
-    workspace_root: Optional[str] = None
-    thread_id: Optional[str] = None
-    parent_thread_id: Optional[str] = None
-    parent_session_id: Optional[str] = None
+    model: str | None = None
+    workspace_root: str | None = None
+    thread_id: str | None = None
+    parent_thread_id: str | None = None
+    parent_session_id: str | None = None
     spawn_depth: int = 0
     tool_calls: Sequence[ToolCall] = field(default_factory=list)
     session_paths: Sequence[SessionPath] = field(default_factory=list)
     daily_usage: Sequence[DailyUsage] = field(default_factory=list)
-    message_usage: Sequence[MessageUsage] = field(default_factory=list)  # claudecode only
+    message_usage: Sequence[MessageUsage] = field(
+        default_factory=list
+    )  # claudecode only
 
 
 class _SqliteSequence(Sequence):
@@ -166,8 +167,7 @@ class _SqliteSequence(Sequence):
         if index < 0:
             raise IndexError(index)
         row = self._spool.connection.execute(
-            f"SELECT {self._columns} FROM {self._table} "
-            "ORDER BY seq LIMIT 1 OFFSET ?",
+            f"SELECT {self._columns} FROM {self._table} ORDER BY seq LIMIT 1 OFFSET ?",
             (index,),
         ).fetchone()
         if row is None:
@@ -599,10 +599,12 @@ _CODEX_AGENTS_INSTRUCTIONS_PREFIX = "# AGENTS.md instructions"
 def _is_codex_agents_payload(text: str) -> bool:
     if not text.startswith(_CODEX_AGENTS_INSTRUCTIONS_PREFIX):
         return False
-    remainder = text[len(_CODEX_AGENTS_INSTRUCTIONS_PREFIX):].lstrip()
+    remainder = text[len(_CODEX_AGENTS_INSTRUCTIONS_PREFIX) :].lstrip()
     # Injections continue with an absolute directory or the wrapper block;
     # prose like "for beginners: …" matches neither.
-    return remainder.startswith("for /") or remainder.startswith("<INSTRUCTIONS>")
+    return remainder.startswith(("for /", "<INSTRUCTIONS>"))
+
+
 # Long opaque tokens are not useful transcript prose and are commonly image,
 # encrypted-thinking, or other base64 payloads. Standard MIME base64 wraps at
 # 76 columns, so remove both continuous tokens and multi-line wrapped runs.
@@ -704,8 +706,10 @@ def _malformed_record_field(record: dict) -> tuple[str, Any] | None:
     if "cwd" in record and cwd is not None and not isinstance(cwd, str):
         return "cwd", cwd
     record_id = record.get("id")
-    if "id" in record and record_id is not None and not isinstance(
-        record_id, (str, int)
+    if (
+        "id" in record
+        and record_id is not None
+        and not isinstance(record_id, (str, int))
     ):
         return "id", record_id
     for field_name in ("message", "payload"):
@@ -908,9 +912,9 @@ def strip_harness_preamble(value: str | None) -> str:
         closing = f"</{match.group(1)}>"
         closing_at = text.find(closing)
         if closing_at >= 0:
-            text = text[closing_at + len(closing):].strip()
+            text = text[closing_at + len(closing) :].strip()
         else:
-            text = text[match.end():].strip()
+            text = text[match.end() :].strip()
     # A codex session whose stored title IS the injected AGENTS.md payload
     # has no operator title; the stored row itself is healed separately by a
     # future token-version reparse.
@@ -939,13 +943,13 @@ def strip_transcript_harness_preamble(value: str | None) -> str:
         closing = f"</{match.group(1)}>"
         closing_at = text.find(closing)
         if closing_at >= 0:
-            text = text[closing_at + len(closing):].strip()
+            text = text[closing_at + len(closing) :].strip()
         elif match.group(1).lower() == "recommended_plugins":
             # Unlike a generic orphan tag, an unclosed plugin catalog has no
             # trustworthy boundary between injected text and operator prose.
             return ""
         else:
-            text = text[match.end():].strip()
+            text = text[match.end() :].strip()
     return text
 
 
@@ -989,15 +993,12 @@ def _credible_unpadded_base64_tail(prefix: str, complete: str) -> bool:
     complete_bytes = _decode_canonical_base64(complete, minimum_length=64)
     if prefix_bytes is None or complete_bytes is None:
         return False
-    tail = complete_bytes[len(prefix_bytes):]
+    tail = complete_bytes[len(prefix_bytes) :]
     if not tail:
         return False
 
     def printable_ratio(value: bytes) -> float:
-        printable = sum(
-            byte in {9, 10, 13} or 32 <= byte <= 126
-            for byte in value
-        )
+        printable = sum(byte in {9, 10, 13} or 32 <= byte <= 126 for byte in value)
         return printable / len(value)
 
     return printable_ratio(prefix_bytes) < 0.85 or printable_ratio(tail) >= 0.85
@@ -1049,11 +1050,9 @@ def _remove_spaced_base64(match: re.Match[str]) -> str:
             short = tokens[equal_end].group(0)
             short_width = len(short.rstrip("="))
             if 2 <= short_width <= width:
-                prefix = "".join(
-                    token.group(0) for token in tokens[start:equal_end]
-                )
+                prefix = "".join(token.group(0) for token in tokens[start:equal_end])
                 candidate = "".join(
-                    token.group(0) for token in tokens[start:equal_end + 1]
+                    token.group(0) for token in tokens[start : equal_end + 1]
                 )
                 tail_is_credible = short.endswith("=") or (
                     _credible_unpadded_base64_tail(prefix, candidate)
@@ -1064,31 +1063,24 @@ def _remove_spaced_base64(match: re.Match[str]) -> str:
                 ):
                     candidate_end = equal_end + 1
         if candidate_end is None and equal_end - start >= 2:
-            candidate = "".join(
-                token.group(0) for token in tokens[start:equal_end]
-            )
+            candidate = "".join(token.group(0) for token in tokens[start:equal_end])
             if _canonical_base64_payload(candidate, minimum_length=64):
                 candidate_end = equal_end
-            elif (
-                equal_end - start >= 3
-                and tokens[equal_end - 1].group(0).endswith("=")
+            elif equal_end - start >= 3 and tokens[equal_end - 1].group(0).endswith(
+                "="
             ):
                 # A malformed padded terminal must not make us retry every
                 # suffix of a huge equal-width run. Remove the canonical
                 # full-chunk prefix if possible, then skip the terminal once.
                 prefix_end = equal_end - 1
-                prefix = "".join(
-                    token.group(0) for token in tokens[start:prefix_end]
-                )
+                prefix = "".join(token.group(0) for token in tokens[start:prefix_end])
                 if _canonical_base64_payload(prefix, minimum_length=64):
                     candidate_end = prefix_end
 
         if candidate_end is None:
             start = max(start + 1, equal_end)
             continue
-        removals.append(
-            (tokens[start].start(), tokens[candidate_end - 1].end())
-        )
+        removals.append((tokens[start].start(), tokens[candidate_end - 1].end()))
         start = candidate_end
 
     if not removals:
@@ -1207,7 +1199,7 @@ def _bounded_lines(
                     else:
                         pending.append(chunk)
                 break
-            head, chunk = chunk[:newline_at], chunk[newline_at + 1:]
+            head, chunk = chunk[:newline_at], chunk[newline_at + 1 :]
             if skipping:
                 skipping = False
                 stats.malformed_fields["line:oversized"] = (
@@ -1255,7 +1247,7 @@ def _iter_jsonl(
     stream_context = (
         nullcontext(path)
         if hasattr(path, "read")
-        else open(path, encoding="utf-8", errors="replace")
+        else open(path, encoding="utf-8", errors="replace")  # noqa: SIM115 - entered via `with stream_context` below
     )
     try:
         if hasattr(path, "seek"):
@@ -1303,7 +1295,7 @@ def _iter_jsonl(
             )
 
 
-def _normalize_codex_record(record: dict) -> tuple[str, dict, Optional[str]]:
+def _normalize_codex_record(record: dict) -> tuple[str, dict, str | None]:
     """Return (record_type, payload, timestamp) for old and new Codex formats."""
     record_type = record.get("type", record.get("record_type", ""))
     timestamp = record.get("timestamp")
@@ -1312,7 +1304,9 @@ def _normalize_codex_record(record: dict) -> tuple[str, dict, Optional[str]]:
         payload = record["payload"]
         return payload.get("type", ""), payload, timestamp
 
-    if record_type in {"session_meta", "event_msg", "turn_context"} and isinstance(record.get("payload"), dict):
+    if record_type in {"session_meta", "event_msg", "turn_context"} and isinstance(
+        record.get("payload"), dict
+    ):
         return record_type, record["payload"], timestamp
 
     return record_type, record, timestamp
@@ -1330,7 +1324,9 @@ def _load_tool_args(arguments: Any) -> dict:
     return loaded if isinstance(loaded, dict) else {}
 
 
-def _extract_codex_token_totals(record_type: str, payload: dict) -> tuple[int, int, int, int] | None:
+def _extract_codex_token_totals(
+    record_type: str, payload: dict
+) -> tuple[int, int, int, int] | None:
     if record_type != "event_msg":
         return None
     if payload.get("type") != "token_count":
@@ -1386,7 +1382,7 @@ def _is_explicit_codex_counter_reset(record_type: str, payload: dict) -> bool:
         return False
 
 
-def _day_of(timestamp: Optional[str]) -> Optional[str]:
+def _day_of(timestamp: str | None) -> str | None:
     if not isinstance(timestamp, str) or not timestamp.strip():
         return None
     value = timestamp.strip()
@@ -1397,11 +1393,11 @@ def _day_of(timestamp: Optional[str]) -> Optional[str]:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).date().isoformat()
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).date().isoformat()
 
 
-def _daily_bucket(daily: dict, timestamp: Optional[str]) -> Optional[DailyUsage]:
+def _daily_bucket(daily: dict, timestamp: str | None) -> DailyUsage | None:
     day = _day_of(timestamp)
     if day is None:
         return None
@@ -1415,13 +1411,13 @@ def _sorted_daily(daily: dict) -> list[DailyUsage]:
     return [daily[day] for day in sorted(daily)]
 
 
-def _string_id(value: Any) -> Optional[str]:
+def _string_id(value: Any) -> str | None:
     if isinstance(value, (str, int)) and str(value):
         return str(value)
     return None
 
 
-def _timestamp_epoch_second(timestamp: Optional[str]) -> Optional[int]:
+def _timestamp_epoch_second(timestamp: str | None) -> int | None:
     if not isinstance(timestamp, str) or not timestamp.strip():
         return None
     value = timestamp.strip()
@@ -1432,11 +1428,11 @@ def _timestamp_epoch_second(timestamp: Optional[str]) -> Optional[int]:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return int(parsed.timestamp())
 
 
-def _started_at_epoch_second(value: Any) -> Optional[int]:
+def _started_at_epoch_second(value: Any) -> int | None:
     try:
         started_at = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -1487,7 +1483,7 @@ def _codex_replay_window(records: list) -> tuple[int, int]:
     return 1, len(records)
 
 
-def _extract_command(arguments: dict) -> Optional[str]:
+def _extract_command(arguments: dict) -> str | None:
     raw_cmd = arguments.get("command") or arguments.get("cmd")
     if isinstance(raw_cmd, list):
         if len(raw_cmd) >= 3 and raw_cmd[1] == "-lc":
@@ -1500,13 +1496,31 @@ def _extract_command(arguments: dict) -> Optional[str]:
 
 def _infer_operation(tool_name: str | None, command: str | None = None) -> str:
     lowered = (tool_name or "").lower()
-    if any(part in lowered for part in ("edit", "write", "replace", "patch", "apply", "create", "delete", "rename", "move")):
+    if any(
+        part in lowered
+        for part in (
+            "edit",
+            "write",
+            "replace",
+            "patch",
+            "apply",
+            "create",
+            "delete",
+            "rename",
+            "move",
+        )
+    ):
         return "write"
     if any(part in lowered for part in ("read", "open", "view", "load", "cat")):
         return "read"
-    if any(part in lowered for part in ("search", "find", "grep", "glob", "list", "ls", "scan")):
+    if any(
+        part in lowered
+        for part in ("search", "find", "grep", "glob", "list", "ls", "scan")
+    ):
         return "search"
-    if any(part in lowered for part in ("bash", "shell", "exec", "terminal", "command")):
+    if any(
+        part in lowered for part in ("bash", "shell", "exec", "terminal", "command")
+    ):
         try:
             tokens = shlex.split(command or "")
         except ValueError:
@@ -1516,7 +1530,22 @@ def _infer_operation(tool_name: str | None, command: str | None = None) -> str:
             return "search"
         if cmd_name in {"cat", "bat", "sed", "head", "tail"}:
             return "read"
-        if cmd_name in {"mv", "cp", "rm", "touch", "mkdir", "tee", "apply_patch", "prettier", "black", "isort", "gofmt", "rustfmt", "clang-format", "stylua"}:
+        if cmd_name in {
+            "mv",
+            "cp",
+            "rm",
+            "touch",
+            "mkdir",
+            "tee",
+            "apply_patch",
+            "prettier",
+            "black",
+            "isort",
+            "gofmt",
+            "rustfmt",
+            "clang-format",
+            "stylua",
+        }:
             return "write"
         lowered_command = (command or "").lower()
         if "ruff format" in lowered_command or "biome format" in lowered_command:
@@ -1530,17 +1559,14 @@ def _key_suggests_path(key: str | None) -> bool:
     return (
         lowered in _ARG_PATH_KEYS
         or lowered in _ARG_PATH_LIST_KEYS
-        or lowered.endswith("_path")
-        or lowered.endswith("_file")
-        or lowered.endswith("_files")
+        or lowered.endswith(("_path", "_file", "_files"))
     )
 
 
 def _clean_path_candidate(value: str) -> str:
     candidate = str(value).strip().strip("\"'")
     candidate = candidate.rstrip(",;")
-    if candidate.startswith("file://"):
-        candidate = candidate[7:]
+    candidate = candidate.removeprefix("file://")
     line_match = re.match(r"^(.*?)(?::\d+(?::\d+)?)$", candidate)
     if line_match:
         base = line_match.group(1)
@@ -1644,12 +1670,18 @@ def _safe_expanduser(path: Path) -> Path:
         return path
 
 
-def _normalize_session_path(candidate: str, workspace_root: str | None) -> tuple[str, str | None, str] | None:
+def _normalize_session_path(
+    candidate: str, workspace_root: str | None
+) -> tuple[str, str | None, str] | None:
     raw_path = _clean_path_candidate(candidate)
     if not _looks_like_path(raw_path):
         return None
 
-    root = _safe_expanduser(Path(workspace_root)) if workspace_root and workspace_root != "unknown" else None
+    root = (
+        _safe_expanduser(Path(workspace_root))
+        if workspace_root and workspace_root != "unknown"
+        else None
+    )
     path = _safe_expanduser(Path(raw_path))
     if not path.is_absolute() and root is not None:
         path = root / raw_path
@@ -1672,7 +1704,9 @@ def _normalize_session_path(candidate: str, workspace_root: str | None) -> tuple
     return normalized_path, relative_path, display_path
 
 
-def _build_session_paths(tool_calls: list[ToolCall], workspace_root: str | None) -> list[SessionPath]:
+def _build_session_paths(
+    tool_calls: list[ToolCall], workspace_root: str | None
+) -> list[SessionPath]:
     session_paths: list[SessionPath] = []
     for tool_call in tool_calls:
         for source_name, candidates in (
@@ -1762,9 +1796,7 @@ def _iter_search_content_text(
     if isinstance(content, dict):
         block_type = content.get("type")
         is_legacy_text = (
-            allow_untyped_text
-            and block_type is None
-            and set(content) == {"text"}
+            allow_untyped_text and block_type is None and set(content) == {"text"}
         )
         if (block_type in block_types or is_legacy_text) and isinstance(
             content.get("text"), str
@@ -1780,9 +1812,7 @@ def _iter_search_content_text(
         # Early Codex JSONL used exact bare {"text": ...} message blocks.
         # Extra tool/reasoning/image keys make an untyped block ineligible.
         is_legacy_text = (
-            allow_untyped_text
-            and block_type is None
-            and set(block) == {"text"}
+            allow_untyped_text and block_type is None and set(block) == {"text"}
         )
         if block_type not in block_types and not is_legacy_text:
             continue
@@ -1828,9 +1858,13 @@ def iter_session_search_text(
             # attachments (system reminders, hook output), not something the
             # operator typed. Real user turns never share a record with
             # tool_result blocks.
-            if role == "user" and isinstance(content, list) and any(
-                isinstance(block, dict) and block.get("type") == "tool_result"
-                for block in content
+            if (
+                role == "user"
+                and isinstance(content, list)
+                and any(
+                    isinstance(block, dict) and block.get("type") == "tool_result"
+                    for block in content
+                )
             ):
                 continue
             block_types = _CLAUDE_SEARCH_BLOCK_TYPES
@@ -1893,7 +1927,12 @@ def _private_marker(records: list) -> str | None:
             texts.append(_extract_text(payload.get("content", "")))
         else:
             msg = record.get("message", {})
-            content = msg.get("content") or record.get("content") or payload.get("content") or ""
+            content = (
+                msg.get("content")
+                or record.get("content")
+                or payload.get("content")
+                or ""
+            )
             texts.append(_extract_text(content))
 
         for key in ("instructions", "base_instructions"):
@@ -1934,7 +1973,7 @@ def _fallback_usage_day(path: Path, records: list[dict]) -> str:
         # The file was readable moments earlier, so this is only a final
         # deterministic guard for a concurrent rotation.
         return "1970-01-01"
-    return datetime.fromtimestamp(modified, tz=timezone.utc).date().isoformat()
+    return datetime.fromtimestamp(modified, tz=UTC).date().isoformat()
 
 
 def _reconcile_daily_usage(
@@ -1953,8 +1992,7 @@ def _reconcile_daily_usage(
     for field_name in _DAILY_RECONCILE_FIELDS:
         target = max(0, int(totals.get(field_name, 0) or 0))
         current = sum(
-            int(getattr(bucket, field_name, 0) or 0)
-            for bucket in daily.values()
+            int(getattr(bucket, field_name, 0) or 0) for bucket in daily.values()
         )
         delta = target - current
         if delta > 0:
@@ -2036,7 +2074,7 @@ def _claude_cache_creation_split(usage: dict) -> tuple[int, int, int]:
 def _claude_session_identity(
     path: Path,
     records: list[dict],
-) -> tuple[str, str, Optional[str], Optional[str], int]:
+) -> tuple[str, str, str | None, str | None, int]:
     """Return canonical id, raw thread id, raw/canonical parent, and depth."""
     raw_session_id = None
     agent_id = None
@@ -2062,7 +2100,7 @@ def _claude_session_identity_from_observations(
     raw_session_id: str | None,
     agent_id: str | None,
     sidechain_flag: bool,
-) -> tuple[str, str, Optional[str], Optional[str], int]:
+) -> tuple[str, str, str | None, str | None, int]:
     """Resolve Claude identity from compact fields gathered while streaming."""
 
     parts = path.parts
@@ -2079,7 +2117,9 @@ def _claude_session_identity_from_observations(
     if sidechain_flag or path_is_subagent or agent_id is not None:
         raw_agent_id = agent_id or path.stem
         canonical_id = (
-            raw_agent_id if raw_agent_id.startswith("agent-") else f"agent-{raw_agent_id}"
+            raw_agent_id
+            if raw_agent_id.startswith("agent-")
+            else f"agent-{raw_agent_id}"
         )
         parent_thread_id = raw_session_id or root_from_path
         depth = max(1, len(subagent_indices))
@@ -2089,7 +2129,7 @@ def _claude_session_identity_from_observations(
     return path.stem, thread_id, None, None, 0
 
 
-def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessionMarker]:
+def parse_claudecode_session(path: Path) -> SessionInfo | PrivateSessionMarker | None:
     """Parse a Claude Code JSONL file and return a SessionInfo."""
     record_count = 0
     private_marker = None
@@ -2155,7 +2195,10 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
                 if has_tool_result:
                     # Count errors
                     for block in content:
-                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_result"
+                        ):
                             is_error = bool(block.get("is_error"))
                             if is_error:
                                 error_count += 1
@@ -2228,16 +2271,22 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
                             if isinstance(cmd, list):
                                 cmd = " ".join(str(c) for c in cmd)
                         input_paths = _extract_argument_paths(inp_data)
-                        command_paths = _extract_command_paths(str(cmd) if cmd else None)
-                        spool.append_tool_call(ToolCall(
-                            tool_name=tool_name,
-                            command=str(cmd)[:500] if cmd else None,
-                            timestamp=ts,
-                            operation=_infer_operation(tool_name, str(cmd) if cmd else None),
-                            input_paths=input_paths,
-                            command_paths=command_paths,
-                            call_id=tool_use_id,
-                        ))
+                        command_paths = _extract_command_paths(
+                            str(cmd) if cmd else None
+                        )
+                        spool.append_tool_call(
+                            ToolCall(
+                                tool_name=tool_name,
+                                command=str(cmd)[:500] if cmd else None,
+                                timestamp=ts,
+                                operation=_infer_operation(
+                                    tool_name, str(cmd) if cmd else None
+                                ),
+                                input_paths=input_paths,
+                                command_paths=command_paths,
+                                call_id=tool_use_id,
+                            )
+                        )
                         bucket = _daily_bucket(daily, ts)
                         if bucket is not None:
                             bucket.tool_call_count += 1
@@ -2346,12 +2395,12 @@ def parse_claudecode_session(path: Path) -> Optional[SessionInfo | PrivateSessio
     )
 
 
-def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMarker]:
+def parse_codex_session(path: Path) -> SessionInfo | PrivateSessionMarker | None:
     """Parse a Codex JSONL file and return a SessionInfo."""
     inspection_stats = JsonlLoadStats()
     record_count = 0
     first_rec: dict | None = None
-    first_normalized: tuple[str, dict, Optional[str]] | None = None
+    first_normalized: tuple[str, dict, str | None] | None = None
     replay_candidate = False
     replay_boundary: int | None = None
     private_marker = None
@@ -2416,9 +2465,7 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
                 if isinstance(subagent, dict):
                     thread_spawn = subagent.get("thread_spawn", {})
                     if isinstance(thread_spawn, dict):
-                        nested_parent = _string_id(
-                            thread_spawn.get("parent_thread_id")
-                        )
+                        nested_parent = _string_id(thread_spawn.get("parent_thread_id"))
                         spawn_depth = int(thread_spawn.get("depth", 0) or 0)
             parent_thread_id = (
                 top_level_parent
@@ -2460,7 +2507,9 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
     replay_end = (
         replay_boundary
         if replay_candidate and replay_boundary is not None
-        else record_count if replay_candidate else 0
+        else record_count
+        if replay_candidate
+        else 0
     )
     baseline = [0, 0, 0, 0]  # current epoch maxima
 
@@ -2480,9 +2529,7 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
         if token_totals is not None:
             input_tokens, cached_tokens, output_tokens, reasoning_tokens = token_totals
             current = [input_tokens, cached_tokens, output_tokens, reasoning_tokens]
-            if any(baseline) and _is_explicit_codex_counter_reset(
-                record_type, payload
-            ):
+            if any(baseline) and _is_explicit_codex_counter_reset(record_type, payload):
                 # Applies while folding replay too: only the terminal
                 # inherited epoch may baseline the leaf-native continuation.
                 baseline = [0, 0, 0, 0]
@@ -2527,9 +2574,7 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
                 # Keep first_user_message from the replayed history: it names
                 # the session's actual topic. Counts stay live-only. Injected
                 # AGENTS.md payloads are not the topic.
-                if not first_user_message and not _is_codex_agents_payload(
-                    clean
-                ):
+                if not first_user_message and not _is_codex_agents_payload(clean):
                     first_user_message = clean[:500]
                 if in_replay:
                     continue
@@ -2555,15 +2600,17 @@ def parse_codex_session(path: Path) -> Optional[SessionInfo | PrivateSessionMark
             tool_name = payload.get("name", "unknown")
             args = _load_tool_args(payload.get("arguments", {}))
             cmd = _extract_command(args)
-            spool.append_tool_call(ToolCall(
-                tool_name=tool_name,
-                command=str(cmd)[:500] if cmd else None,
-                timestamp=timestamp,
-                operation=_infer_operation(tool_name, cmd),
-                input_paths=_extract_argument_paths(args),
-                command_paths=_extract_command_paths(cmd),
-                call_id=payload.get("call_id") or payload.get("id"),
-            ))
+            spool.append_tool_call(
+                ToolCall(
+                    tool_name=tool_name,
+                    command=str(cmd)[:500] if cmd else None,
+                    timestamp=timestamp,
+                    operation=_infer_operation(tool_name, cmd),
+                    input_paths=_extract_argument_paths(args),
+                    command_paths=_extract_command_paths(cmd),
+                    call_id=payload.get("call_id") or payload.get("id"),
+                )
+            )
             bucket = _daily_bucket(daily, timestamp)
             if bucket is not None:
                 bucket.tool_call_count += 1
@@ -2657,7 +2704,8 @@ def render_claudecode_transcript(path: Path | TextIO) -> list:
             if isinstance(content, list):
                 # Check for tool results
                 tool_results = [
-                    b for b in content
+                    b
+                    for b in content
                     if isinstance(b, dict) and b.get("type") == "tool_result"
                 ]
                 if tool_results:
@@ -2665,27 +2713,32 @@ def render_claudecode_transcript(path: Path | TextIO) -> list:
                         result_content = block.get("content", "")
                         if isinstance(result_content, list):
                             result_content = "\n".join(
-                                b.get("text", "") for b in result_content
+                                b.get("text", "")
+                                for b in result_content
                                 if isinstance(b, dict)
                             )
-                        turns.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.get("tool_use_id", ""),
-                            "content": str(result_content)[:5000],
-                            "is_error": block.get("is_error", False),
-                            "timestamp": ts,
-                        })
+                        turns.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.get("tool_use_id", ""),
+                                "content": str(result_content)[:5000],
+                                "is_error": block.get("is_error", False),
+                                "timestamp": ts,
+                            }
+                        )
                     continue
 
             text = _extract_text(content)
             if not text.strip():
                 continue
-            turns.append({
-                "type": "user",
-                "content": text,
-                "timestamp": ts,
-                "cwd": r.get("cwd"),
-            })
+            turns.append(
+                {
+                    "type": "user",
+                    "content": text,
+                    "timestamp": ts,
+                    "cwd": r.get("cwd"),
+                }
+            )
 
         elif rtype == "assistant":
             msg = r.get("message", {})
@@ -2708,26 +2761,33 @@ def render_claudecode_transcript(path: Path | TextIO) -> list:
                 if btype == "text":
                     blocks.append({"type": "text", "text": block.get("text", "")})
                 elif btype == "thinking":
-                    blocks.append({"type": "thinking", "text": block.get("thinking", "")})
+                    blocks.append(
+                        {"type": "thinking", "text": block.get("thinking", "")}
+                    )
                 elif btype == "tool_use":
-                    blocks.append({
-                        "type": "tool_use",
-                        "name": block.get("name", ""),
-                        "id": block.get("id", ""),
-                        "input": block.get("input", {}),
-                    })
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "name": block.get("name", ""),
+                            "id": block.get("id", ""),
+                            "input": block.get("input", {}),
+                        }
+                    )
 
             if not blocks:
                 continue
 
-            turns.append({
-                "type": "assistant",
-                "blocks": blocks,
-                "timestamp": ts,
-                "model": msg.get("model"),
-                "input_tokens": usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0),
-                "output_tokens": usage.get("output_tokens", 0),
-            })
+            turns.append(
+                {
+                    "type": "assistant",
+                    "blocks": blocks,
+                    "timestamp": ts,
+                    "model": msg.get("model"),
+                    "input_tokens": usage.get("input_tokens", 0)
+                    + usage.get("cache_read_input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                }
+            )
 
     return [] if load_stats.io_errors else turns
 
@@ -2756,7 +2816,11 @@ def render_codex_transcript(path: Path | TextIO) -> list:
                 for block in content:
                     if not isinstance(block, dict):
                         continue
-                    if block.get("type") in {"text", "output_text", "input_text"} and block.get("text"):
+                    if block.get("type") in {
+                        "text",
+                        "output_text",
+                        "input_text",
+                    } and block.get("text"):
                         blocks.append({"type": "text", "text": block["text"]})
 
                 if not blocks:
@@ -2765,36 +2829,42 @@ def render_codex_transcript(path: Path | TextIO) -> list:
                         blocks = [{"type": "text", "text": text}]
 
                 if blocks:
-                    turns.append({
-                        "type": "assistant",
-                        "blocks": blocks,
-                        "timestamp": timestamp,
-                        "model": None,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                    })
+                    turns.append(
+                        {
+                            "type": "assistant",
+                            "blocks": blocks,
+                            "timestamp": timestamp,
+                            "model": None,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                        }
+                    )
 
         elif record_type == "function_call":
             tool_name = payload.get("name", "unknown")
             args = _load_tool_args(payload.get("arguments", {}))
             cmd = _extract_command(args)
-            turns.append({
-                "type": "tool_use",
-                "name": tool_name,
-                "id": payload.get("call_id", ""),
-                "input": args or ({"command": cmd} if cmd else {}),
-                "timestamp": timestamp,
-            })
+            turns.append(
+                {
+                    "type": "tool_use",
+                    "name": tool_name,
+                    "id": payload.get("call_id", ""),
+                    "input": args or ({"command": cmd} if cmd else {}),
+                    "timestamp": timestamp,
+                }
+            )
 
         elif record_type == "function_call_output":
             display, is_error = _parse_tool_output(payload.get("output", ""))
-            turns.append({
-                "type": "tool_result",
-                "tool_use_id": payload.get("call_id", ""),
-                "content": str(display)[:5000],
-                "is_error": is_error,
-                "timestamp": timestamp,
-            })
+            turns.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": payload.get("call_id", ""),
+                    "content": str(display)[:5000],
+                    "is_error": is_error,
+                    "timestamp": timestamp,
+                }
+            )
 
         elif record_type == "reasoning":
             summaries = payload.get("summary", [])
