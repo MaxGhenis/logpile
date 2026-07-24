@@ -82,7 +82,11 @@ class ContractViewTests(unittest.TestCase):
             with get_db(db_path) as conn:
                 username = ensure_user(conn, "alice")
                 update_user(conn, username, profile_visibility="unlisted")
-                upsert_session(conn, make_session("public-1", username=username, visibility="public"))
+                with self.assertWarnsRegex(RuntimeWarning, "kept this session unlisted"):
+                    upsert_session(
+                        conn,
+                        make_session("public-1", username=username, visibility="public"),
+                    )
                 public_row = conn.execute(
                     "SELECT * FROM sessions WHERE session_id = 'public-1'"
                 ).fetchone()

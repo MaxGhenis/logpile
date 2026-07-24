@@ -438,6 +438,18 @@ metadata with `logpile db-backup`; do not commit the live database or generated
 
 ---
 
+## Development
+
+```bash
+uv sync --all-extras               # runtime deps plus dev tools (pytest, ruff)
+uv run pytest tests/ -q            # full suite
+uv run ruff check logpile/ tests/  # lint
+```
+
+Ruff is pinned exactly (`ruff==0.16.0` in the `dev` dependency group) so lint
+results don't drift when new ruff releases change the default rules; bump the
+pin deliberately and re-run the suite.
+
 ## Requirements
 
 - Python 3.11+ (for the sync CLI and publish scanner)

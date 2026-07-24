@@ -1035,7 +1035,12 @@ class PublishTests(unittest.TestCase):
             )
 
             with open_sqlite(db_path) as conn:
-                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "no publish review was required"
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
                 conn.commit()
 
             session_path.write_text(
@@ -1080,7 +1085,12 @@ class PublishTests(unittest.TestCase):
             )
 
             with open_sqlite(db_path) as conn:
-                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "no publish review was required"
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
                 conn.commit()
 
             session_path.write_text(

@@ -197,7 +197,12 @@ class SessionRuleTests(unittest.TestCase):
             )
 
             with open_sqlite(db_path) as conn:
-                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "no publish review was required"
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
                 conn.commit()
 
             with session_path.open("a", encoding="utf-8") as fh:
@@ -513,7 +518,10 @@ class SessionRuleTests(unittest.TestCase):
                     pattern="demo",
                     visibility="public",
                 )
-                updated = recompute_session_visibility(conn, identifier="alice", shared_dir=shared)
+                with self.assertWarnsRegex(RuntimeWarning, "kept this session unlisted"):
+                    updated = recompute_session_visibility(
+                        conn, identifier="alice", shared_dir=shared
+                    )
                 conn.commit()
                 self.assertEqual(updated, 1)
 

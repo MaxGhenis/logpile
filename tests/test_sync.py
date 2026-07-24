@@ -772,7 +772,12 @@ class SyncTests(unittest.TestCase):
                         "SELECT shared_path FROM sessions WHERE session_id = 'session-1'"
                     ).fetchone()[0]
                 )
-                set_session_visibility(conn, "session-1", "unlisted", shared_dir=shared)
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "no publish review was required"
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
                 conn.commit()
                 row = conn.execute(
                     "SELECT visibility, shared_path FROM sessions WHERE session_id = 'session-1'"
@@ -801,9 +806,12 @@ class SyncTests(unittest.TestCase):
                 )
 
             with get_db(db_path) as conn:
-                set_session_visibility(
-                    conn, "session-1", "unlisted", shared_dir=shared
-                )
+                with self.assertWarnsRegex(
+                    RuntimeWarning, "no publish review was required"
+                ):
+                    set_session_visibility(
+                        conn, "session-1", "unlisted", shared_dir=shared
+                    )
                 set_session_visibility(
                     conn, "session-1", "private", shared_dir=shared
                 )
@@ -1912,13 +1920,14 @@ class SyncTests(unittest.TestCase):
                 conn.commit()
 
             self._write_claude_session(home, session_id="session-1", message="first")
-            sync_sessions(
-                shared_dir=shared,
-                db_path=db_path,
-                username="alice",
-                machine="machine-1",
-                home=home,
-            )
+            with self.assertWarnsRegex(RuntimeWarning, "kept this session unlisted"):
+                sync_sessions(
+                    shared_dir=shared,
+                    db_path=db_path,
+                    username="alice",
+                    machine="machine-1",
+                    home=home,
+                )
 
             with open_sqlite(db_path) as conn:
                 update_user(conn, "alice", default_session_visibility="unlisted")
