@@ -44,7 +44,7 @@ curl_config_escape() {
 
 # Keep the Global API Key out of curl's argv. The config is mode 0600 (via the
 # restrictive umask plus chmod) and is deleted by the EXIT trap.
-CURL_CONFIG="$(mktemp -t logpile-curl-config)"
+CURL_CONFIG="$(mktemp "${TMPDIR:-/tmp}/logpile-curl-config.XXXXXX")"
 chmod 600 "$CURL_CONFIG"
 printf 'header = "X-Auth-Email: %s"\nheader = "X-Auth-Key: %s"\n' \
   "$(curl_config_escape "$EMAIL")" "$(curl_config_escape "$KEY")" >"$CURL_CONFIG"
@@ -109,7 +109,7 @@ else
   ZONE_ID="$(curl_api "$API/zones?name=$HOSTNAME" | cf_single_id "zone lookup" "CLOUDFLARE_ZONE_ID")"
 fi
 
-WORKER=$(mktemp -t logpile-worker)
+WORKER=$(mktemp "${TMPDIR:-/tmp}/logpile-worker.XXXXXX")
 python3 - "$HTML" >"$WORKER" <<'PY'
 import json, sys
 html = open(sys.argv[1]).read()
@@ -141,7 +141,7 @@ import sys
 print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 )"
-VERIFY_BODY="$(mktemp -t logpile-deploy-verify)"
+VERIFY_BODY="$(mktemp "${TMPDIR:-/tmp}/logpile-deploy-verify.XXXXXX")"
 REMOTE_HASH=""
 for attempt in 1 2 3; do
   if curl --silent --show-error --fail-with-body \
