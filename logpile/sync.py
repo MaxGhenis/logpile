@@ -1,4 +1,5 @@
 """Sync JSONL sessions to a shared directory and update the SQLite index."""
+
 import errno
 import fcntl
 import fnmatch
@@ -176,6 +177,8 @@ class PrivateStorageTransition:
                 # back after the durable archive has been created.
                 pass
         self.active = False
+
+
 _TEST_PATTERNS = (
     re.compile(r"\b(pytest|py\.test|vitest|jest|nosetests|rspec)\b"),
     re.compile(r"\bpython(?:\d+(?:\.\d+)?)?\s+-m\s+(pytest|unittest)\b"),
@@ -185,7 +188,9 @@ _TEST_PATTERNS = (
     re.compile(r"\buv\s+run\s+pytest\b"),
 )
 _LINT_PATTERNS = (
-    re.compile(r"\b(?:ruff(?:\s+check)?|flake8|pylint|eslint|shellcheck|hadolint|mypy|pyright)\b"),
+    re.compile(
+        r"\b(?:ruff(?:\s+check)?|flake8|pylint|eslint|shellcheck|hadolint|mypy|pyright)\b"
+    ),
     re.compile(r"\bbiome\s+check\b"),
     re.compile(r"\bgolangci-lint\b"),
     re.compile(r"\btsc\b.*--noemit\b"),
@@ -328,9 +333,7 @@ def _secure_managed_mkdir(path: Path, root: Path, *, label: str) -> None:
 
         if not stat.S_ISDIR(mode):
             kind = "symlink" if stat.S_ISLNK(mode) else "non-directory"
-            raise StorageSafetyError(
-                f"Refusing {kind} {label} component: {current}"
-            )
+            raise StorageSafetyError(f"Refusing {kind} {label} component: {current}")
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -374,9 +377,7 @@ def _validate_private_archive_file(path: Path, private_root: Path) -> None:
         ) from exc
     if not stat.S_ISREG(mode):
         kind = "symlink" if stat.S_ISLNK(mode) else "non-regular"
-        raise StorageSafetyError(
-            f"Refusing {kind} private archive artifact: {path}"
-        )
+        raise StorageSafetyError(f"Refusing {kind} private archive artifact: {path}")
 
 
 def _lexists(path: Path) -> bool:
@@ -415,17 +416,13 @@ def _private_archive_path(
 
 def _temporary_sibling(path: Path, suffix: str) -> Path:
     for index in range(1000):
-        candidate = path.with_name(
-            f".{path.name}.{os.getpid()}.{index}.{suffix}"
-        )
+        candidate = path.with_name(f".{path.name}.{os.getpid()}.{index}.{suffix}")
         if not _lexists(candidate):
             return candidate
     raise StorageSafetyError(f"Could not reserve temporary storage beside {path}")
 
 
-def _private_quarantine_path(
-    private_root: Path, original: Path, suffix: str
-) -> Path:
+def _private_quarantine_path(private_root: Path, original: Path, suffix: str) -> Path:
     """Reserve a rollback path outside the shared/public storage tree."""
     quarantine_dir = private_root / ".transition-quarantine"
     _secure_private_mkdir(quarantine_dir, private_root)
@@ -485,7 +482,10 @@ def _unchanged_on_disk(
     again — tens of GB per sync once immutable archives are scanned. Any
     mismatch here just falls through to the full hash-and-parse path.
     """
-    if "copy_retry_pending" in existing_row.keys() and existing_row["copy_retry_pending"]:
+    if (
+        "copy_retry_pending" in existing_row.keys()
+        and existing_row["copy_retry_pending"]
+    ):
         return False
     # Full SHA-256 replaced the legacy 16-character prefix.  Force one
     # verified reparse/copy so old rows cannot remain on the cheap fast path.
@@ -627,15 +627,15 @@ def _prepare_private_storage(
     desired_shared = _desired_shared_path(
         shared_dir, username, source, project, filename
     )
-    archive = _private_archive_path(
-        shared_dir, username, source, project, filename
-    )
+    archive = _private_archive_path(shared_dir, username, source, project, filename)
 
     existing_path = Path(existing_shared_path) if existing_shared_path else None
     if existing_path and _is_within(existing_path, private_root):
         archive = _lexical_path(existing_path)
-    elif existing_path and _lexists(existing_path) and not _is_within(
-        existing_path, shared_dir
+    elif (
+        existing_path
+        and _lexists(existing_path)
+        and not _is_within(existing_path, shared_dir)
     ):
         raise StorageSafetyError(
             f"Refusing to privatize transcript outside the configured shared tree: {existing_path}"
@@ -735,16 +735,15 @@ def _prepare_shared_storage(
     """Prepare a reversible materialization into the lexical shared tree."""
     shared_dir = _lexical_path(shared_dir)
     _secure_shared_mkdir(shared_dir, shared_dir)
-    desired = _desired_shared_path(
-        shared_dir, username, source, project, filename
-    )
+    desired = _desired_shared_path(shared_dir, username, source, project, filename)
     _secure_shared_mkdir(desired.parent, shared_dir)
     existing = Path(existing_shared_path) if existing_shared_path else None
     private_root = _private_archive_root(shared_dir)
     _secure_private_mkdir(private_root, private_root)
-    if existing and _lexists(existing) and not (
-        _is_within(existing, shared_dir)
-        or _is_within(existing, private_root)
+    if (
+        existing
+        and _lexists(existing)
+        and not (_is_within(existing, shared_dir) or _is_within(existing, private_root))
     ):
         raise StorageSafetyError(
             f"Refusing to publish transcript from outside managed storage: {existing}"
@@ -801,7 +800,11 @@ def _prepare_shared_storage(
             transition.rollback_unlinks.append(desired)
             transition.changed = True
 
-        if existing and _lexical_path(existing) != _lexical_path(desired) and _lexists(existing):
+        if (
+            existing
+            and _lexical_path(existing) != _lexical_path(desired)
+            and _lexists(existing)
+        ):
             if _is_within(existing, private_root):
                 _validate_private_archive_file(existing, private_root)
                 quarantine = _temporary_sibling(existing, "publish-rollback")
@@ -1104,7 +1107,9 @@ def _preflight_shared_copy_volume(
         jsonl_path = discovered.path
         if should_ignore(jsonl_path, patterns):
             continue
-        if discovered.source == "claudecode" and _is_claude_workflow_journal(jsonl_path):
+        if discovered.source == "claudecode" and _is_claude_workflow_journal(
+            jsonl_path
+        ):
             continue
         session_key = (discovered.source, jsonl_path.stem)
         if session_key in seen_session_ids:
@@ -1167,7 +1172,9 @@ def project_from_claude_path(jsonl_path: Path) -> str:
     if "subagents" in parts:
         subagents_index = len(parts) - 1 - tuple(reversed(parts)).index("subagents")
         project_index = subagents_index - 2
-        dir_name = parts[project_index] if project_index >= 0 else jsonl_path.parent.name
+        dir_name = (
+            parts[project_index] if project_index >= 0 else jsonl_path.parent.name
+        )
     else:
         dir_name = jsonl_path.parent.name
     dir_name = dir_name.removeprefix("-")
@@ -1277,7 +1284,9 @@ def _resolve_repo_metadata(
     metadata = {
         "worktree_root": worktree_root,
         "repo_root": repo_root,
-        "repo_name": Path(repo_root).name or Path(worktree_root).name or fallback_repo_name,
+        "repo_name": Path(repo_root).name
+        or Path(worktree_root).name
+        or fallback_repo_name,
         "git_branch": git_branch,
         "git_commit": _git_output(workspace, "rev-parse", "HEAD"),
         "git_dirty": 1 if _git_output(workspace, "status", "--porcelain") else 0,
@@ -1474,7 +1483,11 @@ def _sample_paths(session_paths: list, limit: int = 2) -> list[str]:
     for session_path in session_paths:
         if session_path.operation != "write":
             continue
-        label = session_path.repo_relative_path or session_path.relative_path or session_path.display_path
+        label = (
+            session_path.repo_relative_path
+            or session_path.relative_path
+            or session_path.display_path
+        )
         if not label or label in seen:
             continue
         seen.add(label)
@@ -1527,14 +1540,18 @@ def _derive_session_narrative(
     goal = _clip_text(first_user_message, limit=180)
     status = _status_from_activity(activity, error_count)
 
-    scope = repo_name or (project if project and project != "unknown" else None) or source
+    scope = (
+        repo_name or (project if project and project != "unknown" else None) or source
+    )
     summary_bits: list[str] = [f"Worked in {scope}."]
 
     write_count = activity.get("write_path_count") or 0
     if write_count:
         path_samples = _sample_paths(session_paths)
         path_fragment = f" ({', '.join(path_samples)})" if path_samples else ""
-        summary_bits.append(f"Touched {write_count} file{'s' if write_count != 1 else ''}{path_fragment}.")
+        summary_bits.append(
+            f"Touched {write_count} file{'s' if write_count != 1 else ''}{path_fragment}."
+        )
 
     for label, total_key, failure_key in (
         ("tests", "test_run_count", "test_failure_count"),
@@ -1552,7 +1569,9 @@ def _derive_session_narrative(
 
     commit_count = activity.get("git_commit_count") or 0
     if commit_count:
-        summary_bits.append(f"Made {commit_count} git commit{'s' if commit_count != 1 else ''}.")
+        summary_bits.append(
+            f"Made {commit_count} git commit{'s' if commit_count != 1 else ''}."
+        )
     elif not write_count and not any(
         (activity.get(key) or 0) > 0
         for key in ("test_run_count", "lint_run_count", "build_run_count")
@@ -1575,7 +1594,9 @@ def _derive_session_narrative(
         ):
             count = activity.get(key) or 0
             if count:
-                failure_parts.append(f"{count} {label} failure{'s' if count != 1 else ''}")
+                failure_parts.append(
+                    f"{count} {label} failure{'s' if count != 1 else ''}"
+                )
         joined = ", ".join(failure_parts) if failure_parts else "recorded errors"
         outcome = f"Made progress, but left {joined}."
     elif status == "failed":
@@ -1587,7 +1608,9 @@ def _derive_session_narrative(
         ):
             count = activity.get(key) or 0
             if count:
-                failure_parts.append(f"{count} {label} failure{'s' if count != 1 else ''}")
+                failure_parts.append(
+                    f"{count} {label} failure{'s' if count != 1 else ''}"
+                )
         joined = ", ".join(failure_parts) if failure_parts else "errors"
         outcome = f"Ended with {joined} and no successful publish signal."
     else:
@@ -1607,6 +1630,7 @@ def _compute_duration(t1: str, t2: str) -> float | None:
         return None
     try:
         from datetime import datetime
+
         d1 = datetime.fromisoformat(t1)
         d2 = datetime.fromisoformat(t2)
         return max(0.0, (d2 - d1).total_seconds())
@@ -1660,7 +1684,10 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
             if exc.errno == errno.ENOSPC:
                 raise
             if verbose:
-                print(f"  Skipped unavailable shared copy {shared_file}: {exc}", file=sys.stderr)
+                print(
+                    f"  Skipped unavailable shared copy {shared_file}: {exc}",
+                    file=sys.stderr,
+                )
             continue
         if info is None or isinstance(info, PrivateSessionMarker):
             continue
@@ -1732,13 +1759,17 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
         insert_session_daily_usage(conn, row["session_id"], info.daily_usage)
         affected.add(row["session_id"])
         if row["source"] == "claudecode":
-            affected |= apply_message_claims(conn, row["session_id"], info.message_usage)
+            affected |= apply_message_claims(
+                conn, row["session_id"], info.message_usage
+            )
         backfilled += 1
         if backfilled % 200 == 0:
             conn.commit()
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         if verbose:
-            print(f"  Backfilled parsed state from shared copy: {row['session_id'][:20]}…")
+            print(
+                f"  Backfilled parsed state from shared copy: {row['session_id'][:20]}…"
+            )
     return backfilled, affected
 
 
@@ -1825,10 +1856,13 @@ def _tighten_private_marker(
     storage_row["source_path"] = str(jsonl_path)
     transition = prepare_private_session_storage(storage_row, shared_dir=shared_dir)
     try:
-        if not _harden_managed_artifact(
-            transition.archive_path,
-            _private_archive_root(shared_dir),
-        ) or file_hash(transition.archive_path) != fhash:
+        if (
+            not _harden_managed_artifact(
+                transition.archive_path,
+                _private_archive_root(shared_dir),
+            )
+            or file_hash(transition.archive_path) != fhash
+        ):
             raise OSError(
                 errno.EIO,
                 "private marker archival copy hash mismatch; source metadata was not advanced",
@@ -1908,9 +1942,7 @@ def sync_sessions(
         lock_flags |= getattr(os, "O_NONBLOCK", 0)
         lock_fd = os.open(lock_path, lock_flags, 0o600)
         if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
-            raise SyncLockError(
-                f"Refusing non-regular sync lock path: {lock_path}"
-            )
+            raise SyncLockError(f"Refusing non-regular sync lock path: {lock_path}")
         os.fchmod(lock_fd, 0o600)
     except SyncLockError:
         if lock_fd is not None:
@@ -1954,7 +1986,9 @@ def _sync_sessions(
 
     with get_db(db_path) as conn:
         canonical_username = _resolve_sync_username(conn, username)
-        canonical_username = ensure_user(conn, canonical_username, display_name=canonical_username)
+        canonical_username = ensure_user(
+            conn, canonical_username, display_name=canonical_username
+        )
         user_row = conn.execute(
             "SELECT default_session_visibility FROM users WHERE username = ?",
             (canonical_username,),
@@ -2005,11 +2039,13 @@ def _sync_sessions(
                 """
             )
         }
-        _planned_bytes, _planned_files, preflight_source_hashes = _preflight_shared_copy_volume(
-            home=home,
-            shared_dir=shared_dir,
-            existing=existing,
-            patterns=patterns,
+        _planned_bytes, _planned_files, preflight_source_hashes = (
+            _preflight_shared_copy_volume(
+                home=home,
+                shared_dir=shared_dir,
+                existing=existing,
+                patterns=patterns,
+            )
         )
         processed_count = 0
         repo_metadata_cache: dict[str, dict[str, str | int | None]] = {}
@@ -2064,10 +2100,7 @@ def _sync_sessions(
                     # exact journal created it. Full agent transcripts remain
                     # indexed under agent-{agentId}; other journals with the
                     # same filename cannot accidentally delete that row.
-                    if (
-                        existing_row
-                        and existing_row["source_path"] == str(jsonl_path)
-                    ):
+                    if existing_row and existing_row["source_path"] == str(jsonl_path):
                         claim_keys = [
                             row[0]
                             for row in conn.execute(
@@ -2077,7 +2110,7 @@ def _sync_sessions(
                             )
                         ]
                         for chunk in (
-                            claim_keys[start:start + 500]
+                            claim_keys[start : start + 500]
                             for start in range(0, len(claim_keys), 500)
                         ):
                             placeholders = ",".join("?" * len(chunk))
@@ -2109,18 +2142,24 @@ def _sync_sessions(
                         skipped_count += 1
                     continue
                 needs_structure_backfill = bool(
-                    existing_row and (
+                    existing_row
+                    and (
                         (existing_row["workspace_root"] or "") == ""
                         or (existing_row["worktree_root"] or "") == ""
                         or (existing_row["repo_name"] or "") == ""
-                        or (existing_row["activity_version"] or 0) < SESSION_ACTIVITY_VERSION
-                        or (existing_row["narrative_version"] or 0) < SESSION_NARRATIVE_VERSION
+                        or (existing_row["activity_version"] or 0)
+                        < SESSION_ACTIVITY_VERSION
+                        or (existing_row["narrative_version"] or 0)
+                        < SESSION_NARRATIVE_VERSION
                         or (existing_row["session_status"] or "") == ""
                         or (existing_row["session_summary"] or "") == ""
-                        or (existing_row["objective_version"] or 0) < SESSION_OBJECTIVE_VERSION
-                        or (existing_row["origin_version"] or 0) < SESSION_ORIGIN_VERSION
+                        or (existing_row["objective_version"] or 0)
+                        < SESSION_OBJECTIVE_VERSION
+                        or (existing_row["origin_version"] or 0)
+                        < SESSION_ORIGIN_VERSION
                         or (existing_row["token_version"] or 0) < SESSION_TOKEN_VERSION
-                        or (existing_row["identity_version"] or 0) < SESSION_IDENTITY_VERSION
+                        or (existing_row["identity_version"] or 0)
+                        < SESSION_IDENTITY_VERSION
                         or (existing_row["session_origin"] or "") == ""
                         or (
                             (existing_row["tool_call_count"] or 0) > 0
@@ -2155,7 +2194,11 @@ def _sync_sessions(
                     skipped_count += 1
                     continue
 
-                if existing_row and existing_row["file_hash"] == fhash and not needs_structure_backfill:
+                if (
+                    existing_row
+                    and existing_row["file_hash"] == fhash
+                    and not needs_structure_backfill
+                ):
                     try:
                         shared_path, storage_changed = _sync_shared_copy(
                             conn=conn,
@@ -2163,7 +2206,8 @@ def _sync_sessions(
                             shared_dir=shared_dir,
                             username=canonical_username,
                             source=existing_row["source"],
-                            project=existing_row["project"] or project_from_claude_path(jsonl_path),
+                            project=existing_row["project"]
+                            or project_from_claude_path(jsonl_path),
                             filename=jsonl_path.name,
                             visibility=existing_row["visibility"],
                             expected_sha256=fhash,
@@ -2189,7 +2233,11 @@ def _sync_sessions(
                         or existing_row["file_mtime"] is None
                         or abs(existing_row["file_mtime"] - file_stat.st_mtime) > 1e-6
                     )
-                    if storage_changed or row_moved or shared_path != (existing_row["shared_path"] or ""):
+                    if (
+                        storage_changed
+                        or row_moved
+                        or shared_path != (existing_row["shared_path"] or "")
+                    ):
                         conn.execute(
                             """
                             UPDATE sessions
@@ -2197,8 +2245,14 @@ def _sync_sessions(
                                 file_mtime = ?, synced_at = ?
                             WHERE session_id = ?
                             """,
-                            (shared_path, str(jsonl_path), file_stat.st_size,
-                             file_stat.st_mtime, now, session_id),
+                            (
+                                shared_path,
+                                str(jsonl_path),
+                                file_stat.st_size,
+                                file_stat.st_mtime,
+                                now,
+                                session_id,
+                            ),
                         )
                         flush_if_needed()
                         updated_count += 1
@@ -2244,9 +2298,12 @@ def _sync_sessions(
 
                 project = project_from_claude_path(jsonl_path)
                 workspace_root = _normalize_workspace_root(
-                    info.workspace_root or (info.project if info.project != "unknown" else None)
+                    info.workspace_root
+                    or (info.project if info.project != "unknown" else None)
                 )
-                repo_metadata = _resolve_repo_metadata(workspace_root, repo_metadata_cache)
+                repo_metadata = _resolve_repo_metadata(
+                    workspace_root, repo_metadata_cache
+                )
                 session_paths = _annotate_session_paths(
                     info.session_paths,
                     repo_root=repo_metadata["repo_root"],
@@ -2290,7 +2347,9 @@ def _sync_sessions(
                         "username": canonical_username,
                     },
                 )
-                storage_visibility = _effective_storage_visibility(existing_row, visibility)
+                storage_visibility = _effective_storage_visibility(
+                    existing_row, visibility
+                )
                 try:
                     shared_path, _ = _sync_shared_copy(
                         conn=conn,
@@ -2302,7 +2361,9 @@ def _sync_sessions(
                         filename=jsonl_path.name,
                         visibility=storage_visibility,
                         expected_sha256=fhash,
-                        existing_shared_path=existing_row["shared_path"] if existing_row else None,
+                        existing_shared_path=existing_row["shared_path"]
+                        if existing_row
+                        else None,
                     )
                 except OSError as exc:
                     _record_copy_retry(
@@ -2319,59 +2380,64 @@ def _sync_sessions(
                     continue
                 _clear_copy_retry(conn, jsonl_path, info.session_id)
 
-                upsert_session(conn, {
-                    "session_id": info.session_id,
-                    "source": "claudecode",
-                    "username": canonical_username,
-                    "machine": machine,
-                    "project": project,
-                    "workspace_root": workspace_root,
-                    "worktree_root": repo_metadata["worktree_root"],
-                    "repo_root": repo_metadata["repo_root"],
-                    "repo_name": repo_metadata["repo_name"],
-                    "git_branch": repo_metadata["git_branch"],
-                    "git_commit": repo_metadata["git_commit"],
-                    "git_dirty": repo_metadata["git_dirty"],
-                    "source_path": str(jsonl_path),
-                    "shared_path": shared_path,
-                    "first_timestamp": info.first_timestamp,
-                    "last_timestamp": info.last_timestamp,
-                    "duration_seconds": _compute_duration(info.first_timestamp, info.last_timestamp),
-                    "user_message_count": info.user_message_count,
-                    "assistant_message_count": info.assistant_message_count,
-                    "tool_call_count": info.tool_call_count,
-                    "error_count": info.error_count,
-                    "total_input_tokens": info.total_input_tokens,
-                    "total_output_tokens": info.total_output_tokens,
-                    "fresh_input_tokens": info.fresh_input_tokens,
-                    "cached_input_tokens": info.cached_input_tokens,
-                    "cache_creation_input_tokens": info.cache_creation_input_tokens,
-                    "cache_creation_5m_input_tokens": info.cache_creation_5m_input_tokens,
-                    "cache_creation_1h_input_tokens": info.cache_creation_1h_input_tokens,
-                    "cache_creation_unknown_input_tokens": info.cache_creation_unknown_input_tokens,
-                    "reasoning_output_tokens": info.reasoning_output_tokens,
-                    "token_version": SESSION_TOKEN_VERSION,
-                    "identity_version": SESSION_IDENTITY_VERSION,
-                    "first_user_message": info.first_user_message,
-                    "parent_session_id": info.parent_session_id,
-                    "thread_id": info.thread_id,
-                    "parent_thread_id": info.parent_thread_id,
-                    "spawn_depth": info.spawn_depth,
-                    "visibility": visibility["visibility"],
-                    "visibility_source": visibility["visibility_source"],
-                    "visibility_rule_id": visibility["visibility_rule_id"],
-                    "visibility_reason": visibility["visibility_reason"],
-                    "is_private": 1 if visibility["visibility"] == "private" else 0,
-                    "file_hash": fhash,
-                    "file_size": file_stat.st_size,
-                    "file_mtime": file_stat.st_mtime,
-                    "synced_at": now,
-                    "model": info.model,
-                    **activity,
-                    **narrative,
-                    **objective,
-                    **origin,
-                })
+                upsert_session(
+                    conn,
+                    {
+                        "session_id": info.session_id,
+                        "source": "claudecode",
+                        "username": canonical_username,
+                        "machine": machine,
+                        "project": project,
+                        "workspace_root": workspace_root,
+                        "worktree_root": repo_metadata["worktree_root"],
+                        "repo_root": repo_metadata["repo_root"],
+                        "repo_name": repo_metadata["repo_name"],
+                        "git_branch": repo_metadata["git_branch"],
+                        "git_commit": repo_metadata["git_commit"],
+                        "git_dirty": repo_metadata["git_dirty"],
+                        "source_path": str(jsonl_path),
+                        "shared_path": shared_path,
+                        "first_timestamp": info.first_timestamp,
+                        "last_timestamp": info.last_timestamp,
+                        "duration_seconds": _compute_duration(
+                            info.first_timestamp, info.last_timestamp
+                        ),
+                        "user_message_count": info.user_message_count,
+                        "assistant_message_count": info.assistant_message_count,
+                        "tool_call_count": info.tool_call_count,
+                        "error_count": info.error_count,
+                        "total_input_tokens": info.total_input_tokens,
+                        "total_output_tokens": info.total_output_tokens,
+                        "fresh_input_tokens": info.fresh_input_tokens,
+                        "cached_input_tokens": info.cached_input_tokens,
+                        "cache_creation_input_tokens": info.cache_creation_input_tokens,
+                        "cache_creation_5m_input_tokens": info.cache_creation_5m_input_tokens,
+                        "cache_creation_1h_input_tokens": info.cache_creation_1h_input_tokens,
+                        "cache_creation_unknown_input_tokens": info.cache_creation_unknown_input_tokens,
+                        "reasoning_output_tokens": info.reasoning_output_tokens,
+                        "token_version": SESSION_TOKEN_VERSION,
+                        "identity_version": SESSION_IDENTITY_VERSION,
+                        "first_user_message": info.first_user_message,
+                        "parent_session_id": info.parent_session_id,
+                        "thread_id": info.thread_id,
+                        "parent_thread_id": info.parent_thread_id,
+                        "spawn_depth": info.spawn_depth,
+                        "visibility": visibility["visibility"],
+                        "visibility_source": visibility["visibility_source"],
+                        "visibility_rule_id": visibility["visibility_rule_id"],
+                        "visibility_reason": visibility["visibility_reason"],
+                        "is_private": 1 if visibility["visibility"] == "private" else 0,
+                        "file_hash": fhash,
+                        "file_size": file_stat.st_size,
+                        "file_mtime": file_stat.st_mtime,
+                        "synced_at": now,
+                        "model": info.model,
+                        **activity,
+                        **narrative,
+                        **objective,
+                        **origin,
+                    },
+                )
                 insert_tool_calls(conn, info.session_id, info.tool_calls)
                 insert_session_paths(conn, info.session_id, session_paths)
                 insert_session_daily_usage(conn, info.session_id, info.daily_usage)
@@ -2406,18 +2472,24 @@ def _sync_sessions(
                 seen_codex_stems.add(session_id)
                 existing_row = existing.get(session_id)
                 needs_structure_backfill = bool(
-                    existing_row and (
+                    existing_row
+                    and (
                         (existing_row["workspace_root"] or "") == ""
                         or (existing_row["worktree_root"] or "") == ""
                         or (existing_row["repo_name"] or "") == ""
-                        or (existing_row["activity_version"] or 0) < SESSION_ACTIVITY_VERSION
-                        or (existing_row["narrative_version"] or 0) < SESSION_NARRATIVE_VERSION
+                        or (existing_row["activity_version"] or 0)
+                        < SESSION_ACTIVITY_VERSION
+                        or (existing_row["narrative_version"] or 0)
+                        < SESSION_NARRATIVE_VERSION
                         or (existing_row["session_status"] or "") == ""
                         or (existing_row["session_summary"] or "") == ""
-                        or (existing_row["objective_version"] or 0) < SESSION_OBJECTIVE_VERSION
-                        or (existing_row["origin_version"] or 0) < SESSION_ORIGIN_VERSION
+                        or (existing_row["objective_version"] or 0)
+                        < SESSION_OBJECTIVE_VERSION
+                        or (existing_row["origin_version"] or 0)
+                        < SESSION_ORIGIN_VERSION
                         or (existing_row["token_version"] or 0) < SESSION_TOKEN_VERSION
-                        or (existing_row["identity_version"] or 0) < SESSION_IDENTITY_VERSION
+                        or (existing_row["identity_version"] or 0)
+                        < SESSION_IDENTITY_VERSION
                         or (existing_row["session_origin"] or "") == ""
                         or (
                             (existing_row["tool_call_count"] or 0) > 0
@@ -2451,7 +2523,11 @@ def _sync_sessions(
                     skipped_count += 1
                     continue
 
-                if existing_row and existing_row["file_hash"] == fhash and not needs_structure_backfill:
+                if (
+                    existing_row
+                    and existing_row["file_hash"] == fhash
+                    and not needs_structure_backfill
+                ):
                     try:
                         shared_path, storage_changed = _sync_shared_copy(
                             conn=conn,
@@ -2486,7 +2562,11 @@ def _sync_sessions(
                         or existing_row["file_mtime"] is None
                         or abs(existing_row["file_mtime"] - file_stat.st_mtime) > 1e-6
                     )
-                    if storage_changed or row_moved or shared_path != (existing_row["shared_path"] or ""):
+                    if (
+                        storage_changed
+                        or row_moved
+                        or shared_path != (existing_row["shared_path"] or "")
+                    ):
                         conn.execute(
                             """
                             UPDATE sessions
@@ -2494,8 +2574,14 @@ def _sync_sessions(
                                 file_mtime = ?, synced_at = ?
                             WHERE session_id = ?
                             """,
-                            (shared_path, str(jsonl_path), file_stat.st_size,
-                             file_stat.st_mtime, now, session_id),
+                            (
+                                shared_path,
+                                str(jsonl_path),
+                                file_stat.st_size,
+                                file_stat.st_mtime,
+                                now,
+                                session_id,
+                            ),
                         )
                         flush_if_needed()
                         updated_count += 1
@@ -2549,11 +2635,16 @@ def _sync_sessions(
                     continue
 
                 # Use leaf of cwd as project name
-                project = Path(info.project).name if info.project != "unknown" else "unknown"
-                workspace_root = _normalize_workspace_root(
-                    info.workspace_root or (info.project if info.project != "unknown" else None)
+                project = (
+                    Path(info.project).name if info.project != "unknown" else "unknown"
                 )
-                repo_metadata = _resolve_repo_metadata(workspace_root, repo_metadata_cache)
+                workspace_root = _normalize_workspace_root(
+                    info.workspace_root
+                    or (info.project if info.project != "unknown" else None)
+                )
+                repo_metadata = _resolve_repo_metadata(
+                    workspace_root, repo_metadata_cache
+                )
                 session_paths = _annotate_session_paths(
                     info.session_paths,
                     repo_root=repo_metadata["repo_root"],
@@ -2597,7 +2688,9 @@ def _sync_sessions(
                         "username": canonical_username,
                     },
                 )
-                storage_visibility = _effective_storage_visibility(existing_row, visibility)
+                storage_visibility = _effective_storage_visibility(
+                    existing_row, visibility
+                )
                 try:
                     shared_path, _ = _sync_shared_copy(
                         conn=conn,
@@ -2609,7 +2702,9 @@ def _sync_sessions(
                         filename=jsonl_path.name,
                         visibility=storage_visibility,
                         expected_sha256=fhash,
-                        existing_shared_path=existing_row["shared_path"] if existing_row else None,
+                        existing_shared_path=existing_row["shared_path"]
+                        if existing_row
+                        else None,
                     )
                 except OSError as exc:
                     _record_copy_retry(
@@ -2628,61 +2723,64 @@ def _sync_sessions(
                 _clear_copy_retry(conn, jsonl_path, session_id)
 
                 # Use file_stem as session_id (unique per file)
-                upsert_session(conn, {
-                    "session_id": session_id,
-                    "source": "codex",
-                    "username": canonical_username,
-                    "machine": machine,
-                    "project": project,
-                    "workspace_root": workspace_root,
-                    "worktree_root": repo_metadata["worktree_root"],
-                    "repo_root": repo_metadata["repo_root"],
-                    "repo_name": repo_metadata["repo_name"],
-                    "git_branch": repo_metadata["git_branch"],
-                    "git_commit": repo_metadata["git_commit"],
-                    "git_dirty": repo_metadata["git_dirty"],
-                    "source_path": str(jsonl_path),
-                    "shared_path": shared_path,
-                    "first_timestamp": info.first_timestamp,
-                    "last_timestamp": info.last_timestamp,
-                    "duration_seconds": None,
-                    "user_message_count": info.user_message_count,
-                    "assistant_message_count": info.assistant_message_count,
-                    "tool_call_count": info.tool_call_count,
-                    "error_count": info.error_count,
-                    "total_input_tokens": info.total_input_tokens,
-                    "total_output_tokens": info.total_output_tokens,
-                    "fresh_input_tokens": info.fresh_input_tokens,
-                    "cached_input_tokens": info.cached_input_tokens,
-                    "cache_creation_input_tokens": info.cache_creation_input_tokens,
-                    "cache_creation_5m_input_tokens": info.cache_creation_5m_input_tokens,
-                    "cache_creation_1h_input_tokens": info.cache_creation_1h_input_tokens,
-                    "cache_creation_unknown_input_tokens": info.cache_creation_unknown_input_tokens,
-                    "reasoning_output_tokens": info.reasoning_output_tokens,
-                    "token_version": SESSION_TOKEN_VERSION,
-                    "identity_version": SESSION_IDENTITY_VERSION,
-                    "first_user_message": info.first_user_message,
-                    # Codex metadata carries a raw thread UUID here; the exact
-                    # rollout-key parent is resolved after the complete scan.
-                    "parent_session_id": None,
-                    "thread_id": info.thread_id,
-                    "parent_thread_id": info.parent_thread_id,
-                    "spawn_depth": info.spawn_depth,
-                    "visibility": visibility["visibility"],
-                    "visibility_source": visibility["visibility_source"],
-                    "visibility_rule_id": visibility["visibility_rule_id"],
-                    "visibility_reason": visibility["visibility_reason"],
-                    "is_private": 1 if visibility["visibility"] == "private" else 0,
-                    "file_hash": fhash,
-                    "file_size": file_stat.st_size,
-                    "file_mtime": file_stat.st_mtime,
-                    "synced_at": now,
-                    "model": info.model,
-                    **activity,
-                    **narrative,
-                    **objective,
-                    **origin,
-                })
+                upsert_session(
+                    conn,
+                    {
+                        "session_id": session_id,
+                        "source": "codex",
+                        "username": canonical_username,
+                        "machine": machine,
+                        "project": project,
+                        "workspace_root": workspace_root,
+                        "worktree_root": repo_metadata["worktree_root"],
+                        "repo_root": repo_metadata["repo_root"],
+                        "repo_name": repo_metadata["repo_name"],
+                        "git_branch": repo_metadata["git_branch"],
+                        "git_commit": repo_metadata["git_commit"],
+                        "git_dirty": repo_metadata["git_dirty"],
+                        "source_path": str(jsonl_path),
+                        "shared_path": shared_path,
+                        "first_timestamp": info.first_timestamp,
+                        "last_timestamp": info.last_timestamp,
+                        "duration_seconds": None,
+                        "user_message_count": info.user_message_count,
+                        "assistant_message_count": info.assistant_message_count,
+                        "tool_call_count": info.tool_call_count,
+                        "error_count": info.error_count,
+                        "total_input_tokens": info.total_input_tokens,
+                        "total_output_tokens": info.total_output_tokens,
+                        "fresh_input_tokens": info.fresh_input_tokens,
+                        "cached_input_tokens": info.cached_input_tokens,
+                        "cache_creation_input_tokens": info.cache_creation_input_tokens,
+                        "cache_creation_5m_input_tokens": info.cache_creation_5m_input_tokens,
+                        "cache_creation_1h_input_tokens": info.cache_creation_1h_input_tokens,
+                        "cache_creation_unknown_input_tokens": info.cache_creation_unknown_input_tokens,
+                        "reasoning_output_tokens": info.reasoning_output_tokens,
+                        "token_version": SESSION_TOKEN_VERSION,
+                        "identity_version": SESSION_IDENTITY_VERSION,
+                        "first_user_message": info.first_user_message,
+                        # Codex metadata carries a raw thread UUID here; the exact
+                        # rollout-key parent is resolved after the complete scan.
+                        "parent_session_id": None,
+                        "thread_id": info.thread_id,
+                        "parent_thread_id": info.parent_thread_id,
+                        "spawn_depth": info.spawn_depth,
+                        "visibility": visibility["visibility"],
+                        "visibility_source": visibility["visibility_source"],
+                        "visibility_rule_id": visibility["visibility_rule_id"],
+                        "visibility_reason": visibility["visibility_reason"],
+                        "is_private": 1 if visibility["visibility"] == "private" else 0,
+                        "file_hash": fhash,
+                        "file_size": file_stat.st_size,
+                        "file_mtime": file_stat.st_mtime,
+                        "synced_at": now,
+                        "model": info.model,
+                        **activity,
+                        **narrative,
+                        **objective,
+                        **origin,
+                    },
+                )
                 insert_tool_calls(conn, session_id, info.tool_calls)
                 insert_session_paths(conn, session_id, session_paths)
                 insert_session_daily_usage(conn, session_id, info.daily_usage)
@@ -2700,7 +2798,9 @@ def _sync_sessions(
                     short = session_id[-20:] if len(session_id) > 20 else session_id
                     print(f"  {action}: …{short} ({project})")
 
-        backfilled, backfill_affected = _backfill_tokens_from_shared(conn, verbose=verbose)
+        backfilled, backfill_affected = _backfill_tokens_from_shared(
+            conn, verbose=verbose
+        )
         updated_count += backfilled
         affected_native |= backfill_affected
 
@@ -2718,7 +2818,7 @@ def _sync_sessions(
             verbose=verbose,
         )
         if search_backfill.indexed or search_backfill.missing or search_backfill.errors:
-            gib = search_backfill.indexed_bytes / (1024 ** 3)
+            gib = search_backfill.indexed_bytes / (1024**3)
             print(
                 "Search index: "
                 f"{search_backfill.indexed} session(s), {gib:.2f} GiB scanned "

@@ -1,4 +1,5 @@
 """Flask web application for Logpile."""
+
 import re
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
@@ -24,7 +25,9 @@ from ..origins import SESSION_ORIGINS
 from ..parsers import render_claudecode_transcript, render_codex_transcript
 
 
-def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool = False) -> Flask:
+def create_app(
+    db_path: Path, shared_dir: Path | None = None, public_mode: bool = False
+) -> Flask:
     init_db(db_path)
     app = Flask(__name__)
     app.config["DB_PATH"] = db_path
@@ -45,7 +48,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 3,
                 lambda session_goal, first_user_message, session_summary: (
                     _core_normalize_objective_family(
-                        _core_objective_seed_text(session_goal, first_user_message, session_summary)
+                        _core_objective_seed_text(
+                            session_goal, first_user_message, session_summary
+                        )
                     )
                     or ""
                 ),
@@ -106,7 +111,8 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         # edit revokes those sessions, so do not expose the edit on an empty
         # public profile page or API response.
         return bool(
-            _db().execute(
+            _db()
+            .execute(
                 """
                 SELECT 1
                 FROM session_catalog s
@@ -114,7 +120,8 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 LIMIT 1
                 """,
                 (row["username"],),
-            ).fetchone()
+            )
+            .fetchone()
         )
 
     def _parse_int_arg(
@@ -148,7 +155,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         for row in rows:
             user_key = row["user_key"]
             display = row["user_display_name"] or row["username"] or user_key
-            labels[user_key] = f"{display} (@{user_key})" if counts[display] > 1 else display
+            labels[user_key] = (
+                f"{display} (@{user_key})" if counts[display] > 1 else display
+            )
         return labels
 
     def _fmt_ts(ts: str | None) -> str:
@@ -249,7 +258,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             abort(400, description=f"Unsupported activity filter: {name}")
         return clauses[normalized]
 
-    def _normalize_origin_filter(name: str | None, *, allow_all: bool = False) -> str | None:
+    def _normalize_origin_filter(
+        name: str | None, *, allow_all: bool = False
+    ) -> str | None:
         if not name:
             return None
         normalized = name.strip().lower()
@@ -261,7 +272,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             abort(400, description=f"Unsupported origin filter: {name}")
         return normalized
 
-    def _origin_clause(name: str | None, alias: str = "s", *, allow_all: bool = False) -> str | None:
+    def _origin_clause(
+        name: str | None, alias: str = "s", *, allow_all: bool = False
+    ) -> str | None:
         normalized = _normalize_origin_filter(name, allow_all=allow_all)
         if not normalized:
             return None
@@ -309,7 +322,8 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             if not existing:
                 grouped[key] = {
                     "objective_key": key,
-                    "display_label": row["objective_label"] or _display_objective_label(seed),
+                    "display_label": row["objective_label"]
+                    or _display_objective_label(seed),
                     "launches": 1,
                     "operator_count": 1,
                     "total_tool_calls": row["tool_call_count"] or 0,
@@ -365,7 +379,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
     def _group_context_explosion_rows(rows, limit: int = 6) -> list[dict]:
         grouped: dict[str, dict] = {}
         for row in rows:
-            total_tokens = (row["total_input_tokens"] or 0) + (row["total_output_tokens"] or 0)
+            total_tokens = (row["total_input_tokens"] or 0) + (
+                row["total_output_tokens"] or 0
+            )
             root_session_id = row["root_session_id"]
             existing = grouped.get(root_session_id)
             if not existing:
@@ -375,7 +391,10 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                     row["root_session_summary"],
                 )
                 display_label = row["root_objective_label"] or _display_objective_label(
-                    seed or row["root_session_summary"] or row["session_summary"] or "Untitled workstream"
+                    seed
+                    or row["root_session_summary"]
+                    or row["session_summary"]
+                    or "Untitled workstream"
                 )
                 existing = {
                     "root_session_id": root_session_id,
@@ -385,7 +404,8 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                     "project": row["root_project"] or row["project"],
                     "display_label": display_label,
                     "root_summary": row["root_session_summary"],
-                    "root_first_timestamp": row["root_first_timestamp"] or row["first_timestamp"],
+                    "root_first_timestamp": row["root_first_timestamp"]
+                    or row["first_timestamp"],
                     "total_tokens": 0,
                     "total_input_tokens": 0,
                     "fresh_input_tokens": 0,
@@ -409,12 +429,16 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             existing["cached_input_tokens"] += row["cached_input_tokens"] or 0
             existing["total_output_tokens"] += row["total_output_tokens"] or 0
             existing["session_count"] += 1
-            existing["max_spawn_depth"] = max(existing["max_spawn_depth"], row["spawn_depth"] or 0)
+            existing["max_spawn_depth"] = max(
+                existing["max_spawn_depth"], row["spawn_depth"] or 0
+            )
 
             if row["session_id"] != root_session_id:
                 existing["child_session_count"] += 1
                 existing["child_token_burden"] += total_tokens
-                existing["top_child_tokens"] = max(existing["top_child_tokens"], total_tokens)
+                existing["top_child_tokens"] = max(
+                    existing["top_child_tokens"], total_tokens
+                )
                 existing["top_children"].append(
                     {
                         "session_id": row["session_id"],
@@ -440,7 +464,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 item["child_token_burden"] / total_tokens if total_tokens else 0.0
             )
             item["top_children"] = sorted(
-                item["top_children"], key=lambda child: child["total_tokens"], reverse=True
+                item["top_children"],
+                key=lambda child: child["total_tokens"],
+                reverse=True,
             )[:4]
             item["warnings"] = _context_explosion_warnings(
                 child_session_count=item["child_session_count"],
@@ -454,7 +480,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         ranked.sort(key=lambda item: item["total_tokens"], reverse=True)
         return ranked[:limit]
 
-    def _build_user_profile(identifier: str, origin_filter: str | None = None) -> dict | None:
+    def _build_user_profile(
+        identifier: str, origin_filter: str | None = None
+    ) -> dict | None:
         db = _db()
         user = _get_user_catalog(identifier)
         if not _profile_is_directly_visible(user):
@@ -491,7 +519,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 MIN(first_timestamp) AS first_seen,
                 MAX(last_timestamp) AS last_seen
             FROM session_catalog s
-            WHERE { _profile_session_clause("s") } AND s.username = ?{origin_sql}
+            WHERE {_profile_session_clause("s")} AND s.username = ?{origin_sql}
             """,
             (user["username"],),
         ).fetchone()
@@ -504,11 +532,13 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 SELECT COUNT(DISTINCT d.day) AS active_days
                 FROM session_daily_effective d
                 JOIN session_catalog s ON s.session_id = d.session_id
-                WHERE { _profile_session_clause("s") } AND s.username = ?{origin_sql}
+                WHERE {_profile_session_clause("s")} AND s.username = ?{origin_sql}
                 """,
                 (user["username"],),
             ).fetchone()
-            summary["active_days"] = active_days_row["active_days"] if active_days_row else 0
+            summary["active_days"] = (
+                active_days_row["active_days"] if active_days_row else 0
+            )
 
         cutoff = (datetime.now(UTC) - timedelta(days=60)).isoformat()
         activity_rows = db.execute(
@@ -520,7 +550,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 SUM(d.tool_call_count) AS tool_calls
             FROM session_daily_effective d
             JOIN session_catalog s ON s.session_id = d.session_id
-            WHERE { _profile_session_clause("s") }
+            WHERE {_profile_session_clause("s")}
               AND s.username = ?
               AND d.day >= ?{origin_sql}
             GROUP BY day
@@ -537,7 +567,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 SUM(user_message_count + native_assistant_message_count) AS messages,
                 SUM(tool_call_count) AS tool_calls
             FROM session_catalog s
-            WHERE { _profile_session_clause("s") } AND s.username = ?{origin_sql}
+            WHERE {_profile_session_clause("s")} AND s.username = ?{origin_sql}
             GROUP BY source
             ORDER BY sessions DESC, messages DESC
             """,
@@ -549,7 +579,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             SELECT tc.tool_name, COUNT(*) AS cnt
             FROM tool_calls tc
             JOIN session_catalog s ON s.session_id = tc.session_id
-            WHERE { _profile_session_clause("s") } AND s.username = ?{origin_sql}
+            WHERE {_profile_session_clause("s")} AND s.username = ?{origin_sql}
             GROUP BY tc.tool_name
             ORDER BY cnt DESC
             LIMIT 12
@@ -567,7 +597,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 COUNT(*) AS sessions,
                 SUM(user_message_count + native_assistant_message_count) AS messages
             FROM session_catalog s
-            WHERE { _profile_session_clause("s") } AND s.username = ?{origin_sql}
+            WHERE {_profile_session_clause("s")} AND s.username = ?{origin_sql}
             GROUP BY model_name
             ORDER BY sessions DESC, messages DESC
             LIMIT 8
@@ -593,7 +623,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 s.assistant_message_count,
                 s.tool_call_count
             FROM session_catalog s
-            WHERE { _profile_session_clause("s") } AND s.username = ?{origin_sql}
+            WHERE {_profile_session_clause("s")} AND s.username = ?{origin_sql}
             ORDER BY s.first_timestamp DESC
             LIMIT 12
             """,
@@ -608,8 +638,10 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         }
         source_breakdown = {
             "labels": [
-                "Claude Code" if r["source"] == "claudecode"
-                else "Codex" if r["source"] == "codex"
+                "Claude Code"
+                if r["source"] == "claudecode"
+                else "Codex"
+                if r["source"] == "codex"
                 else r["source"]
                 for r in source_rows
             ],
@@ -658,7 +690,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 COUNT(DISTINCT project) AS total_projects
             FROM session_catalog s
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") }{origin_sql}
+            WHERE {_listed_session_clause("s", "u")}{origin_sql}
             """
         ).fetchone()
 
@@ -678,18 +710,22 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 s.first_user_message
             FROM session_catalog s
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") }{origin_sql}
+            WHERE {_listed_session_clause("s", "u")}{origin_sql}
             ORDER BY s.first_timestamp DESC
             LIMIT 10
             """
         ).fetchall()
-        return render_template("dashboard.html", stats=stats, recent=recent, origin=origin)
+        return render_template(
+            "dashboard.html", stats=stats, recent=recent, origin=origin
+        )
 
     @app.route("/api/messages-per-day")
     def api_messages_per_day():
         db = _db()
         cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat()
-        origin_clause = _origin_clause(request.args.get("origin", ""), "s", allow_all=True)
+        origin_clause = _origin_clause(
+            request.args.get("origin", ""), "s", allow_all=True
+        )
         origin_sql = f" AND {origin_clause}" if origin_clause else ""
         rows = db.execute(
             f"""
@@ -702,7 +738,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             FROM session_daily_effective d
             JOIN session_catalog s ON s.session_id = d.session_id
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") } AND d.day >= ?{origin_sql}
+            WHERE {_listed_session_clause("s", "u")} AND d.day >= ?{origin_sql}
             GROUP BY day, user_key, s.username, user_display_name
             ORDER BY day
             """,
@@ -745,7 +781,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
     def api_messages_per_tool():
         db = _db()
         cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat()
-        origin_clause = _origin_clause(request.args.get("origin", ""), "s", allow_all=True)
+        origin_clause = _origin_clause(
+            request.args.get("origin", ""), "s", allow_all=True
+        )
         origin_sql = f" AND {origin_clause}" if origin_clause else ""
         rows = db.execute(
             f"""
@@ -756,7 +794,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             FROM session_daily_effective d
             JOIN session_catalog s ON s.session_id = d.session_id
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") } AND d.day >= ?{origin_sql}
+            WHERE {_listed_session_clause("s", "u")} AND d.day >= ?{origin_sql}
             GROUP BY day, source
             ORDER BY day
             """,
@@ -778,7 +816,11 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             color = source_colors.get(src, {"border": "#aaaaaa", "bg": "#aaaaaa33"})
             datasets.append(
                 {
-                    "label": "CC" if src == "claudecode" else "Codex" if src == "codex" else src,
+                    "label": "CC"
+                    if src == "claudecode"
+                    else "Codex"
+                    if src == "codex"
+                    else src,
                     "data": [pivot[day][src] for day in days_set],
                     "borderColor": color["border"],
                     "backgroundColor": color["bg"],
@@ -792,7 +834,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
     @app.route("/api/top-tools")
     def api_top_tools():
         db = _db()
-        origin_clause = _origin_clause(request.args.get("origin", ""), "s", allow_all=True)
+        origin_clause = _origin_clause(
+            request.args.get("origin", ""), "s", allow_all=True
+        )
         origin_sql = f" AND {origin_clause}" if origin_clause else ""
         rows = db.execute(
             f"""
@@ -800,7 +844,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             FROM tool_calls tc
             JOIN session_catalog s ON s.session_id = tc.session_id
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") }{origin_sql}
+            WHERE {_listed_session_clause("s", "u")}{origin_sql}
             GROUP BY tc.tool_name
             ORDER BY cnt DESC
             LIMIT 20
@@ -823,7 +867,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
     @app.route("/api/error-rate")
     def api_error_rate():
         db = _db()
-        origin_clause = _origin_clause(request.args.get("origin", ""), "s", allow_all=True)
+        origin_clause = _origin_clause(
+            request.args.get("origin", ""), "s", allow_all=True
+        )
         origin_sql = f" AND {origin_clause}" if origin_clause else ""
         rows = db.execute(
             f"""
@@ -834,7 +880,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 SUM(s.error_count) AS errors
             FROM session_catalog s
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") }{origin_sql}
+            WHERE {_listed_session_clause("s", "u")}{origin_sql}
             GROUP BY user_key, s.username, user_display_name
             ORDER BY errors DESC
             LIMIT 15
@@ -872,8 +918,8 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 MIN(s.first_timestamp) AS first_seen,
                 MAX(s.last_timestamp) AS last_seen
             FROM user_catalog u
-            LEFT JOIN session_catalog s ON s.username = u.username AND { _listed_session_clause("s", "u") }
-            WHERE { _listed_profile_clause("u") }
+            LEFT JOIN session_catalog s ON s.username = u.username AND {_listed_session_clause("s", "u")}
+            WHERE {_listed_profile_clause("u")}
             GROUP BY u.username, u.display_name, u.bio
             ORDER BY last_seen DESC, sessions DESC, u.username
             """
@@ -901,7 +947,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         branch = request.args.get("branch", "").strip()
         activity = request.args.get("activity", "").strip()
         status_filter = request.args.get("status", "").strip()
-        origin_filter = request.args.get("origin", "human_direct").strip() or "human_direct"
+        origin_filter = (
+            request.args.get("origin", "human_direct").strip() or "human_direct"
+        )
         path_query = request.args.get("path", "").strip()
         page = _parse_int_arg("page", 1, minimum=1)
         per_page = 50
@@ -1050,10 +1098,10 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 u.username,
                 COALESCE(u.display_name, u.username) AS display_name
             FROM user_catalog u
-            WHERE { _listed_profile_clause("u") }
+            WHERE {_listed_profile_clause("u")}
               AND EXISTS (
                   SELECT 1 FROM session_catalog s
-                  WHERE s.username = u.username AND { _listed_session_clause("s") }
+                  WHERE s.username = u.username AND {_listed_session_clause("s")}
               )
             ORDER BY display_name, u.username
             """
@@ -1130,10 +1178,12 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                     else:
                         turns = render_codex_transcript(artifact_stream)
                 except Exception as exc:
-                    turns = [{
-                        "type": "error",
-                        "content": f"Failed to parse transcript: {exc}",
-                    }]
+                    turns = [
+                        {
+                            "type": "error",
+                            "content": f"Failed to parse transcript: {exc}",
+                        }
+                    ]
         else:
             candidate_paths = []
             if row["shared_path"]:
@@ -1148,9 +1198,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                         / Path(row["shared_path"]).name
                     )
             if row["source_path"]:
-                candidate_paths.append(
-                    Path(row["source_path"])
-                )
+                candidate_paths.append(Path(row["source_path"]))
             path = next(
                 (candidate for candidate in candidate_paths if candidate.exists()),
                 None,
@@ -1163,14 +1211,18 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 else:
                     turns = render_codex_transcript(path)
             except Exception as exc:
-                turns = [{"type": "error", "content": f"Failed to parse transcript: {exc}"}]
+                turns = [
+                    {"type": "error", "content": f"Failed to parse transcript: {exc}"}
+                ]
 
         tool_calls = db.execute(
             "SELECT tool_name, command, is_error FROM tool_calls WHERE session_id = ?",
             (session_id,),
         ).fetchall()
 
-        return render_template("session_detail.html", session=row, turns=turns, tool_calls=tool_calls)
+        return render_template(
+            "session_detail.html", session=row, turns=turns, tool_calls=tool_calls
+        )
 
     @app.route("/analysis")
     def analysis():
@@ -1184,7 +1236,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             FROM tool_calls tc
             JOIN session_catalog s ON s.session_id = tc.session_id
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") }{origin_sql}
+            WHERE {_listed_session_clause("s", "u")}{origin_sql}
               AND tc.tool_name IN ('Bash', 'shell', 'bash')
               AND tc.command IS NOT NULL
               AND tc.command != ''
@@ -1205,7 +1257,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             FROM tool_calls tc
             JOIN session_catalog s ON s.session_id = tc.session_id
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") }{origin_sql}
+            WHERE {_listed_session_clause("s", "u")}{origin_sql}
             GROUP BY tc.tool_name
             ORDER BY cnt DESC
             LIMIT 25
@@ -1227,7 +1279,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 MAX(s.last_timestamp) AS last_seen
             FROM session_catalog s
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") }{origin_sql}
+            WHERE {_listed_session_clause("s", "u")}{origin_sql}
             GROUP BY s.username, display_name, s.username
             ORDER BY sessions DESC
             """
@@ -1239,7 +1291,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             FROM tool_calls tc
             JOIN session_catalog s ON s.session_id = tc.session_id
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") }{origin_sql}
+            WHERE {_listed_session_clause("s", "u")}{origin_sql}
               AND tc.command IS NOT NULL
               AND tc.command != ''
             GROUP BY tc.command
@@ -1269,7 +1321,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 s.error_count
             FROM session_catalog s
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") }{origin_sql}
+            WHERE {_listed_session_clause("s", "u")}{origin_sql}
               AND s.first_timestamp >= ?
               AND (
                 COALESCE(s.session_goal, '') != ''
@@ -1288,7 +1340,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 SELECT s.session_id, s.parent_session_id
                 FROM session_catalog s
                 LEFT JOIN user_catalog u ON u.username = s.username
-                WHERE { _listed_session_clause("s", "u") }{origin_sql}
+                WHERE {_listed_session_clause("s", "u")}{origin_sql}
                   AND s.source = 'codex'
                   AND s.first_timestamp >= ?
                   AND (
@@ -1296,7 +1348,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                     OR EXISTS (
                       SELECT 1 FROM session_catalog child
                       WHERE child.parent_session_id = s.session_id
-                        AND { _listed_session_clause("child") }
+                        AND {_listed_session_clause("child")}
                     )
                   )
                   AND (COALESCE(s.total_input_tokens, 0) + COALESCE(s.total_output_tokens, 0)) > 0
@@ -1315,7 +1367,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 FROM lineage
                 JOIN session_catalog parent
                   ON parent.session_id = lineage.parent_session_id
-                 AND { _listed_session_clause("parent") }
+                 AND {_listed_session_clause("parent")}
                 WHERE lineage.parent_session_id IS NOT NULL
             ),
             roots AS (
@@ -1356,10 +1408,10 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             JOIN roots ON roots.leaf_session_id = recent.session_id
             JOIN session_catalog s
               ON s.session_id = recent.session_id
-             AND { _listed_session_clause("s") }
+             AND {_listed_session_clause("s")}
             JOIN session_catalog root
               ON root.session_id = roots.root_session_id
-             AND { _listed_session_clause("root") }
+             AND {_listed_session_clause("root")}
             ORDER BY root.first_timestamp DESC, s.first_timestamp DESC
             """,
             ((datetime.now(UTC) - timedelta(days=7)).isoformat(),),
@@ -1384,7 +1436,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 s.error_count
             FROM session_catalog s
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE { _listed_session_clause("s", "u") }{origin_sql}
+            WHERE {_listed_session_clause("s", "u")}{origin_sql}
               AND (
                 s.tool_call_count >= 200
                 OR s.error_count >= 25
@@ -1419,7 +1471,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         branch = request.args.get("branch", "").strip()
         activity = request.args.get("activity", "").strip()
         status_filter = request.args.get("status", "").strip()
-        origin_filter = request.args.get("origin", "human_direct").strip() or "human_direct"
+        origin_filter = (
+            request.args.get("origin", "human_direct").strip() or "human_direct"
+        )
         objective_filter = request.args.get("objective", "").strip()
         user = request.args.get("user", "").strip()
         path_query = request.args.get("path", "").strip()
@@ -1518,7 +1572,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 s.total_output_tokens
             FROM session_catalog s
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY s.first_timestamp DESC
             LIMIT ?
             """,
@@ -1564,7 +1618,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                     s.tool_call_count
                 FROM session_catalog s
                 LEFT JOIN user_catalog u ON u.username = s.username
-                WHERE {' AND '.join(clauses)}
+                WHERE {" AND ".join(clauses)}
             ),
             path_counts AS (
                 SELECT
@@ -1616,7 +1670,11 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         db = _db()
         user = request.args.get("user", "").strip()
         limit = _parse_int_arg("limit", 100, minimum=1, maximum=500)
-        clauses = [_listed_session_clause("s", "u"), "s.repo_name IS NOT NULL", "s.repo_name != ''"]
+        clauses = [
+            _listed_session_clause("s", "u"),
+            "s.repo_name IS NOT NULL",
+            "s.repo_name != ''",
+        ]
         params: list = []
         if user:
             user_row = get_user_by_identifier(db, user)
@@ -1642,7 +1700,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                     s.last_timestamp
                 FROM session_catalog s
                 LEFT JOIN user_catalog u ON u.username = s.username
-                WHERE {' AND '.join(clauses)}
+                WHERE {" AND ".join(clauses)}
             ),
             path_counts AS (
                 SELECT
@@ -1726,7 +1784,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             FROM session_paths sp
             JOIN session_catalog s ON s.session_id = sp.session_id
             LEFT JOIN user_catalog u ON u.username = s.username
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             GROUP BY COALESCE(sp.repo_relative_path, sp.relative_path, sp.display_path), sp.relative_path, sp.repo_relative_path, s.repo_name
             ORDER BY sessions DESC, occurrences DESC, display_path
             LIMIT ?
@@ -1753,8 +1811,8 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 SUM(s.total_input_tokens + s.total_output_tokens) AS tokens,
                 MAX(s.last_timestamp) AS last_seen
             FROM user_catalog u
-            LEFT JOIN session_catalog s ON s.username = u.username AND { _listed_session_clause("s", "u") }
-            WHERE { _listed_profile_clause("u") }
+            LEFT JOIN session_catalog s ON s.username = u.username AND {_listed_session_clause("s", "u")}
+            WHERE {_listed_profile_clause("u")}
             GROUP BY u.username, u.display_name, u.bio, u.avatar_url, u.profile_visibility
             ORDER BY last_seen DESC, sessions DESC, u.username
             """
@@ -1805,7 +1863,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         branch = request.args.get("branch", "").strip()
         activity = request.args.get("activity", "").strip()
         status_filter = request.args.get("status", "").strip()
-        origin_filter = request.args.get("origin", "human_direct").strip() or "human_direct"
+        origin_filter = (
+            request.args.get("origin", "human_direct").strip() or "human_direct"
+        )
         objective_filter = request.args.get("objective", "").strip()
         path_query = request.args.get("path", "").strip()
         clauses = [_profile_session_clause("s"), "s.username = ?"]
@@ -1851,7 +1911,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
             f"""
             SELECT COUNT(*)
             FROM session_catalog s
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             """,
             params,
         ).fetchone()[0]
@@ -1901,7 +1961,7 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 total_input_tokens,
                 total_output_tokens
             FROM session_catalog s
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY first_timestamp DESC
             LIMIT ? OFFSET ?
             """,
@@ -1963,7 +2023,11 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
         status_filter = request.args.get("status", "").strip() or None
         origin_filter = request.args.get("origin", "").strip() or None
         user = request.args.get("user", "").strip() or None
-        include_reviews = request.args.get("reviews", "").strip().lower() in {"1", "true", "yes"}
+        include_reviews = request.args.get("reviews", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
         try:
             total = count_publish_candidates(
                 _db(),
@@ -1991,7 +2055,9 @@ def create_app(db_path: Path, shared_dir: Path | None = None, public_mode: bool 
                 "status": status_filter,
                 "origin": origin_filter,
                 "reviews": include_reviews,
-                "candidates": [serialize_publish_candidate(candidate) for candidate in candidates],
+                "candidates": [
+                    serialize_publish_candidate(candidate) for candidate in candidates
+                ],
             }
         )
 

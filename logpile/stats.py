@@ -621,7 +621,9 @@ def format_stats(data: dict) -> list[str]:
     if periods:
         lines.append("")
         lines.append("=== By month (event-dated) ===")
-        hdr = f"  {'Month':<10}{'Sessions':>10}{'Input':>16}{'Output':>14}{'Tok/day':>12}"
+        hdr = (
+            f"  {'Month':<10}{'Sessions':>10}{'Input':>16}{'Output':>14}{'Tok/day':>12}"
+        )
         lines.append(hdr)
         for p in periods:
             lines.append(

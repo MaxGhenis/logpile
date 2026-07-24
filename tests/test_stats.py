@@ -174,10 +174,7 @@ class TestClassifySession:
 
     def test_boundary_subagent_beats_everything(self):
         assert classify_session(1, 200, 1000) == "subagent"
-        assert (
-            classify_session(0, 200, 1000, subagent_evidence=True)
-            == "subagent"
-        )
+        assert classify_session(0, 200, 1000, subagent_evidence=True) == "subagent"
 
     def test_boundary_long_vs_medium(self):
         assert classify_session(0, 19, 400) == "medium-conversation"
@@ -663,10 +660,18 @@ class TestBoundedEventPeriodSemantics:
         assert by_repo["repo-b"]["session_count"] == 1
         assert by_repo["repo-b"]["total_output_tokens"] == 40
 
-        assert sum(row["session_count"] for row in patterns) == overview["total_sessions"]
-        assert sum(row["total_output_tokens"] for row in patterns) == overview["total_output_tokens"]
+        assert (
+            sum(row["session_count"] for row in patterns) == overview["total_sessions"]
+        )
+        assert (
+            sum(row["total_output_tokens"] for row in patterns)
+            == overview["total_output_tokens"]
+        )
         assert sum(row["session_count"] for row in repos) == overview["total_sessions"]
-        assert sum(row["total_output_tokens"] for row in repos) == overview["total_output_tokens"]
+        assert (
+            sum(row["total_output_tokens"] for row in repos)
+            == overview["total_output_tokens"]
+        )
 
         # Supplying no date bounds intentionally retains whole-session rows.
         unbounded = compute_overview(conn)

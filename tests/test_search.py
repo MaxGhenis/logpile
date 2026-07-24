@@ -297,9 +297,7 @@ class SearchIndexTests(unittest.TestCase):
                 [
                     {
                         "type": "assistant",
-                        "message": {
-                            "content": [{"type": "text", "text": phrase}]
-                        },
+                        "message": {"content": [{"type": "text", "text": phrase}]},
                     }
                 ],
             )
@@ -348,14 +346,11 @@ class SearchIndexTests(unittest.TestCase):
                     )
 
                 uncapped = {
-                    row["session_id"]
-                    for row in search_sessions(conn, phrase, limit=10)
+                    row["session_id"] for row in search_sessions(conn, phrase, limit=10)
                 }
                 capped = {
                     row["session_id"]
-                    for row in search_sessions(
-                        conn, phrase, limit=10, candidate_cap=1
-                    )
+                    for row in search_sessions(conn, phrase, limit=10, candidate_cap=1)
                 }
 
             self.assertEqual(
@@ -382,7 +377,10 @@ class SearchIndexTests(unittest.TestCase):
                         "type": "assistant",
                         "message": {
                             "content": [
-                                {"type": "text", "text": "visible claude assistant prose"},
+                                {
+                                    "type": "text",
+                                    "text": "visible claude assistant prose",
+                                },
                                 {"type": "thinking", "thinking": "claudeThinkingLeak"},
                                 {
                                     "type": "tool_use",
@@ -422,7 +420,10 @@ class SearchIndexTests(unittest.TestCase):
                             "type": "message",
                             "role": "user",
                             "content": [
-                                {"type": "input_text", "text": "visible codex user prose"}
+                                {
+                                    "type": "input_text",
+                                    "text": "visible codex user prose",
+                                }
                             ],
                         },
                     },
@@ -432,7 +433,10 @@ class SearchIndexTests(unittest.TestCase):
                             "type": "message",
                             "role": "assistant",
                             "content": [
-                                {"type": "output_text", "text": "visible codex assistant prose"},
+                                {
+                                    "type": "output_text",
+                                    "text": "visible codex assistant prose",
+                                },
                                 {"type": "thinking", "text": "codexThinkingLeak"},
                                 {"type": "image", "text": "codexImageLeak"},
                             ],
@@ -524,23 +528,23 @@ class SearchIndexTests(unittest.TestCase):
                 )
             ),
             "\n".join(
-                base64.b64encode(b"x" * 48).decode()[index:index + 32]
+                base64.b64encode(b"x" * 48).decode()[index : index + 32]
                 for index in range(0, 64, 32)
             ),
             " ".join(
-                base64.b64encode(b"x" * 48).decode()[index:index + 32]
+                base64.b64encode(b"x" * 48).decode()[index : index + 32]
                 for index in range(0, 64, 32)
             ),
             "\t".join(
-                base64.b64encode(b"x" * 48).decode()[index:index + 32]
+                base64.b64encode(b"x" * 48).decode()[index : index + 32]
                 for index in range(0, 64, 32)
             ),
             " ".join(
-                base64.b64encode(b"x" * 51).decode()[index:index + 32]
+                base64.b64encode(b"x" * 51).decode()[index : index + 32]
                 for index in range(0, 68, 32)
             ),
             " ".join(
-                base64.b64encode(b"x" * 54).decode()[index:index + 32]
+                base64.b64encode(b"x" * 54).decode()[index : index + 32]
                 for index in range(0, 72, 32)
             ),
             base64.b64encode(b"x" * 13).decode(),
@@ -555,9 +559,7 @@ class SearchIndexTests(unittest.TestCase):
             )
 
         adversarial = " ".join(
-            token
-            for _ in range(2000)
-            for token in (("A" * 16,) * 4 + ("B" * 17,))
+            token for _ in range(2000) for token in (("A" * 16,) * 4 + ("B" * 17,))
         )
         started = time.monotonic()
         cleaned_adversarial = clean_search_text(adversarial)
@@ -679,7 +681,9 @@ class SearchIndexTests(unittest.TestCase):
             codex = parse_codex_session(codex_path)
             assert claude is not None and codex is not None
             self.assertEqual(claude.first_user_message, "real claude operator request")
-            self.assertEqual(codex.first_user_message, "real legacy codex operator request")
+            self.assertEqual(
+                codex.first_user_message, "real legacy codex operator request"
+            )
 
             init_db(db_path)
             with get_db(db_path) as conn:
@@ -768,7 +772,9 @@ class SearchIndexTests(unittest.TestCase):
                 self.assertEqual(search_sessions(conn, "pluginNeedle"), [])
                 self.assertEqual(search_sessions(conn, "contextNeedle"), [])
 
-    def test_recommended_plugins_title_is_blank_but_suffix_remains_in_transcript(self) -> None:
+    def test_recommended_plugins_title_is_blank_but_suffix_remains_in_transcript(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             db_path = root / "logpile.db"
@@ -859,13 +865,9 @@ class SearchIndexTests(unittest.TestCase):
                     "xml-prompt",
                     transcript_path=transcript,
                 )
-                results = search_sessions(
-                    conn, "quarterlyRevenueReconciliation"
-                )
+                results = search_sessions(conn, "quarterlyRevenueReconciliation")
 
-            self.assertEqual(
-                [row["session_id"] for row in results], ["xml-prompt"]
-            )
+            self.assertEqual([row["session_id"] for row in results], ["xml-prompt"])
             self.assertIn(
                 results[0]["matched_field"],
                 {"session goal", "first user message"},
@@ -928,9 +930,7 @@ class SearchIndexTests(unittest.TestCase):
                         self.assertEqual(search_sessions(conn, leak), [])
                 kept = search_sessions(conn, "genuine operator ask")
 
-            self.assertEqual(
-                [row["session_id"] for row in kept], ["injected"]
-            )
+            self.assertEqual([row["session_id"] for row in kept], ["injected"])
 
     def test_codex_agents_instructions_payload_is_not_indexed(self) -> None:
         agents_payload = (
@@ -1006,17 +1006,11 @@ class SearchIndexTests(unittest.TestCase):
                     "codex-agents",
                     transcript_path=transcript,
                 )
-                self.assertEqual(
-                    search_sessions(conn, "agentsPayloadSentinel"), []
-                )
-                self.assertEqual(
-                    search_sessions(conn, "bareHeaderSentinel"), []
-                )
+                self.assertEqual(search_sessions(conn, "agentsPayloadSentinel"), [])
+                self.assertEqual(search_sessions(conn, "bareHeaderSentinel"), [])
                 kept = search_sessions(conn, "real codex operator ask")
 
-            self.assertEqual(
-                [row["session_id"] for row in kept], ["codex-agents"]
-            )
+            self.assertEqual([row["session_id"] for row in kept], ["codex-agents"])
 
     def test_public_mode_cannot_search_private_session_text(self) -> None:
         # A reviewed public session and a private session share the same
@@ -1030,11 +1024,7 @@ class SearchIndexTests(unittest.TestCase):
             shared = root / "shared"
             db_path = root / "logpile.db"
             public_source = (
-                home
-                / ".claude"
-                / "projects"
-                / "-tmp-demo"
-                / "public-visible.jsonl"
+                home / ".claude" / "projects" / "-tmp-demo" / "public-visible.jsonl"
             )
             write_jsonl(
                 public_source,
@@ -1117,9 +1107,7 @@ class SearchIndexTests(unittest.TestCase):
                 {"public-visible", "private-session"},
             )
             private_row = next(
-                row
-                for row in private_results
-                if row["session_id"] == "private-session"
+                row for row in private_results if row["session_id"] == "private-session"
             )
             self.assertIsNotNone(private_row["score"])
 
@@ -1129,13 +1117,7 @@ class SearchIndexTests(unittest.TestCase):
             home = root / "home"
             shared = root / "shared"
             db_path = root / "logpile.db"
-            source = (
-                home
-                / ".claude"
-                / "projects"
-                / "-tmp-demo"
-                / "public-search.jsonl"
-            )
+            source = home / ".claude" / "projects" / "-tmp-demo" / "public-search.jsonl"
             write_jsonl(
                 source,
                 [
@@ -1208,11 +1190,7 @@ class SearchIndexTests(unittest.TestCase):
             shared = root / "shared"
             db_path = root / "logpile.db"
             session_path = (
-                home
-                / ".claude"
-                / "projects"
-                / "-tmp-demo"
-                / "search-session.jsonl"
+                home / ".claude" / "projects" / "-tmp-demo" / "search-session.jsonl"
             )
             write_jsonl(
                 session_path,
@@ -1265,9 +1243,7 @@ class SearchIndexTests(unittest.TestCase):
                     search_sessions(conn, "new incremental replacement needle")
                 )
                 self.assertEqual(get_meta(conn, "search_refresh_pending"), "0")
-                conn.execute(
-                    "DELETE FROM sessions WHERE session_id = 'search-session'"
-                )
+                conn.execute("DELETE FROM sessions WHERE session_id = 'search-session'")
                 self.assertEqual(
                     conn.execute(
                         "SELECT COUNT(*) FROM session_search_documents "
@@ -1283,19 +1259,15 @@ class SearchIndexTests(unittest.TestCase):
                     0,
                 )
 
-    def test_incremental_search_uses_verified_copy_not_post_copy_source_bytes(self) -> None:
+    def test_incremental_search_uses_verified_copy_not_post_copy_source_bytes(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
             shared = root / "shared"
             db_path = root / "logpile.db"
-            source = (
-                home
-                / ".claude"
-                / "projects"
-                / "-tmp-demo"
-                / "copy-race.jsonl"
-            )
+            source = home / ".claude" / "projects" / "-tmp-demo" / "copy-race.jsonl"
             old_record = {
                 "timestamp": "2026-07-01T00:00:00Z",
                 "type": "user",
@@ -1371,12 +1343,12 @@ class SearchIndexTests(unittest.TestCase):
             racing_conn = sqlite3.connect(db_path, factory=_RacingConnection)
             racing_conn.row_factory = sqlite3.Row
             try:
+
                 def commit_redaction() -> None:
                     other = sqlite3.connect(db_path)
                     try:
                         other.execute(
-                            "UPDATE sessions SET session_goal = ? "
-                            "WHERE session_id = ?",
+                            "UPDATE sessions SET session_goal = ? WHERE session_id = ?",
                             ("redacted goal", "racing"),
                         )
                         other.commit()
@@ -1396,8 +1368,7 @@ class SearchIndexTests(unittest.TestCase):
             with get_db(db_path) as conn:
                 self.assertEqual(
                     conn.execute(
-                        "SELECT session_goal FROM sessions "
-                        "WHERE session_id = 'racing'"
+                        "SELECT session_goal FROM sessions WHERE session_id = 'racing'"
                     ).fetchone()[0],
                     "redacted goal",
                 )
@@ -1410,12 +1381,8 @@ class SearchIndexTests(unittest.TestCase):
                     ).fetchone()[0],
                     "stale",
                 )
-                self.assertEqual(
-                    search_sessions(conn, "first revision text"), []
-                )
-                self.assertEqual(
-                    search_sessions(conn, "redacted goal"), []
-                )
+                self.assertEqual(search_sessions(conn, "first revision text"), [])
+                self.assertEqual(search_sessions(conn, "redacted goal"), [])
 
     def test_public_membership_survives_private_shadowing(self) -> None:
         # Rank-cut-then-filter must not decide membership: many dense private
@@ -1428,11 +1395,7 @@ class SearchIndexTests(unittest.TestCase):
             shared = root / "shared"
             db_path = root / "logpile.db"
             public_source = (
-                home
-                / ".claude"
-                / "projects"
-                / "-tmp-demo"
-                / "public-shadowed.jsonl"
+                home / ".claude" / "projects" / "-tmp-demo" / "public-shadowed.jsonl"
             )
             write_jsonl(
                 public_source,
@@ -1565,9 +1528,7 @@ class SearchIndexTests(unittest.TestCase):
                             {
                                 "type": "assistant",
                                 "message": {
-                                    "content": [
-                                        {"type": "text", "text": phrase}
-                                    ]
+                                    "content": [{"type": "text", "text": phrase}]
                                 },
                             }
                         ],
@@ -1584,9 +1545,7 @@ class SearchIndexTests(unittest.TestCase):
                         transcript_path=path,
                     )
 
-                results = search_sessions(
-                    conn, phrase, limit=2, candidate_cap=2
-                )
+                results = search_sessions(conn, phrase, limit=2, candidate_cap=2)
 
             # tie-2 is the newest; the equal-score class must be fully
             # consumed so it wins regardless of which side of the original
@@ -1635,9 +1594,7 @@ class SearchIndexTests(unittest.TestCase):
                     "wrapped-agents",
                     transcript_path=transcript,
                 )
-                self.assertEqual(
-                    search_sessions(conn, "wrappedAgentsSentinel"), []
-                )
+                self.assertEqual(search_sessions(conn, "wrappedAgentsSentinel"), [])
 
     def test_codex_agents_payload_never_becomes_the_title(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -1722,9 +1679,7 @@ class SearchIndexTests(unittest.TestCase):
                         [
                             {
                                 "type": "user",
-                                "message": {
-                                    "content": f"{phrase} variant {index}"
-                                },
+                                "message": {"content": f"{phrase} variant {index}"},
                             }
                         ],
                     )
@@ -1740,9 +1695,7 @@ class SearchIndexTests(unittest.TestCase):
                         transcript_path=path,
                     )
 
-            counting_conn = sqlite3.connect(
-                db_path, factory=_SnippetCountingConnection
-            )
+            counting_conn = sqlite3.connect(db_path, factory=_SnippetCountingConnection)
             counting_conn.row_factory = sqlite3.Row
             try:
                 with mock.patch("logpile.search._SQL_IN_CHUNK", 1):
@@ -1763,23 +1716,17 @@ class SearchIndexTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "mixed.jsonl"
-            giant = json.dumps(
-                {"type": "user", "message": {"content": "G" * 4000}}
-            )
+            giant = json.dumps({"type": "user", "message": {"content": "G" * 4000}})
             normal = json.dumps(
                 {"type": "user", "message": {"content": "small survivor"}}
             )
             path.write_text(f"{giant}\n{normal}\n", encoding="utf-8")
 
             stats = JsonlLoadStats()
-            records = list(
-                _iter_jsonl(path, stats=stats, max_line_chars=1000)
-            )
+            records = list(_iter_jsonl(path, stats=stats, max_line_chars=1000))
 
         self.assertEqual(len(records), 1)
-        self.assertEqual(
-            records[0]["message"]["content"], "small survivor"
-        )
+        self.assertEqual(records[0]["message"]["content"], "small survivor")
         self.assertEqual(stats.malformed_fields.get("line:oversized"), 1)
 
     def test_v7_tool_result_metadata_is_reparsed_and_removed_from_search(self) -> None:
@@ -1789,13 +1736,7 @@ class SearchIndexTests(unittest.TestCase):
             home = root / "home"
             shared = root / "shared"
             db_path = root / "logpile.db"
-            source = (
-                home
-                / ".claude"
-                / "projects"
-                / "-tmp-demo"
-                / "dict-tool.jsonl"
-            )
+            source = home / ".claude" / "projects" / "-tmp-demo" / "dict-tool.jsonl"
             write_jsonl(
                 source,
                 [
@@ -1825,7 +1766,9 @@ class SearchIndexTests(unittest.TestCase):
                     "SELECT first_user_message, session_goal, user_message_count "
                     "FROM sessions WHERE session_id = 'dict-tool'"
                 ).fetchone()
-                self.assertEqual(row["first_user_message"], "real operator search request")
+                self.assertEqual(
+                    row["first_user_message"], "real operator search request"
+                )
                 self.assertEqual(row["session_goal"], "real operator search request")
                 self.assertEqual(row["user_message_count"], 1)
 
@@ -1853,7 +1796,9 @@ class SearchIndexTests(unittest.TestCase):
                     "SELECT first_user_message, session_goal, token_version "
                     "FROM sessions WHERE session_id = 'dict-tool'"
                 ).fetchone()
-                self.assertEqual(row["first_user_message"], "real operator search request")
+                self.assertEqual(
+                    row["first_user_message"], "real operator search request"
+                )
                 self.assertEqual(row["session_goal"], "real operator search request")
                 self.assertEqual(row["token_version"], SESSION_TOKEN_VERSION)
                 self.assertEqual(
@@ -1861,23 +1806,21 @@ class SearchIndexTests(unittest.TestCase):
                     [],
                 )
                 self.assertEqual(
-                    search_sessions(conn, "real operator search request")[0]["session_id"],
+                    search_sessions(conn, "real operator search request")[0][
+                        "session_id"
+                    ],
                     "dict-tool",
                 )
 
-    def test_failed_refresh_is_hidden_until_verified_public_artifact_is_indexed(self) -> None:
+    def test_failed_refresh_is_hidden_until_verified_public_artifact_is_indexed(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
             shared = root / "shared"
             db_path = root / "logpile.db"
-            source = (
-                home
-                / ".claude"
-                / "projects"
-                / "-tmp-demo"
-                / "stale-public.jsonl"
-            )
+            source = home / ".claude" / "projects" / "-tmp-demo" / "stale-public.jsonl"
             init_db(db_path)
             with get_db(db_path) as conn:
                 ensure_user(conn, "alice", display_name="Alice")
@@ -1983,13 +1926,7 @@ class SearchIndexTests(unittest.TestCase):
             home = root / "home"
             shared = root / "shared"
             db_path = root / "logpile.db"
-            source = (
-                home
-                / ".claude"
-                / "projects"
-                / "-tmp-demo"
-                / "fts-recovery.jsonl"
-            )
+            source = home / ".claude" / "projects" / "-tmp-demo" / "fts-recovery.jsonl"
             write_jsonl(
                 source,
                 [
@@ -2030,18 +1967,16 @@ class SearchIndexTests(unittest.TestCase):
                     str(SEARCH_INDEX_VERSION),
                 )
 
-    def test_interrupted_fts_recreation_marker_forces_safe_chunked_rebuild(self) -> None:
+    def test_interrupted_fts_recreation_marker_forces_safe_chunked_rebuild(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
             shared = root / "shared"
             db_path = root / "logpile.db"
             source = (
-                home
-                / ".claude"
-                / "projects"
-                / "-tmp-demo"
-                / "interrupted-fts.jsonl"
+                home / ".claude" / "projects" / "-tmp-demo" / "interrupted-fts.jsonl"
             )
             write_jsonl(
                 source,
@@ -2082,7 +2017,9 @@ class SearchIndexTests(unittest.TestCase):
             init_db(db_path)
             with get_db(db_path) as conn:
                 self.assertEqual(
-                    conn.execute("SELECT COUNT(*) FROM session_search_state").fetchone()[0],
+                    conn.execute(
+                        "SELECT COUNT(*) FROM session_search_state"
+                    ).fetchone()[0],
                     0,
                 )
                 self.assertEqual(
@@ -2096,7 +2033,9 @@ class SearchIndexTests(unittest.TestCase):
                 self.assertTrue(search_sessions(conn, "interrupted fts sentinel"))
                 self.assertEqual(get_meta(conn, "search_refresh_pending"), "0")
 
-    def test_missing_transcript_keeps_private_structured_fields_searchable(self) -> None:
+    def test_missing_transcript_keeps_private_structured_fields_searchable(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             db_path = root / "logpile.db"

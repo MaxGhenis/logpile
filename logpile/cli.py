@@ -1,4 +1,5 @@
 """Click CLI for Logpile."""
+
 import ipaddress
 import json
 import os
@@ -81,11 +82,15 @@ def _select_backend(
         )
     if mode == "cloud":
         if not db_url:
-            raise click.ClickException("Cloud backend requires LOGPILE_SUPABASE_DB_URL or --db-url.")
+            raise click.ClickException(
+                "Cloud backend requires LOGPILE_SUPABASE_DB_URL or --db-url."
+            )
         return "cloud"
     if mode == "local":
         if not db_path.exists():
-            raise click.ClickException(f"Local database not found: {db_path}. Run 'logpile sync' first.")
+            raise click.ClickException(
+                f"Local database not found: {db_path}. Run 'logpile sync' first."
+            )
         return "local"
     if db_url:
         return "cloud"
@@ -183,7 +188,12 @@ def _local_raw_search(
     results: list[dict] = []
     seen: set[str] = set()
     for row in rows:
-        text = row["first_user_message"] or row["session_goal"] or row["session_summary"] or ""
+        text = (
+            row["first_user_message"]
+            or row["session_goal"]
+            or row["session_summary"]
+            or ""
+        )
         results.append(
             {
                 "session_id": row["session_id"],
@@ -288,7 +298,12 @@ def _prepare_db(db: str | Path) -> Path:
 def _resolve_sync_username(db: str | Path, requested_username: str | None) -> str:
     from .db import normalize_username
 
-    explicit = requested_username or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+    explicit = (
+        requested_username
+        or os.environ.get("USER")
+        or os.environ.get("USERNAME")
+        or "unknown"
+    )
     return normalize_username(explicit)
 
 
@@ -318,13 +333,26 @@ def db_backup(output: Path, db: Path):
 
 
 @cli.command(name="status")
-@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
-              help="Read from local SQLite, cloud Postgres, or auto-detect.")
-@click.option("--db", default=str(DEFAULT_DB), show_default=True,
-              help="SQLite database path for local mode.")
-@click.option("--db-url", envvar="LOGPILE_SUPABASE_DB_URL",
-              help="Supabase/Postgres connection URL for cloud mode.")
-@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
+@click.option(
+    "--backend",
+    type=click.Choice(BACKEND_CHOICES),
+    default=None,
+    help="Read from local SQLite, cloud Postgres, or auto-detect.",
+)
+@click.option(
+    "--db",
+    default=str(DEFAULT_DB),
+    show_default=True,
+    help="SQLite database path for local mode.",
+)
+@click.option(
+    "--db-url",
+    envvar="LOGPILE_SUPABASE_DB_URL",
+    help="Supabase/Postgres connection URL for cloud mode.",
+)
+@click.option(
+    "--json", "json_output", is_flag=True, help="Emit structured JSON output."
+)
 def status_command(backend, db, db_url, json_output):
     """Show which Logpile backend is active and how much it contains."""
     db_path = Path(db)
@@ -376,12 +404,23 @@ def status_command(backend, db, db_url, json_output):
 
 @cli.command(name="search")
 @click.argument("query")
-@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
-              help="Read from local SQLite/shared files, cloud Postgres, or auto-detect.")
-@click.option("--db", default=str(DEFAULT_DB), show_default=True,
-              help="SQLite database path for local mode.")
-@click.option("--db-url", envvar="LOGPILE_SUPABASE_DB_URL",
-              help="Supabase/Postgres connection URL for cloud mode.")
+@click.option(
+    "--backend",
+    type=click.Choice(BACKEND_CHOICES),
+    default=None,
+    help="Read from local SQLite/shared files, cloud Postgres, or auto-detect.",
+)
+@click.option(
+    "--db",
+    default=str(DEFAULT_DB),
+    show_default=True,
+    help="SQLite database path for local mode.",
+)
+@click.option(
+    "--db-url",
+    envvar="LOGPILE_SUPABASE_DB_URL",
+    help="Supabase/Postgres connection URL for cloud mode.",
+)
 @click.option("--limit", default=20, show_default=True, type=int)
 @click.option(
     "--public",
@@ -394,7 +433,9 @@ def status_command(backend, db, db_url, json_output):
     is_flag=True,
     help="Forensic raw JSONL/chunk search; may include tool or opaque payloads.",
 )
-@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
+@click.option(
+    "--json", "json_output", is_flag=True, help="Emit structured JSON output."
+)
 def search_command(query, backend, db, db_url, limit, public_mode, raw, json_output):
     """Search extracted session prose (or raw records with --raw)."""
     db_path = Path(db)
@@ -485,7 +526,9 @@ def _print_turn(turn: dict, *, index: int) -> None:
         for block in turn.get("blocks", []):
             if block.get("type") == "tool_use":
                 click.echo(f"  tool: {block.get('name')}")
-                click.echo(json.dumps(block.get("input") or {}, ensure_ascii=False)[:5000])
+                click.echo(
+                    json.dumps(block.get("input") or {}, ensure_ascii=False)[:5000]
+                )
             else:
                 click.echo((block.get("text") or "").strip())
     elif kind == "tool_use":
@@ -499,15 +542,33 @@ def _print_turn(turn: dict, *, index: int) -> None:
 
 @cli.command(name="show")
 @click.argument("session_id")
-@click.option("--backend", type=click.Choice(BACKEND_CHOICES), default=None,
-              help="Read from local SQLite/shared files, cloud Postgres, or auto-detect.")
-@click.option("--db", default=str(DEFAULT_DB), show_default=True,
-              help="SQLite database path for local mode.")
-@click.option("--db-url", envvar="LOGPILE_SUPABASE_DB_URL",
-              help="Supabase/Postgres connection URL for cloud mode.")
-@click.option("--limit", default=200, show_default=True, type=int,
-              help="Maximum turns/chunks to print.")
-@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
+@click.option(
+    "--backend",
+    type=click.Choice(BACKEND_CHOICES),
+    default=None,
+    help="Read from local SQLite/shared files, cloud Postgres, or auto-detect.",
+)
+@click.option(
+    "--db",
+    default=str(DEFAULT_DB),
+    show_default=True,
+    help="SQLite database path for local mode.",
+)
+@click.option(
+    "--db-url",
+    envvar="LOGPILE_SUPABASE_DB_URL",
+    help="Supabase/Postgres connection URL for cloud mode.",
+)
+@click.option(
+    "--limit",
+    default=200,
+    show_default=True,
+    type=int,
+    help="Maximum turns/chunks to print.",
+)
+@click.option(
+    "--json", "json_output", is_flag=True, help="Emit structured JSON output."
+)
 def show_command(session_id, backend, db, db_url, limit, json_output):
     """Show a session transcript from local files or cloud-indexed raw chunks."""
     db_path = Path(db)
@@ -519,8 +580,14 @@ def show_command(session_id, backend, db, db_url, limit, json_output):
 
             chunks = SupabaseArchive(db_url).session_chunks(session_id, limit=limit)
             if not chunks:
-                raise click.ClickException(f"No cloud chunks found for session '{session_id}'.")
-            payload = {"backend": "cloud", "session_id": chunks[0]["session_id"], "chunks": chunks}
+                raise click.ClickException(
+                    f"No cloud chunks found for session '{session_id}'."
+                )
+            payload = {
+                "backend": "cloud",
+                "session_id": chunks[0]["session_id"],
+                "chunks": chunks,
+            }
             if json_output:
                 click.echo(json.dumps(payload, default=str))
                 return
@@ -557,7 +624,9 @@ def show_command(session_id, backend, db, db_url, limit, json_output):
         ).fetchall()
         conn.close()
         if len(rows) != 1:
-            raise click.ClickException(f"No unique local session found for '{session_id}'.")
+            raise click.ClickException(
+                f"No unique local session found for '{session_id}'."
+            )
         row = rows[0]
         path = None
         for candidate in (row["shared_path"], row["source_path"]):
@@ -573,7 +642,12 @@ def show_command(session_id, backend, db, db_url, limit, json_output):
             if row["source"] == "codex"
             else render_claudecode_transcript(path)
         )[:limit]
-        payload = {"backend": "local", "session_id": row["session_id"], "path": str(path), "turns": turns}
+        payload = {
+            "backend": "local",
+            "session_id": row["session_id"],
+            "path": str(path),
+            "turns": turns,
+        }
         if json_output:
             click.echo(json.dumps(payload, default=str))
             return
@@ -586,21 +660,49 @@ def show_command(session_id, backend, db, db_url, limit, json_output):
 
 
 @cli.command()
-@click.option("--shared", default=str(DEFAULT_SHARED), show_default=True,
-              help="Shared directory path")
-@click.option("--db", default=str(DEFAULT_DB), show_default=True,
-              help="SQLite database path")
-@click.option("--backend", type=click.Choice(["local", "cloud", "both"]), default="local",
-              show_default=True, help="Local SQLite sync, cloud raw upload, or both.")
-@click.option("--db-url", envvar="LOGPILE_SUPABASE_DB_URL",
-              help="Supabase/Postgres connection URL for cloud sync.")
-@click.option("--bucket", envvar="LOGPILE_R2_BUCKET", help="R2/S3 bucket for cloud sync.")
-@click.option("--endpoint-url", envvar="LOGPILE_R2_ENDPOINT_URL", help="S3-compatible endpoint URL.")
-@click.option("--account-id", envvar="LOGPILE_R2_ACCOUNT_ID", help="Cloudflare account id for R2 endpoint construction.")
+@click.option(
+    "--shared",
+    default=str(DEFAULT_SHARED),
+    show_default=True,
+    help="Shared directory path",
+)
+@click.option(
+    "--db", default=str(DEFAULT_DB), show_default=True, help="SQLite database path"
+)
+@click.option(
+    "--backend",
+    type=click.Choice(["local", "cloud", "both"]),
+    default="local",
+    show_default=True,
+    help="Local SQLite sync, cloud raw upload, or both.",
+)
+@click.option(
+    "--db-url",
+    envvar="LOGPILE_SUPABASE_DB_URL",
+    help="Supabase/Postgres connection URL for cloud sync.",
+)
+@click.option(
+    "--bucket", envvar="LOGPILE_R2_BUCKET", help="R2/S3 bucket for cloud sync."
+)
+@click.option(
+    "--endpoint-url",
+    envvar="LOGPILE_R2_ENDPOINT_URL",
+    help="S3-compatible endpoint URL.",
+)
+@click.option(
+    "--account-id",
+    envvar="LOGPILE_R2_ACCOUNT_ID",
+    help="Cloudflare account id for R2 endpoint construction.",
+)
 @click.option("--access-key-id", envvar="LOGPILE_R2_ACCESS_KEY_ID", hidden=True)
 @click.option("--secret-access-key", envvar="LOGPILE_R2_SECRET_ACCESS_KEY", hidden=True)
-@click.option("--index/--no-index", "index_text", default=True, show_default=True,
-              help="Index exact JSONL chunks in cloud mode.")
+@click.option(
+    "--index/--no-index",
+    "index_text",
+    default=True,
+    show_default=True,
+    help="Index exact JSONL chunks in cloud mode.",
+)
 @click.option("--username", default=None, help="Override system username")
 @click.option("--machine", default=None, help="Override machine/hostname")
 @click.option("-v", "--verbose", is_flag=True, help="Print each file processed")
@@ -640,11 +742,15 @@ def sync(
         if local_result.status == SyncStatus.LOCK_CONTENDED:
             raise click.exceptions.Exit(75)
         new, updated, skipped = local_result
-        click.echo(f"Local done: {new} new, {updated} updated, {skipped} unchanged/skipped")
+        click.echo(
+            f"Local done: {new} new, {updated} updated, {skipped} unchanged/skipped"
+        )
 
     if backend in {"cloud", "both"}:
         if not db_url:
-            raise click.ClickException("Cloud sync requires LOGPILE_SUPABASE_DB_URL or --db-url.")
+            raise click.ClickException(
+                "Cloud sync requires LOGPILE_SUPABASE_DB_URL or --db-url."
+            )
         from .backup import push_backup, r2_config_from_env
 
         storage_config = r2_config_from_env(
@@ -675,17 +781,26 @@ def sync(
 @click.option("--db", default=str(DEFAULT_DB), show_default=True)
 @click.option("--host", default="127.0.0.1", show_default=True)
 @click.option("--port", default=5002, show_default=True, type=int)
-@click.option("--public", is_flag=True,
-              help="Serve a public read-only view (no auth required). "
-                   "Private/redacted sessions are still hidden.")
+@click.option(
+    "--public",
+    is_flag=True,
+    help="Serve a public read-only view (no auth required). "
+    "Private/redacted sessions are still hidden.",
+)
 @click.option(
     "--unsafe-network",
     is_flag=True,
     help="Allow unauthenticated private mode to bind beyond loopback.",
 )
-@click.option("--dev", is_flag=True, help="Run Next.js dev server with HMR (default: production)")
-@click.option("--flask", is_flag=True, hidden=True,
-              help="Use the legacy Flask server instead of Next.js")
+@click.option(
+    "--dev", is_flag=True, help="Run Next.js dev server with HMR (default: production)"
+)
+@click.option(
+    "--flask",
+    is_flag=True,
+    hidden=True,
+    help="Use the legacy Flask server instead of Next.js",
+)
 def serve(shared, db, host, port, public, unsafe_network, dev, flask):
     """Start the Logpile web viewer.
 
@@ -715,6 +830,7 @@ def serve(shared, db, host, port, public, unsafe_network, dev, flask):
     if flask:
         # Legacy Flask path
         from .web.app import create_app
+
         app = create_app(db_path=db_path, shared_dir=Path(shared), public_mode=public)
         mode = "PUBLIC read-only" if public else "private"
         click.echo(f"Logpile Flask ({mode}) at http://{host}:{port}")
@@ -879,6 +995,7 @@ def redact(session_id, turn_number, db, shared):
     Per-turn redaction will write a sidecar .redact file in a future version.
     """
     from .db import get_db, set_session_visibility
+
     with get_db(_prepare_db(db)) as conn:
         try:
             count = set_session_visibility(
@@ -891,7 +1008,9 @@ def redact(session_id, turn_number, db, shared):
             click.echo(str(exc), err=True)
             raise SystemExit(1)
         if count:
-            click.echo(f"Session {session_id} marked private (turn {turn_number} redacted).")
+            click.echo(
+                f"Session {session_id} marked private (turn {turn_number} redacted)."
+            )
         else:
             click.echo(f"No session found matching '{session_id}'")
 
@@ -930,8 +1049,12 @@ def users_command(db):
     type=click.Choice(["private", "unlisted", "public"]),
     default=None,
 )
-@click.option("--github", "github_username", default=None,
-              help="Link a GitHub username for `logpile github sync`")
+@click.option(
+    "--github",
+    "github_username",
+    default=None,
+    help="Link a GitHub username for `logpile github sync`",
+)
 def user_command(
     identifier,
     db,
@@ -972,10 +1095,15 @@ def github_group():
 
 @github_group.command("sync")
 @click.option("--db", default=str(DEFAULT_DB), show_default=True)
-@click.option("--user", "identifier", default=None,
-              help="Sync one user (by username). Otherwise syncs everyone with a linked GitHub handle.")
-@click.option("--since", default=None,
-              help="ISO date (YYYY-MM-DD). Default: 540 days ago.")
+@click.option(
+    "--user",
+    "identifier",
+    default=None,
+    help="Sync one user (by username). Otherwise syncs everyone with a linked GitHub handle.",
+)
+@click.option(
+    "--since", default=None, help="ISO date (YYYY-MM-DD). Default: 540 days ago."
+)
 def github_sync(db, identifier, since):
     """Pull GitHub contribution data into `user_github_daily`.
 
@@ -1024,7 +1152,9 @@ def github_sync(db, identifier, since):
         for username, gh_user in targets:
             click.echo(f"Syncing GitHub for {username} ({gh_user})…")
             try:
-                stats = sync_user_github(conn, username=username, github_user=gh_user, since=since_dt)
+                stats = sync_user_github(
+                    conn, username=username, github_user=gh_user, since=since_dt
+                )
             except GitHubSyncError as exc:
                 click.echo(f"  ✗ {exc}", err=True)
                 continue
@@ -1096,7 +1226,9 @@ def rules_list(db, identifier):
     help="Only apply this rule to one agent source",
 )
 @click.option("--disabled", is_flag=True, help="Create the rule in a disabled state")
-@click.option("--apply", is_flag=True, help="Recompute matching sessions after adding the rule")
+@click.option(
+    "--apply", is_flag=True, help="Recompute matching sessions after adding the rule"
+)
 @click.option("--db", default=str(DEFAULT_DB), show_default=True)
 @click.option("--shared", default=str(DEFAULT_SHARED), show_default=True)
 def rules_add(
@@ -1170,7 +1302,12 @@ def rules_delete(rule_id, db, shared):
 @click.option("--db", default=str(DEFAULT_DB), show_default=True)
 @click.option("--shared", default=str(DEFAULT_SHARED), show_default=True)
 @click.option("--user", "identifier", default=None, help="Restrict to one user")
-@click.option("--session", "session_id_prefix", default=None, help="Restrict to one session prefix")
+@click.option(
+    "--session",
+    "session_id_prefix",
+    default=None,
+    help="Restrict to one session prefix",
+)
 @click.option("--include-manual", is_flag=True, help="Also recompute manual overrides")
 def rules_apply(db, shared, identifier, session_id_prefix, include_manual):
     """Recompute session visibility from defaults and rules."""
@@ -1223,7 +1360,9 @@ def publish_group():
 @click.option(
     "--visibility",
     default="pending",
-    type=click.Choice(["pending", "needs_changes", "all", "private", "unlisted", "public"]),
+    type=click.Choice(
+        ["pending", "needs_changes", "all", "private", "unlisted", "public"]
+    ),
     show_default=True,
 )
 @click.option(
@@ -1249,8 +1388,12 @@ def publish_group():
 @click.option("--limit", default=25, show_default=True, type=int)
 @click.option("--reviews/--no-reviews", default=True, show_default=True)
 @click.option("--db", default=str(DEFAULT_DB), show_default=True)
-@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
-def publish_queue(user, visibility, status_filter, origin_filter, limit, reviews, db, json_output):
+@click.option(
+    "--json", "json_output", is_flag=True, help="Emit structured JSON output."
+)
+def publish_queue(
+    user, visibility, status_filter, origin_filter, limit, reviews, db, json_output
+):
     """List candidate sessions for publication."""
     from .db import get_db
     from .publish import (
@@ -1318,7 +1461,9 @@ def backup_schema():
 @click.option("--shared", default=str(DEFAULT_SHARED), show_default=True)
 @click.option("--include-codex-db/--no-codex-db", default=True, show_default=True)
 @click.option("--limit", default=None, type=int, help="Only inspect the first N files.")
-@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
+@click.option(
+    "--json", "json_output", is_flag=True, help="Emit structured JSON output."
+)
 def backup_plan(home, db, shared, include_codex_db, limit, json_output):
     """Show the raw local log files that would be backed up."""
     from .backup import format_bytes, plan_backup, plan_to_dict
@@ -1336,30 +1481,62 @@ def backup_plan(home, db, shared, include_codex_db, limit, json_output):
 
     click.echo(f"{len(plan.candidates)} file(s), {format_bytes(plan.total_bytes)}")
     for source, count in sorted(plan.source_counts.items()):
-        click.echo(f"  {source}: {count} file(s), {format_bytes(plan.source_bytes[source])}")
+        click.echo(
+            f"  {source}: {count} file(s), {format_bytes(plan.source_bytes[source])}"
+        )
 
 
 @backup_group.command("push")
 @click.option("--home", default=str(Path.home()), show_default=True)
 @click.option("--db", default=str(DEFAULT_DB), show_default=True)
 @click.option("--shared", default=str(DEFAULT_SHARED), show_default=True)
-@click.option("--db-url", envvar="LOGPILE_SUPABASE_DB_URL", help="Supabase/Postgres connection URL.")
-@click.option("--bucket", envvar="LOGPILE_R2_BUCKET", help="R2/S3 bucket for immutable raw logs.")
-@click.option("--endpoint-url", envvar="LOGPILE_R2_ENDPOINT_URL", help="S3-compatible endpoint URL.")
-@click.option("--account-id", envvar="LOGPILE_R2_ACCOUNT_ID", help="Cloudflare account id for R2 endpoint construction.")
+@click.option(
+    "--db-url",
+    envvar="LOGPILE_SUPABASE_DB_URL",
+    help="Supabase/Postgres connection URL.",
+)
+@click.option(
+    "--bucket", envvar="LOGPILE_R2_BUCKET", help="R2/S3 bucket for immutable raw logs."
+)
+@click.option(
+    "--endpoint-url",
+    envvar="LOGPILE_R2_ENDPOINT_URL",
+    help="S3-compatible endpoint URL.",
+)
+@click.option(
+    "--account-id",
+    envvar="LOGPILE_R2_ACCOUNT_ID",
+    help="Cloudflare account id for R2 endpoint construction.",
+)
 @click.option("--access-key-id", envvar="LOGPILE_R2_ACCESS_KEY_ID", hidden=True)
 @click.option("--secret-access-key", envvar="LOGPILE_R2_SECRET_ACCESS_KEY", hidden=True)
 @click.option("--provider", default="r2", show_default=True)
 @click.option("--include-codex-db/--no-codex-db", default=True, show_default=True)
-@click.option("--index/--no-index", "index_text", default=True, show_default=True,
-              help="Index exact JSONL chunks in Postgres after upload.")
-@click.option("--missing", "missing_only", is_flag=True,
-              help="Skip local files whose sha256 is already present in Postgres.")
-@click.option("--defer-search-index", is_flag=True,
-              help="Skip creating the FTS index until a later backup search-index run.")
+@click.option(
+    "--index/--no-index",
+    "index_text",
+    default=True,
+    show_default=True,
+    help="Index exact JSONL chunks in Postgres after upload.",
+)
+@click.option(
+    "--missing",
+    "missing_only",
+    is_flag=True,
+    help="Skip local files whose sha256 is already present in Postgres.",
+)
+@click.option(
+    "--defer-search-index",
+    is_flag=True,
+    help="Skip creating the FTS index until a later backup search-index run.",
+)
 @click.option("--limit", default=None, type=int, help="Only process the first N files.")
-@click.option("--dry-run", is_flag=True, help="Plan only; do not connect to cloud services.")
-@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
+@click.option(
+    "--dry-run", is_flag=True, help="Plan only; do not connect to cloud services."
+)
+@click.option(
+    "--json", "json_output", is_flag=True, help="Emit structured JSON output."
+)
 def backup_push(
     home,
     db,
@@ -1453,24 +1630,63 @@ def backup_push(
 
 
 @backup_group.command("index")
-@click.option("--db-url", envvar="LOGPILE_SUPABASE_DB_URL", help="Supabase/Postgres connection URL.")
-@click.option("--bucket", envvar="LOGPILE_R2_BUCKET", help="R2/S3 bucket for immutable raw logs.")
-@click.option("--endpoint-url", envvar="LOGPILE_R2_ENDPOINT_URL", help="S3-compatible endpoint URL.")
-@click.option("--account-id", envvar="LOGPILE_R2_ACCOUNT_ID", help="Cloudflare account id for R2 endpoint construction.")
+@click.option(
+    "--db-url",
+    envvar="LOGPILE_SUPABASE_DB_URL",
+    help="Supabase/Postgres connection URL.",
+)
+@click.option(
+    "--bucket", envvar="LOGPILE_R2_BUCKET", help="R2/S3 bucket for immutable raw logs."
+)
+@click.option(
+    "--endpoint-url",
+    envvar="LOGPILE_R2_ENDPOINT_URL",
+    help="S3-compatible endpoint URL.",
+)
+@click.option(
+    "--account-id",
+    envvar="LOGPILE_R2_ACCOUNT_ID",
+    help="Cloudflare account id for R2 endpoint construction.",
+)
 @click.option("--access-key-id", envvar="LOGPILE_R2_ACCESS_KEY_ID", hidden=True)
 @click.option("--secret-access-key", envvar="LOGPILE_R2_SECRET_ACCESS_KEY", hidden=True)
 @click.option("--provider", default="r2", show_default=True)
-@click.option("--source", default=None, help="Only index one raw file source, e.g. codex or claudecode.")
-@click.option("--from-r2/--from-manifest", "from_r2", default=False, show_default=True,
-              help="List content-addressed R2/S3 objects directly instead of using the Postgres manifest.")
-@click.option("--prefix", default="raw/sha256/", show_default=True,
-              help="Object key prefix for --from-r2.")
-@click.option("--defer-search-index", is_flag=True,
-              help="For --from-r2 bulk imports, skip creating the FTS index until a later backup search-index run.")
-@click.option("--missing/--all", "missing_only", default=True, show_default=True,
-              help="Index only files without chunks, or rebuild every matching file.")
-@click.option("--limit", default=None, type=int, help="Only index the first N matching files.")
-@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
+@click.option(
+    "--source",
+    default=None,
+    help="Only index one raw file source, e.g. codex or claudecode.",
+)
+@click.option(
+    "--from-r2/--from-manifest",
+    "from_r2",
+    default=False,
+    show_default=True,
+    help="List content-addressed R2/S3 objects directly instead of using the Postgres manifest.",
+)
+@click.option(
+    "--prefix",
+    default="raw/sha256/",
+    show_default=True,
+    help="Object key prefix for --from-r2.",
+)
+@click.option(
+    "--defer-search-index",
+    is_flag=True,
+    help="For --from-r2 bulk imports, skip creating the FTS index until a later backup search-index run.",
+)
+@click.option(
+    "--missing/--all",
+    "missing_only",
+    default=True,
+    show_default=True,
+    help="Index only files without chunks, or rebuild every matching file.",
+)
+@click.option(
+    "--limit", default=None, type=int, help="Only index the first N matching files."
+)
+@click.option(
+    "--json", "json_output", is_flag=True, help="Emit structured JSON output."
+)
 def backup_index(
     db_url,
     bucket,
@@ -1542,7 +1758,11 @@ def backup_index(
 
 
 @backup_group.command("search-index")
-@click.option("--db-url", envvar="LOGPILE_SUPABASE_DB_URL", help="Supabase/Postgres connection URL.")
+@click.option(
+    "--db-url",
+    envvar="LOGPILE_SUPABASE_DB_URL",
+    help="Supabase/Postgres connection URL.",
+)
 def backup_search_index(db_url):
     """Create the Supabase/Postgres full-text search index after a bulk import."""
     if not db_url:
@@ -1562,9 +1782,15 @@ def backup_search_index(db_url):
 
 @backup_group.command("search")
 @click.argument("query")
-@click.option("--db-url", envvar="LOGPILE_SUPABASE_DB_URL", help="Supabase/Postgres connection URL.")
+@click.option(
+    "--db-url",
+    envvar="LOGPILE_SUPABASE_DB_URL",
+    help="Supabase/Postgres connection URL.",
+)
 @click.option("--limit", default=20, show_default=True, type=int)
-@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
+@click.option(
+    "--json", "json_output", is_flag=True, help="Emit structured JSON output."
+)
 def backup_search(query, db_url, limit, json_output):
     """Search exact raw chunks in Supabase/Postgres."""
     if not db_url:
@@ -1596,7 +1822,9 @@ def backup_search(query, db_url, limit, json_output):
 @publish_group.command("review")
 @click.argument("session_id")
 @click.option("--db", default=str(DEFAULT_DB), show_default=True)
-@click.option("--json", "json_output", is_flag=True, help="Emit structured JSON output.")
+@click.option(
+    "--json", "json_output", is_flag=True, help="Emit structured JSON output."
+)
 def publish_review(session_id, db, json_output):
     """Inspect a session for risky content before publishing."""
     from .db import get_db
@@ -1699,9 +1927,7 @@ def _publish_apply_impl(session_id, db, shared, visibility, force):
             if not result.count:
                 click.echo(f"No session found matching '{session_id}'")
                 raise SystemExit(1)
-            click.echo(
-                f"Updated {result.count} session(s) to visibility={visibility}"
-            )
+            click.echo(f"Updated {result.count} session(s) to visibility={visibility}")
         except (ValueError, OSError, StorageSafetyError) as exc:
             click.echo(str(exc), err=True)
             raise SystemExit(1)

@@ -6,6 +6,7 @@ and timestamps. These tests cover the claims ledger that dedupes that
 inherited history: ownership (earliest-ending transcript wins), order
 independence, re-parse reconciliation, and the native_* columns fed by it.
 """
+
 import json
 import sqlite3
 import tempfile
@@ -81,19 +82,33 @@ def _assistant(
 PARENT_RECORDS = [
     _user("2026-04-10T10:00:00Z"),
     _assistant(
-        "2026-04-10T10:00:05Z", "msg-1", rid="req-1", uid="uuid-1",
-        fresh=100, cached=50, cache_creation=10, out=20,
+        "2026-04-10T10:00:05Z",
+        "msg-1",
+        rid="req-1",
+        uid="uuid-1",
+        fresh=100,
+        cached=50,
+        cache_creation=10,
+        out=20,
     ),
     _assistant(
-        "2026-04-10T10:00:10Z", "msg-2", rid="req-2", uid="uuid-2",
-        fresh=200, out=30,
+        "2026-04-10T10:00:10Z",
+        "msg-2",
+        rid="req-2",
+        uid="uuid-2",
+        fresh=200,
+        out=30,
     ),
 ]
 CHILD_RECORDS = PARENT_RECORDS + [
     _user("2026-04-11T11:00:00Z", text="continue please"),
     _assistant(
-        "2026-04-11T11:00:05Z", "msg-3", rid="req-3", uid="uuid-3",
-        fresh=300, out=40,
+        "2026-04-11T11:00:05Z",
+        "msg-3",
+        rid="req-3",
+        uid="uuid-3",
+        fresh=300,
+        out=40,
     ),
 ]
 
@@ -173,8 +188,12 @@ class ParserMessageUsageTests(unittest.TestCase):
         # keeps the highest-output copy, and the claim key follows it.
         records = [
             _user("2026-04-10T10:00:00Z"),
-            _assistant("2026-04-10T10:00:05Z", "msg-r", rid="req-a", uid="u-a", fresh=10, out=5),
-            _assistant("2026-04-10T10:00:07Z", "msg-r", rid="req-b", uid="u-b", fresh=10, out=9),
+            _assistant(
+                "2026-04-10T10:00:05Z", "msg-r", rid="req-a", uid="u-a", fresh=10, out=5
+            ),
+            _assistant(
+                "2026-04-10T10:00:07Z", "msg-r", rid="req-b", uid="u-b", fresh=10, out=9
+            ),
         ]
         info = self._parse(records)
         self.assertEqual([m.claim_key for m in info.message_usage], ["msg-r:req-b"])
@@ -217,9 +236,7 @@ class ApplyMessageClaimsTests(unittest.TestCase):
     def _occurrences(self, conn) -> set[tuple[str, str]]:
         return {
             (row["claim_key"], row["session_id"])
-            for row in conn.execute(
-                "SELECT claim_key, session_id FROM message_claims"
-            )
+            for row in conn.execute("SELECT claim_key, session_id FROM message_claims")
         }
 
     EXPECTED_OWNERS: ClassVar[dict[str, str]] = {
@@ -269,34 +286,54 @@ class ApplyMessageClaimsTests(unittest.TestCase):
             self._register(conn, self.child)
             self._register(conn, self.parent)
             apply_message_claims(conn, "aaa-child", self.child.message_usage)
-            affected = apply_message_claims(conn, "zzz-parent", self.parent.message_usage)
+            affected = apply_message_claims(
+                conn, "zzz-parent", self.parent.message_usage
+            )
             self.assertEqual(affected, {"zzz-parent", "aaa-child"})
 
-    def test_reparse_is_stable_and_marks_current_claimants_for_rank_refresh(self) -> None:
+    def test_reparse_is_stable_and_marks_current_claimants_for_rank_refresh(
+        self,
+    ) -> None:
         with get_db(self.db_path) as conn:
             self._register(conn, self.parent)
             apply_message_claims(conn, "zzz-parent", self.parent.message_usage)
-            affected = apply_message_claims(conn, "zzz-parent", self.parent.message_usage)
+            affected = apply_message_claims(
+                conn, "zzz-parent", self.parent.message_usage
+            )
             self.assertEqual(affected, {"zzz-parent"})
 
     def test_reparse_drops_stale_keys_after_retry_flip(self) -> None:
         records = [
             _user("2026-04-10T10:00:00Z"),
-            _assistant("2026-04-10T10:00:05Z", "msg-r", rid="req-a", uid="u-a", fresh=10, out=5),
+            _assistant(
+                "2026-04-10T10:00:05Z", "msg-r", rid="req-a", uid="u-a", fresh=10, out=5
+            ),
         ]
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "retry.jsonl"
             write_jsonl(path, records)
             before = parse_claudecode_session(path)
-            write_jsonl(path, records + [
-                _assistant("2026-04-10T10:00:07Z", "msg-r", rid="req-b", uid="u-b", fresh=10, out=9),
-            ])
+            write_jsonl(
+                path,
+                records
+                + [
+                    _assistant(
+                        "2026-04-10T10:00:07Z",
+                        "msg-r",
+                        rid="req-b",
+                        uid="u-b",
+                        fresh=10,
+                        out=9,
+                    ),
+                ],
+            )
             after = parse_claudecode_session(path)
         assert before is not None and after is not None
 
         with get_db(self.db_path) as conn:
             _insert_session_row(
-                conn, "retry",
+                conn,
+                "retry",
                 first_timestamp=before.first_timestamp,
                 last_timestamp=before.last_timestamp,
             )
@@ -312,9 +349,7 @@ class ApplyMessageClaimsTests(unittest.TestCase):
             conn.execute("DELETE FROM sessions WHERE session_id = 'zzz-parent'")
             self._register(conn, self.child)
             apply_message_claims(conn, "aaa-child", self.child.message_usage)
-            self.assertEqual(
-                set(self._owners(conn).values()), {"aaa-child"}
-            )
+            self.assertEqual(set(self._owners(conn).values()), {"aaa-child"})
 
     def test_identical_transcripts_tie_break_on_session_id(self) -> None:
         # A resume that added nothing produces a byte-identical history; the
@@ -322,7 +357,8 @@ class ApplyMessageClaimsTests(unittest.TestCase):
         with get_db(self.db_path) as conn:
             for sid in ("twin-b", "twin-a"):
                 _insert_session_row(
-                    conn, sid,
+                    conn,
+                    sid,
                     first_timestamp=self.parent.first_timestamp,
                     last_timestamp=self.parent.last_timestamp,
                 )
@@ -341,7 +377,9 @@ class ApplyMessageClaimsTests(unittest.TestCase):
                 for message in self.child.message_usage
             ]
             apply_message_claims(conn, self.child.session_id, child_usage)
-            apply_message_claims(conn, self.parent.session_id, self.parent.message_usage)
+            apply_message_claims(
+                conn, self.parent.session_id, self.parent.message_usage
+            )
             self.assertEqual(self._owners(conn)["msg-1:req-1"], "zzz-parent")
 
             remaining_parent = [
@@ -371,7 +409,9 @@ class ApplyMessageClaimsTests(unittest.TestCase):
         with get_db(self.db_path) as conn:
             self._register(conn, self.parent)
             self._register(conn, self.child)
-            apply_message_claims(conn, self.parent.session_id, self.parent.message_usage)
+            apply_message_claims(
+                conn, self.parent.session_id, self.parent.message_usage
+            )
             apply_message_claims(conn, self.child.session_id, self.child.message_usage)
             self.assertEqual(self._owners(conn)["msg-1:req-1"], "zzz-parent")
 
@@ -389,14 +429,18 @@ class ApplyMessageClaimsTests(unittest.TestCase):
                 "UPDATE sessions SET last_timestamp = '2026-04-10T10:00:10Z' "
                 "WHERE session_id = 'zzz-parent'"
             )
-            apply_message_claims(conn, self.parent.session_id, self.parent.message_usage)
+            apply_message_claims(
+                conn, self.parent.session_id, self.parent.message_usage
+            )
             self.assertEqual(self._owners(conn)["msg-1:req-1"], "zzz-parent")
 
     def test_stale_losing_occurrence_does_not_delete_winner(self) -> None:
         with get_db(self.db_path) as conn:
             self._register(conn, self.parent)
             self._register(conn, self.child)
-            apply_message_claims(conn, self.parent.session_id, self.parent.message_usage)
+            apply_message_claims(
+                conn, self.parent.session_id, self.parent.message_usage
+            )
             apply_message_claims(conn, self.child.session_id, self.child.message_usage)
 
             child_unique = [
@@ -422,27 +466,31 @@ class NativeRefreshTests(unittest.TestCase):
     def test_codex_native_mirrors_transcript_totals(self) -> None:
         with get_db(self.db_path) as conn:
             _insert_session_row(
-                conn, "codex-1", source="codex",
+                conn,
+                "codex-1",
+                source="codex",
                 first_timestamp="2026-04-10T10:00:00Z",
                 last_timestamp="2026-04-10T11:00:00Z",
-                total_input=500, total_output=60,
+                total_input=500,
+                total_output=60,
             )
             refresh_native_usage(conn, {"codex-1"})
             row = conn.execute(
                 "SELECT native_total_input_tokens, native_total_output_tokens,"
                 " native_fresh_input_tokens FROM sessions WHERE session_id = 'codex-1'"
             ).fetchone()
-            self.assertEqual(
-                (row[0], row[1], row[2]), (500, 60, 500)
-            )
+            self.assertEqual((row[0], row[1], row[2]), (500, 60, 500))
 
     def test_pre_claims_claudecode_rows_mirror_transcript_totals(self) -> None:
         with get_db(self.db_path) as conn:
             _insert_session_row(
-                conn, "old-cc", token_version=CLAIMS_TOKEN_VERSION - 1,
+                conn,
+                "old-cc",
+                token_version=CLAIMS_TOKEN_VERSION - 1,
                 first_timestamp="2026-03-01T10:00:00Z",
                 last_timestamp="2026-03-01T11:00:00Z",
-                total_input=900, total_output=90,
+                total_input=900,
+                total_output=90,
             )
             refresh_native_usage(conn, {"old-cc"})
             row = conn.execute(
@@ -574,9 +622,7 @@ class SyncClaimsIntegrationTests(unittest.TestCase):
                 after = conn.execute(
                     "SELECT session_id, native_total_input_tokens FROM sessions ORDER BY session_id"
                 ).fetchall()
-            self.assertEqual(
-                [tuple(r) for r in before], [tuple(r) for r in after]
-            )
+            self.assertEqual([tuple(r) for r in before], [tuple(r) for r in after])
 
     def test_live_continuation_extends_native_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -584,12 +630,20 @@ class SyncClaimsIntegrationTests(unittest.TestCase):
             self._sync(home, shared, db_path)
 
             project_dir = home / ".claude" / "projects" / "-tmp-demo"
-            write_jsonl(project_dir / "aaa-child.jsonl", CHILD_RECORDS + [
-                _assistant(
-                    "2026-04-11T12:00:00Z", "msg-4", rid="req-4", uid="uuid-4",
-                    fresh=1000, out=100,
-                ),
-            ])
+            write_jsonl(
+                project_dir / "aaa-child.jsonl",
+                CHILD_RECORDS
+                + [
+                    _assistant(
+                        "2026-04-11T12:00:00Z",
+                        "msg-4",
+                        rid="req-4",
+                        uid="uuid-4",
+                        fresh=1000,
+                        out=100,
+                    ),
+                ],
+            )
             self._sync(home, shared, db_path)
 
             with sqlite3.connect(db_path) as conn:
@@ -676,10 +730,13 @@ class MigrationTests(unittest.TestCase):
             init_db(db_path)
             with get_db(db_path) as conn:
                 _insert_session_row(
-                    conn, "legacy", token_version=4,
+                    conn,
+                    "legacy",
+                    token_version=4,
                     first_timestamp="2026-03-01T10:00:00Z",
                     last_timestamp="2026-03-01T11:00:00Z",
-                    total_input=1234, total_output=56,
+                    total_input=1234,
+                    total_output=56,
                 )
                 conn.execute(
                     """

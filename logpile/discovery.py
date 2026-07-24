@@ -49,9 +49,7 @@ def transcript_roots(home: Path) -> tuple[TranscriptRoot, ...]:
     if openclaw_agents.exists():
         roots.extend(
             TranscriptRoot(path, "codex")
-            for path in sorted(
-                openclaw_agents.glob("*/agent/codex-home/sessions")
-            )
+            for path in sorted(openclaw_agents.glob("*/agent/codex-home/sessions"))
         )
     return tuple(roots)
 
@@ -130,9 +128,7 @@ def _db_shared_transcripts(
         conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         try:
-            columns = {
-                row[1] for row in conn.execute("PRAGMA table_info(sessions)")
-            }
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
             if not {"source", "source_path", "shared_path"}.issubset(columns):
                 return
             reviewed_column = (
