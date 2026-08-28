@@ -659,6 +659,106 @@ def show_command(session_id, backend, db, db_url, limit, json_output):
         raise click.ClickException(str(exc))
 
 
+@cli.command(name="task-list")
+@click.option(
+    "--db",
+    default=str(DEFAULT_DB),
+    show_default=True,
+    type=click.Path(path_type=Path, dir_okay=False),
+    help="Local SQLite database path.",
+)
+@click.option(
+    "--limit",
+    default=20,
+    show_default=True,
+    type=click.IntRange(1, 1000),
+    help="Maximum number of recent tasks.",
+)
+@click.option(
+    "--json", "json_output", is_flag=True, help="Emit structured JSON output."
+)
+def task_list_command(db: Path, limit: int, json_output: bool):
+    """List recent local Subfleet tasks and their opaque IDs."""
+    if not db.is_file():
+        raise click.ClickException(f"Local database not found: {db}")
+
+    from .db import get_db, init_db
+    from .subfleet import list_tasks
+
+    init_db(db)
+    with get_db(db) as conn:
+        tasks = list_tasks(conn, limit=limit)
+
+    payload = {"backend": "local", "tasks": tasks}
+    if json_output:
+        click.echo(json.dumps(payload, default=str))
+        return
+    if not tasks:
+        click.echo("No Subfleet tasks found.")
+        return
+    for task in tasks:
+        providers = ",".join(task["providers"]) or "unknown"
+        line = (
+            f"{task['last_occurred_at']}  {task['task_id']}  "
+            f"providers={providers}  runs={task['run_count']}  "
+            f"attempts={task['attempt_count']}"
+        )
+        if task["last_outcome_status"]:
+            line += (
+                f"  outcome={task['last_outcome_status']}"
+                f"({task['last_outcome_exit_code']})"
+            )
+        click.echo(line)
+
+
+@cli.command(name="task-timeline")
+@click.argument("task_id")
+@click.option(
+    "--db",
+    default=str(DEFAULT_DB),
+    show_default=True,
+    type=click.Path(path_type=Path, dir_okay=False),
+    help="Local SQLite database path.",
+)
+@click.option(
+    "--json", "json_output", is_flag=True, help="Emit structured JSON output."
+)
+def task_timeline_command(task_id: str, db: Path, json_output: bool):
+    """Show one local Subfleet task across runs and native sessions."""
+    if not db.is_file():
+        raise click.ClickException(f"Local database not found: {db}")
+
+    from .db import get_db, init_db
+    from .subfleet import get_task_timeline
+
+    init_db(db)
+    try:
+        with get_db(db) as conn:
+            events = get_task_timeline(conn, task_id)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if not events:
+        raise click.ClickException(f"No Subfleet events found for task '{task_id}'.")
+
+    payload = {"backend": "local", "task_id": task_id, "events": events}
+    if json_output:
+        click.echo(json.dumps(payload, default=str))
+        return
+
+    for event in events:
+        line = (
+            f"{event['occurred_at']}  {event['event_type']}  "
+            f"{event['provider']}  run={event['run_id']}"
+        )
+        if event["attempt_id"]:
+            line += f"  attempt={event['attempt_id']}"
+        if event["session_id"]:
+            line += f"  session={event['session_id']}"
+        if event["outcome_status"]:
+            line += f"  outcome={event['outcome_status']}({event['outcome_exit_code']})"
+        click.echo(line)
+
+
 @cli.command()
 @click.option(
     "--shared",
@@ -703,6 +803,15 @@ def show_command(session_id, backend, db, db_url, limit, json_output):
     show_default=True,
     help="Index exact JSONL chunks in cloud mode.",
 )
+@click.option(
+    "--subfleet-events-dir",
+    envvar="LOGPILE_SUBFLEET_EVENTS_DIR",
+    type=click.Path(path_type=Path, file_okay=False),
+    help=(
+        "Override the dedicated Subfleet integration-events/v1 spool. "
+        "No private run directory is read."
+    ),
+)
 @click.option("--username", default=None, help="Override system username")
 @click.option("--machine", default=None, help="Override machine/hostname")
 @click.option("-v", "--verbose", is_flag=True, help="Print each file processed")
@@ -717,12 +826,14 @@ def sync(
     access_key_id,
     secret_access_key,
     index_text,
+    subfleet_events_dir,
     username,
     machine,
     verbose,
 ):
     """Index local sessions, upload raw logs to cloud storage, or both."""
     if backend in {"local", "both"}:
+        from .subfleet import SubfleetSpoolError
         from .sync import SyncLockError, SyncStatus, sync_sessions
 
         username = _resolve_sync_username(db, username)
@@ -736,8 +847,9 @@ def sync(
                 machine=machine,
                 home=Path.home(),
                 verbose=verbose,
+                subfleet_events_dir=subfleet_events_dir,
             )
-        except SyncLockError as exc:
+        except (SubfleetSpoolError, SyncLockError) as exc:
             raise click.ClickException(str(exc)) from exc
         if local_result.status == SyncStatus.LOCK_CONTENDED:
             raise click.exceptions.Exit(75)

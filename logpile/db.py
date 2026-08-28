@@ -293,6 +293,61 @@ CREATE TABLE IF NOT EXISTS logpile_meta (
     value TEXT
 );
 
+-- Credential-free Subfleet lifecycle metadata. The importer expands the v1
+-- allowlist into columns instead of retaining raw JSON, so private producer
+-- fields cannot become durable through a permissive payload column.
+CREATE TABLE IF NOT EXISTS subfleet_events (
+    event_id          TEXT PRIMARY KEY,
+    schema_version    INTEGER NOT NULL CHECK (schema_version = 1),
+    event_type        TEXT NOT NULL CHECK (
+        event_type IN ('run.started', 'run.bound', 'run.finished')
+    ),
+    task_id           TEXT NOT NULL,
+    run_id            TEXT NOT NULL,
+    attempt_id        TEXT,
+    provider          TEXT NOT NULL CHECK (
+        provider IN ('claude', 'codex', 'unknown')
+    ),
+    lane_ref          TEXT,
+    workspace_ref     TEXT,
+    occurred_at       TEXT NOT NULL,
+    started_at        TEXT,
+    finished_at       TEXT,
+    binding_kind      TEXT CHECK (
+        binding_kind IS NULL OR binding_kind IN ('session', 'thread')
+    ),
+    binding_native_id TEXT,
+    outcome_status    TEXT CHECK (
+        outcome_status IS NULL OR outcome_status IN ('succeeded', 'failed')
+    ),
+    outcome_exit_code INTEGER,
+    outcome_duration_s REAL,
+    ingested_at       TEXT NOT NULL,
+    CHECK (
+        event_type != 'run.bound'
+        OR (
+            attempt_id IS NOT NULL
+            AND binding_kind IS NOT NULL
+            AND binding_native_id IS NOT NULL
+        )
+    ),
+    CHECK (event_type != 'run.started' OR attempt_id IS NULL)
+);
+
+-- Attempt identity is provider plus native UUID. session_id remains nullable
+-- until the authoritative native transcript reaches Logpile; every subsequent
+-- event sync retries reconciliation without needing the source spool line.
+CREATE TABLE IF NOT EXISTS subfleet_attempts (
+    attempt_id        TEXT PRIMARY KEY,
+    provider          TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    binding_kind      TEXT NOT NULL CHECK (binding_kind IN ('session', 'thread')),
+    native_id         TEXT NOT NULL,
+    first_bound_at    TEXT NOT NULL,
+    session_id        TEXT,
+    reconciled_at     TEXT,
+    UNIQUE (provider, native_id)
+);
+
 CREATE TABLE IF NOT EXISTS tool_calls (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id  TEXT NOT NULL,
@@ -342,6 +397,17 @@ CREATE INDEX IF NOT EXISTS idx_sessions_thread              ON sessions(source, 
 CREATE INDEX IF NOT EXISTS idx_sessions_parent_thread       ON sessions(source, username, parent_thread_id);
 CREATE INDEX IF NOT EXISTS idx_session_daily_day            ON session_daily_usage(day);
 CREATE INDEX IF NOT EXISTS idx_message_claims_session_day   ON message_claims(session_id, day);
+CREATE INDEX IF NOT EXISTS idx_subfleet_events_task_time     ON subfleet_events(task_id, occurred_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_subfleet_events_run_time      ON subfleet_events(run_id, occurred_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_subfleet_events_attempt       ON subfleet_events(attempt_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subfleet_events_one_lifecycle
+    ON subfleet_events(run_id, event_type)
+    WHERE event_type IN ('run.started', 'run.finished');
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subfleet_events_one_binding
+    ON subfleet_events(run_id, attempt_id)
+    WHERE event_type = 'run.bound';
+CREATE INDEX IF NOT EXISTS idx_subfleet_attempts_native      ON subfleet_attempts(provider, native_id);
+CREATE INDEX IF NOT EXISTS idx_subfleet_attempts_session     ON subfleet_attempts(session_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session           ON tool_calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_name              ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_session_paths_session        ON session_paths(session_id);
@@ -382,6 +448,70 @@ SELECT
     END AS direct_private
 FROM sessions s
 LEFT JOIN users u ON u.username = s.username;
+
+-- Local/private task history. run.finished rows inherit their native session
+-- through attempt_id; run.started intentionally remains unbound.
+DROP VIEW IF EXISTS subfleet_task_timeline;
+CREATE VIEW subfleet_task_timeline AS
+SELECT
+    e.event_id,
+    e.schema_version,
+    e.event_type,
+    e.task_id,
+    e.run_id,
+    e.attempt_id,
+    e.provider,
+    e.lane_ref,
+    e.workspace_ref,
+    e.occurred_at,
+    e.started_at,
+    e.finished_at,
+    COALESCE(e.binding_kind, a.binding_kind) AS binding_kind,
+    COALESCE(e.binding_native_id, a.native_id) AS native_id,
+    e.outcome_status,
+    e.outcome_exit_code,
+    e.outcome_duration_s,
+    a.session_id,
+    s.source AS session_source,
+    s.project AS session_project,
+    s.first_timestamp AS session_first_timestamp,
+    s.last_timestamp AS session_last_timestamp,
+    s.session_status
+FROM subfleet_events e
+LEFT JOIN subfleet_attempts a ON a.attempt_id = e.attempt_id
+LEFT JOIN sessions s ON s.session_id = a.session_id;
+
+DROP VIEW IF EXISTS subfleet_task_catalog;
+CREATE VIEW subfleet_task_catalog AS
+WITH ranked_finishes AS (
+    SELECT
+        task_id,
+        outcome_status,
+        outcome_exit_code,
+        finished_at,
+        ROW_NUMBER() OVER (
+            PARTITION BY task_id
+            ORDER BY occurred_at DESC, event_id DESC
+        ) AS outcome_rank
+    FROM subfleet_events
+    WHERE event_type = 'run.finished'
+)
+SELECT
+    e.task_id,
+    MIN(e.occurred_at) AS first_occurred_at,
+    MAX(e.occurred_at) AS last_occurred_at,
+    MAX(CASE WHEN e.provider = 'claude' THEN 1 ELSE 0 END) AS has_claude,
+    MAX(CASE WHEN e.provider = 'codex' THEN 1 ELSE 0 END) AS has_codex,
+    MAX(CASE WHEN e.provider = 'unknown' THEN 1 ELSE 0 END) AS has_unknown,
+    COUNT(DISTINCT e.run_id) AS run_count,
+    COUNT(DISTINCT e.attempt_id) AS attempt_count,
+    MAX(f.outcome_status) AS last_outcome_status,
+    MAX(f.outcome_exit_code) AS last_outcome_exit_code,
+    MAX(f.finished_at) AS last_outcome_finished_at
+FROM subfleet_events e
+LEFT JOIN ranked_finishes f
+    ON f.task_id = e.task_id AND f.outcome_rank = 1
+GROUP BY e.task_id;
 
 -- Per-day usage with graceful degradation: sessions that have not been
 -- re-synced since session_daily_usage was introduced (or whose records carry

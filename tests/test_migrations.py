@@ -139,5 +139,53 @@ class IdentityMigrationTests(unittest.TestCase):
             )
 
 
+class SubfleetEventMigrationTests(unittest.TestCase):
+    def test_existing_database_adds_event_tables_indexes_and_timeline_view(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "pre-events.db"
+            init_db(db_path)
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("DROP VIEW subfleet_task_timeline")
+                conn.execute("DROP TABLE subfleet_attempts")
+                conn.execute("DROP TABLE subfleet_events")
+
+            init_db(db_path)
+            init_db(db_path)
+
+            with sqlite3.connect(db_path) as conn:
+                objects = {
+                    (row[0], row[1])
+                    for row in conn.execute(
+                        """
+                        SELECT type, name
+                        FROM sqlite_master
+                        WHERE name LIKE '%subfleet%'
+                        """
+                    ).fetchall()
+                }
+                attempt_indexes = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA index_list(subfleet_attempts)"
+                    ).fetchall()
+                }
+
+            self.assertIn(("table", "subfleet_events"), objects)
+            self.assertIn(("table", "subfleet_attempts"), objects)
+            self.assertIn(("view", "subfleet_task_timeline"), objects)
+            self.assertIn(("view", "subfleet_task_catalog"), objects)
+            self.assertIn("idx_subfleet_attempts_native", attempt_indexes)
+            self.assertIn(("index", "idx_subfleet_events_one_lifecycle"), objects)
+            self.assertIn(("index", "idx_subfleet_events_one_binding"), objects)
+            self.assertTrue(
+                any(
+                    name.startswith("sqlite_autoindex_subfleet_attempts")
+                    for name in attempt_indexes
+                )
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

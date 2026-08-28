@@ -89,6 +89,8 @@ Options:
   --shared PATH     Shared directory    [default: ~/logpile/shared]
   --db PATH         SQLite database     [default: ~/logpile/logpile.db]
   --backend MODE    local | cloud | both [default: local]
+  --subfleet-events-dir DIRECTORY
+                    Exact Subfleet integration-events/v1 spool
   --username TEXT   Override system username
   --machine TEXT    Override hostname
   -v, --verbose     Print each file processed
@@ -112,6 +114,15 @@ Logpile intentionally keeps archival shared copies. Before copying, sync prints
 the planned copy count/volume and available free space; it refuses an
 insufficient-space plan. A source hash/mtime is committed only after the shared
 copy matches that hash, and failed verification is persisted for retry.
+
+Sync also consumes Subfleet's dedicated, credential-free
+`integration-events/v1` spool and joins opaque tasks/runs to indexed native
+Claude sessions and Codex threads. It does not read Subfleet prompts, outputs,
+auth, account paths, or private run-ledger directories. Query retained local
+metadata with `logpile task-list [--json]`, then inspect one task with
+`logpile task-timeline task_<opaque-id> [--json]`. See
+[Subfleet task events](docs/subfleet-integration.md) for the storage,
+idempotency, pruning, and security contract.
 
 #### Token accounting
 
