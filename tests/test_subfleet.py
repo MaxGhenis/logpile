@@ -239,6 +239,44 @@ class SubfleetEventTests(unittest.TestCase):
             self.assertEqual((task["run_count"], task["attempt_count"]), (2, 2))
             self.assertEqual(task["last_outcome_status"], "failed")
 
+    def test_open_traycer_bridge_run_joins_without_a_synthetic_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "logpile.db"
+            spool = _spool(root)
+            _write_events(
+                spool,
+                1,
+                [
+                    _started(event_number=1, run_number=1),
+                    _bound(
+                        event_number=2,
+                        run_number=1,
+                        attempt_number=1,
+                        native_id=CLAUDE_SESSION,
+                    ),
+                ],
+            )
+            init_db(db_path)
+            with get_db(db_path) as conn:
+                _insert_session(
+                    conn,
+                    session_id=CLAUDE_SESSION,
+                    source="claudecode",
+                )
+                result = ingest_subfleet_events(conn, spool)
+                timeline = get_task_timeline(conn, _ref("task", 1))
+                task = list_tasks(conn)[0]
+
+            self.assertEqual((result.inserted, result.reconciled), (2, 1))
+            self.assertEqual(
+                [event["event_type"] for event in timeline],
+                ["run.started", "run.bound"],
+            )
+            self.assertEqual(timeline[-1]["session_id"], CLAUDE_SESSION)
+            self.assertEqual((task["run_count"], task["attempt_count"]), (1, 1))
+            self.assertIsNone(task["last_outcome_status"])
+
     def test_out_of_order_events_reconcile_after_session_and_spool_are_gone(
         self,
     ) -> None:

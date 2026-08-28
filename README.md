@@ -118,9 +118,11 @@ copy matches that hash, and failed verification is persisted for retry.
 Sync also consumes Subfleet's dedicated, credential-free
 `integration-events/v1` spool and joins opaque tasks/runs to indexed native
 Claude sessions and Codex threads. It does not read Subfleet prompts, outputs,
-auth, account paths, or private run-ledger directories. Query retained local
-metadata with `logpile task-list [--json]`, then inspect one task with
-`logpile task-timeline task_<opaque-id> [--json]`. See
+auth, account paths, or private run-ledger directories. This includes Traycer
+children routed by Subfleet once the bridge emits a validated metadata-only
+native binding; open child runs do not require a synthetic finish event. Query
+retained local metadata with `logpile task-list [--json]`, then inspect one task
+with `logpile task-timeline task_<opaque-id> [--json]`. See
 [Subfleet task events](docs/subfleet-integration.md) for the storage,
 idempotency, pruning, and security contract.
 

@@ -67,8 +67,11 @@ The first integration slice is deliberately local-only. It does not add a web
 or public API route because task membership and publication policy are separate
 from the existing per-session visibility gate.
 
-This consumer accepts only Subfleet's `run.*` schema-v1 events. Traycer bridge
-receipts use separate `traycer.agent.*` event names, and Traycer's current
-public create/list contract does not expose the provider-native harness session
-ID needed for a safe transcript join. Bridge-created Traycer agents therefore
-do not appear in this task timeline yet.
+This consumer accepts only Subfleet's `run.*` schema-v1 events, never the
+separate `traycer.agent.*` receipt spool. The Subfleet Traycer bridge now emits
+that standard seam after querying Traycer's metadata-only `agent binding`
+command: the parent Traycer task becomes a pseudonymous `task_id`, each child
+dispatch becomes a `run_id`, and a validated Claude session or Codex thread UUID
+becomes `run.bound`. Logpile therefore joins bridge-created children through
+the same strict parser as native Subfleet runs. A bridge run can legitimately
+have no `run.finished` yet because prompt acceptance is not child completion.
