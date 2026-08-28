@@ -21,6 +21,7 @@ from logpile.backup import (
     snapshot_candidate,
 )
 from logpile.db import init_db
+from logpile.discovery import transcript_roots
 
 
 def write_jsonl(path: Path, records: list[dict]) -> None:
@@ -32,6 +33,163 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
 
 
 class BackupTests(unittest.TestCase):
+    def test_discovers_exact_subfleet_and_traycer_transcript_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+
+            numbered_2_live = home / ".codex-2" / "sessions" / "two-live.jsonl"
+            numbered_10_live = home / ".codex-10" / "sessions" / "ten-live.jsonl"
+            numbered_2_archive = (
+                home / ".codex-2" / "archived_sessions" / "two-archive.jsonl"
+            )
+            numbered_10_archive = (
+                home / ".codex-10" / "archived_sessions" / "ten-archive.jsonl"
+            )
+            traycer_claude = (
+                home
+                / ".traycer"
+                / "harness-accounts"
+                / "claude-code"
+                / "profile-b"
+                / "projects"
+                / "-tmp-demo"
+                / "claude.jsonl"
+            )
+            traycer_codex_a_live = (
+                home
+                / ".traycer"
+                / "harness-accounts"
+                / "codex"
+                / "profile-a"
+                / "sessions"
+                / "codex-a.jsonl"
+            )
+            traycer_codex_b_live = (
+                home
+                / ".traycer"
+                / "harness-accounts"
+                / "codex"
+                / "profile-b"
+                / "sessions"
+                / "codex-b.jsonl"
+            )
+            traycer_codex_a_archive = (
+                home
+                / ".traycer"
+                / "harness-accounts"
+                / "codex"
+                / "profile-a"
+                / "archived_sessions"
+                / "codex-a-archive.jsonl"
+            )
+            expected_files = [
+                traycer_claude,
+                numbered_2_live,
+                numbered_10_live,
+                traycer_codex_a_live,
+                traycer_codex_b_live,
+                numbered_2_archive,
+                numbered_10_archive,
+                traycer_codex_a_archive,
+            ]
+            for index, path in enumerate(expected_files):
+                write_jsonl(
+                    path,
+                    [{"type": "session_meta", "payload": {"id": f"kept-{index}"}}],
+                )
+
+            # Complete-name matching excludes backup-like Codex homes.
+            for path in (
+                home / ".codex-backup" / "sessions" / "backup.jsonl",
+                home / ".codex-4-old" / "sessions" / "old.jsonl",
+            ):
+                write_jsonl(
+                    path, [{"type": "session_meta", "payload": {"id": "decoy"}}]
+                )
+
+            # Traycer profile roots can contain credentials and other JSONL.
+            # Only the provider's exact native transcript child is admissible.
+            traycer_root = home / ".traycer" / "harness-accounts"
+            for path in (
+                home / ".codex-2" / "credentials.jsonl",
+                traycer_root / "claude-code" / "profile-b" / "credentials.jsonl",
+                traycer_root / "codex" / "profile-a" / "logs" / "events.jsonl",
+                traycer_root
+                / "claude"
+                / "wrong-provider-id"
+                / "projects"
+                / "decoy.jsonl",
+            ):
+                write_jsonl(
+                    path, [{"type": "session_meta", "payload": {"id": "decoy"}}]
+                )
+
+            # A transcript-looking symlink inside an admitted dynamic root must
+            # not escape to credential siblings. Directory symlinks are pruned
+            # before traversal and file symlinks are rejected before admission.
+            credential_links = (
+                (
+                    home / ".codex-2" / "sessions" / "linked-credentials.jsonl",
+                    home / ".codex-2" / "credentials.jsonl",
+                ),
+                (
+                    traycer_root
+                    / "claude-code"
+                    / "profile-b"
+                    / "projects"
+                    / "-tmp-demo"
+                    / "linked-credentials.jsonl",
+                    traycer_root / "claude-code" / "profile-b" / "credentials.jsonl",
+                ),
+                (
+                    traycer_root
+                    / "codex"
+                    / "profile-a"
+                    / "sessions"
+                    / "linked-events.jsonl",
+                    traycer_root / "codex" / "profile-a" / "logs" / "events.jsonl",
+                ),
+            )
+            for link, target in credential_links:
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(target)
+
+            credential_directory = home / ".codex-2" / "credential-history"
+            write_jsonl(
+                credential_directory / "secret.jsonl",
+                [{"type": "session_meta", "payload": {"id": "directory-decoy"}}],
+            )
+            linked_directory = home / ".codex-2" / "sessions" / "linked-history"
+            linked_directory.symlink_to(credential_directory, target_is_directory=True)
+
+            roots = list(transcript_roots(home))
+            self.assertEqual(
+                [(root.path, root.source) for root in roots],
+                [
+                    (home / ".claude" / "projects", "claudecode"),
+                    (
+                        traycer_root / "claude-code" / "profile-b" / "projects",
+                        "claudecode",
+                    ),
+                    (home / ".codex" / "sessions", "codex"),
+                    (home / ".codex-2" / "sessions", "codex"),
+                    (home / ".codex-10" / "sessions", "codex"),
+                    (traycer_root / "codex" / "profile-a" / "sessions", "codex"),
+                    (traycer_root / "codex" / "profile-b" / "sessions", "codex"),
+                    (home / ".codex" / "archived_sessions", "codex_archive"),
+                    (home / ".codex-2" / "archived_sessions", "codex_archive"),
+                    (home / ".codex-10" / "archived_sessions", "codex_archive"),
+                    (
+                        traycer_root / "codex" / "profile-a" / "archived_sessions",
+                        "codex_archive",
+                    ),
+                ],
+            )
+            self.assertEqual(
+                list(discover_raw_paths(home, include_codex_db=False)),
+                expected_files,
+            )
+
     def test_plan_discovers_all_roots_rotated_shared_rows_and_deduplicates_sha256(
         self,
     ) -> None:

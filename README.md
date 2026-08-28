@@ -95,13 +95,19 @@ Options:
 ```
 
 Scans `~/.claude/projects/**/*.jsonl` plus every Codex rollout root —
-`~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.codex-2/sessions`,
-`~/.codex-3/sessions`, and OpenClaw codex homes
-(`~/.openclaw/agents/*/agent/codex-home/sessions`) — extracts repo metadata,
-activity counts, narrative fields, and origin classification, then writes to
-SQLite. If a rollout stem exists in more than one root (mid-archive race),
-the live `sessions/` copy wins. Unchanged files are skipped on a size+mtime
-fast path, so multi-GB immutable archives are hashed once, not every sync.
+`~/.codex/{sessions,archived_sessions}`, exact numbered Subfleet homes matching
+`~/.codex-[0-9]+/{sessions,archived_sessions}`, and OpenClaw codex homes
+(`~/.openclaw/agents/*/agent/codex-home/sessions`). It also discovers only the
+native transcript subdirectories of Traycer-managed profiles:
+`~/.traycer/harness-accounts/claude-code/*/projects` and
+`~/.traycer/harness-accounts/codex/*/{sessions,archived_sessions}`. It never
+recursively scans the profile/config roots themselves, and dynamic managed
+roots reject symlinked files and directory components. Sync extracts repo
+metadata, activity counts, narrative fields, and origin classification, then
+writes to SQLite. If a session ID exists in more than one root for the same
+provider, the first root wins; live Codex `sessions/` roots precede archives.
+Unchanged files are skipped on a size+mtime fast path, so multi-GB immutable
+archives are hashed once, not every sync.
 Logpile intentionally keeps archival shared copies. Before copying, sync prints
 the planned copy count/volume and available free space; it refuses an
 insufficient-space plan. A source hash/mtime is committed only after the shared
