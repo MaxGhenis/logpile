@@ -704,7 +704,7 @@ def task_list_command(db: Path, limit: int, json_output: bool):
         line = (
             f"{task['last_occurred_at']}  {task['task_id']}  "
             f"providers={providers}  runs={task['run_count']}  "
-            f"attempts={task['attempt_count']}"
+            f"attempts={task['attempt_count']}  handoffs={task['handoff_count']}"
         )
         if task["last_outcome_status"]:
             line += (
@@ -750,6 +750,17 @@ def task_timeline_command(task_id: str, db: Path, json_output: bool):
         return
 
     for event in events:
+        if event["event_type"] == "handoff.created":
+            source = event["source_provider"]
+            if event["source_session_id"]:
+                source += f":{event['source_session_id']}"
+            else:
+                source += f":{event['source_native_id']}"
+            click.echo(
+                f"{event['occurred_at']}  handoff.created  {source} -> "
+                f"{event['provider']}  run={event['run_id']}"
+            )
+            continue
         line = (
             f"{event['occurred_at']}  {event['event_type']}  "
             f"{event['provider']}  run={event['run_id']}"

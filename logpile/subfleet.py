@@ -20,7 +20,7 @@ from typing import Any
 
 SUBFLEET_EVENT_SCHEMA_VERSION = 1
 MAX_SPOOL_FILE_BYTES = 256 * 1024
-_EVENT_TYPES = {"run.started", "run.bound", "run.finished"}
+_EVENT_TYPES = {"run.started", "run.bound", "run.finished", "handoff.created"}
 _PROVIDERS = {"claude", "codex", "unknown"}
 _REF_RE = re.compile(r"^(?P<kind>task|attempt|run|event|lane|workspace)_[0-9a-f]{24}$")
 _RUN_FILE_RE = re.compile(r"^(run_[0-9a-f]{24})\.jsonl$")
@@ -47,6 +47,29 @@ _EVENT_COLUMNS = (
     "outcome_exit_code",
     "outcome_duration_s",
 )
+_HANDOFF_COLUMNS = (
+    "event_id",
+    "schema_version",
+    "task_id",
+    "target_run_id",
+    "target_provider",
+    "lane_ref",
+    "workspace_ref",
+    "source_attempt_id",
+    "source_provider",
+    "source_binding_kind",
+    "source_native_id",
+    "occurred_at",
+)
+_TIMELINE_SOURCE_COLUMNS = (
+    "source_attempt_id",
+    "source_provider",
+    "source_binding_kind",
+    "source_native_id",
+    "source_session_id",
+    "source_session_source",
+    "source_session_project",
+)
 
 
 class SubfleetSpoolError(RuntimeError):
@@ -72,6 +95,25 @@ class SubfleetEvent:
     outcome_status: str | None
     outcome_exit_code: int | None
     outcome_duration_s: float | None
+
+    def values(self) -> tuple[Any, ...]:
+        return astuple(self)
+
+
+@dataclass(frozen=True)
+class SubfleetHandoff:
+    event_id: str
+    schema_version: int
+    task_id: str
+    target_run_id: str
+    target_provider: str
+    lane_ref: str | None
+    workspace_ref: str | None
+    source_attempt_id: str
+    source_provider: str
+    source_binding_kind: str
+    source_native_id: str
+    occurred_at: str
 
     def values(self) -> tuple[Any, ...]:
         return astuple(self)
@@ -152,7 +194,9 @@ def _parse_timestamps(
     return {name: _timestamp(value[name], f"timestamps.{name}") for name in required}
 
 
-def _parse_event(value: Any, *, expected_run_id: str) -> SubfleetEvent:
+def _parse_event(
+    value: Any, *, expected_run_id: str
+) -> SubfleetEvent | SubfleetHandoff:
     if not isinstance(value, dict):
         raise TypeError("event must be an object")
     event_type = value.get("event")
@@ -174,12 +218,14 @@ def _parse_event(value: Any, *, expected_run_id: str) -> SubfleetEvent:
         _require_exact_keys(value, required=common)
     elif event_type == "run.bound":
         _require_exact_keys(value, required=common | {"attempt_id", "binding"})
-    else:
+    elif event_type == "run.finished":
         _require_exact_keys(
             value,
             required=common | {"outcome"},
             optional={"attempt_id"},
         )
+    else:
+        _require_exact_keys(value, required=common | {"source"})
 
     schema_version = value["schema_version"]
     if (
@@ -202,6 +248,50 @@ def _parse_event(value: Any, *, expected_run_id: str) -> SubfleetEvent:
         raise TypeError("workspace must be an object")
     _require_exact_keys(workspace, required={"ref"})
     workspace_ref = _ref(workspace["ref"], "workspace", optional=True)
+
+    if event_type == "handoff.created":
+        if provider not in {"claude", "codex"}:
+            raise ValueError("handoff.created requires a native target provider")
+        timestamps = _parse_timestamps(value["timestamps"], required={"occurred_at"})
+        source = value["source"]
+        if not isinstance(source, dict):
+            raise TypeError("source must be an object")
+        _require_exact_keys(
+            source,
+            required={"provider", "attempt_id", "binding"},
+        )
+        source_provider = source["provider"]
+        if source_provider not in {"claude", "codex"}:
+            raise ValueError("handoff source requires a native provider")
+        source_attempt_id = _ref(source["attempt_id"], "attempt")
+        source_binding = source["binding"]
+        if not isinstance(source_binding, dict):
+            raise TypeError("source.binding must be an object")
+        _require_exact_keys(source_binding, required={"kind", "native_id"})
+        source_binding_kind = source_binding["kind"]
+        expected_kind = "session" if source_provider == "claude" else "thread"
+        if source_binding_kind != expected_kind:
+            raise ValueError("source binding kind does not match provider")
+        source_native_id = source_binding["native_id"]
+        if (
+            not isinstance(source_native_id, str)
+            or _UUID_RE.fullmatch(source_native_id) is None
+        ):
+            raise ValueError("source.binding.native_id must be a UUID")
+        return SubfleetHandoff(
+            event_id=event_id,
+            schema_version=schema_version,
+            task_id=task_id,
+            target_run_id=run_id,
+            target_provider=provider,
+            lane_ref=lane_ref,
+            workspace_ref=workspace_ref,
+            source_attempt_id=source_attempt_id,
+            source_provider=source_provider,
+            source_binding_kind=source_binding_kind,
+            source_native_id=source_native_id.lower(),
+            occurred_at=timestamps["occurred_at"],
+        )
 
     attempt_id = None
     binding_kind = None
@@ -389,6 +479,14 @@ def _read_spool_file(spool_fd: int, name: str) -> bytes | None:
 
 
 def _event_conflicts(conn: sqlite3.Connection, event: SubfleetEvent) -> bool | None:
+    if (
+        conn.execute(
+            "SELECT 1 FROM subfleet_handoffs WHERE event_id = ?",
+            (event.event_id,),
+        ).fetchone()
+        is not None
+    ):
+        return True
     existing = conn.execute(
         f"SELECT {', '.join(_EVENT_COLUMNS)} FROM subfleet_events WHERE event_id = ?",
         (event.event_id,),
@@ -398,24 +496,79 @@ def _event_conflicts(conn: sqlite3.Connection, event: SubfleetEvent) -> bool | N
     return tuple(existing[column] for column in _EVENT_COLUMNS) != event.values()
 
 
-def _attempt_conflicts(conn: sqlite3.Connection, event: SubfleetEvent) -> bool:
-    if event.event_type != "run.bound":
-        return False
+def _handoff_conflicts(
+    conn: sqlite3.Connection, handoff: SubfleetHandoff
+) -> bool | None:
+    if (
+        conn.execute(
+            "SELECT 1 FROM subfleet_events WHERE event_id = ?",
+            (handoff.event_id,),
+        ).fetchone()
+        is not None
+    ):
+        return True
+    existing = conn.execute(
+        f"""
+        SELECT {", ".join(_HANDOFF_COLUMNS)}
+        FROM subfleet_handoffs
+        WHERE event_id = ?
+        """,
+        (handoff.event_id,),
+    ).fetchone()
+    if existing is None:
+        return None
+    return tuple(existing[column] for column in _HANDOFF_COLUMNS) != handoff.values()
+
+
+def _attempt_identity_conflicts(
+    conn: sqlite3.Connection,
+    *,
+    attempt_id: str,
+    provider: str,
+    binding_kind: str,
+    native_id: str,
+) -> bool:
     existing = conn.execute(
         """
         SELECT attempt_id, provider, binding_kind, native_id
         FROM subfleet_attempts
         WHERE attempt_id = ? OR (provider = ? AND native_id = ?)
         """,
-        (event.attempt_id, event.provider, event.binding_native_id),
+        (attempt_id, provider, native_id),
     ).fetchall()
-    expected = (
-        event.attempt_id,
-        event.provider,
-        event.binding_kind,
-        event.binding_native_id,
-    )
+    expected = (attempt_id, provider, binding_kind, native_id)
     return any(tuple(row) != expected for row in existing)
+
+
+def _attempt_task_conflicts(
+    conn: sqlite3.Connection,
+    *,
+    attempt_id: str,
+    task_id: str,
+    provider: str,
+) -> bool:
+    lifecycle = conn.execute(
+        """
+        SELECT 1
+        FROM subfleet_events
+        WHERE attempt_id = ? AND (task_id != ? OR provider != ?)
+        LIMIT 1
+        """,
+        (attempt_id, task_id, provider),
+    ).fetchone()
+    if lifecycle is not None:
+        return True
+    source_edge = conn.execute(
+        """
+        SELECT 1
+        FROM subfleet_handoffs
+        WHERE source_attempt_id = ?
+          AND (task_id != ? OR source_provider != ?)
+        LIMIT 1
+        """,
+        (attempt_id, task_id, provider),
+    ).fetchone()
+    return source_edge is not None
 
 
 def _lifecycle_conflicts(conn: sqlite3.Connection, event: SubfleetEvent) -> bool:
@@ -432,6 +585,24 @@ def _lifecycle_conflicts(conn: sqlite3.Connection, event: SubfleetEvent) -> bool
     if existing_run is not None and (
         existing_run["task_id"] != event.task_id
         or existing_run["provider"] != event.provider
+    ):
+        return True
+    handoff_target = conn.execute(
+        """
+        SELECT task_id, target_provider, source_attempt_id
+        FROM subfleet_handoffs
+        WHERE target_run_id = ?
+        LIMIT 1
+        """,
+        (event.run_id,),
+    ).fetchone()
+    if handoff_target is not None and (
+        handoff_target["task_id"] != event.task_id
+        or handoff_target["target_provider"] != event.provider
+        or (
+            event.attempt_id is not None
+            and handoff_target["source_attempt_id"] == event.attempt_id
+        )
     ):
         return True
     if event.event_type in {"run.started", "run.finished"}:
@@ -476,50 +647,141 @@ def _lifecycle_conflicts(conn: sqlite3.Connection, event: SubfleetEvent) -> bool
     ).fetchone()
     if existing_attempt is not None and existing_attempt["provider"] != event.provider:
         return True
-    existing_event = conn.execute(
+    return _attempt_task_conflicts(
+        conn,
+        attempt_id=event.attempt_id,
+        task_id=event.task_id,
+        provider=event.provider,
+    )
+
+
+def _handoff_relational_conflicts(
+    conn: sqlite3.Connection, handoff: SubfleetHandoff
+) -> bool:
+    duplicate_target = conn.execute(
+        """
+        SELECT event_id
+        FROM subfleet_handoffs
+        WHERE target_run_id = ?
+        LIMIT 1
+        """,
+        (handoff.target_run_id,),
+    ).fetchone()
+    if (
+        duplicate_target is not None
+        and duplicate_target["event_id"] != handoff.event_id
+    ):
+        return True
+    target_run = conn.execute(
         """
         SELECT 1
         FROM subfleet_events
-        WHERE attempt_id = ? AND provider != ?
+        WHERE run_id = ? AND (task_id != ? OR provider != ?)
         LIMIT 1
         """,
-        (event.attempt_id, event.provider),
+        (handoff.target_run_id, handoff.task_id, handoff.target_provider),
     ).fetchone()
-    return existing_event is not None
+    if target_run is not None:
+        return True
+    self_loop = conn.execute(
+        """
+        SELECT 1
+        FROM subfleet_events
+        WHERE run_id = ? AND attempt_id = ?
+        LIMIT 1
+        """,
+        (handoff.target_run_id, handoff.source_attempt_id),
+    ).fetchone()
+    if self_loop is not None:
+        return True
+    if _attempt_identity_conflicts(
+        conn,
+        attempt_id=handoff.source_attempt_id,
+        provider=handoff.source_provider,
+        binding_kind=handoff.source_binding_kind,
+        native_id=handoff.source_native_id,
+    ):
+        return True
+    return _attempt_task_conflicts(
+        conn,
+        attempt_id=handoff.source_attempt_id,
+        task_id=handoff.task_id,
+        provider=handoff.source_provider,
+    )
 
 
-def _store_event(
+def _upsert_attempt(
+    conn: sqlite3.Connection,
+    *,
+    attempt_id: str,
+    provider: str,
+    binding_kind: str,
+    native_id: str,
+    occurred_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO subfleet_attempts (
+            attempt_id, provider, binding_kind, native_id, first_bound_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(attempt_id) DO UPDATE SET
+            first_bound_at = MIN(first_bound_at, excluded.first_bound_at)
+        """,
+        (attempt_id, provider, binding_kind, native_id, occurred_at),
+    )
+
+
+def _store_lifecycle_event(
     conn: sqlite3.Connection,
     event: SubfleetEvent,
     *,
     ingested_at: str,
 ) -> str:
     conflict = _event_conflicts(conn, event)
-    if (
-        conflict is True
-        or _lifecycle_conflicts(conn, event)
-        or _attempt_conflicts(conn, event)
+    if conflict is True:
+        return "rejected"
+    if conflict is False:
+        # Committed pre-handoff databases could contain one native attempt in
+        # more than one task. Preserve exact event-id replay idempotency across
+        # that upgrade while still restoring or validating its attempt row.
+        if event.event_type == "run.bound":
+            if _attempt_identity_conflicts(
+                conn,
+                attempt_id=event.attempt_id,
+                provider=event.provider,
+                binding_kind=event.binding_kind,
+                native_id=event.binding_native_id,
+            ):
+                return "rejected"
+            _upsert_attempt(
+                conn,
+                attempt_id=event.attempt_id,
+                provider=event.provider,
+                binding_kind=event.binding_kind,
+                native_id=event.binding_native_id,
+                occurred_at=event.occurred_at,
+            )
+        return "duplicate"
+    if _lifecycle_conflicts(conn, event) or (
+        event.event_type == "run.bound"
+        and _attempt_identity_conflicts(
+            conn,
+            attempt_id=event.attempt_id,
+            provider=event.provider,
+            binding_kind=event.binding_kind,
+            native_id=event.binding_native_id,
+        )
     ):
         return "rejected"
     if event.event_type == "run.bound":
-        conn.execute(
-            """
-            INSERT INTO subfleet_attempts (
-                attempt_id, provider, binding_kind, native_id, first_bound_at
-            ) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(attempt_id) DO UPDATE SET
-                first_bound_at = MIN(first_bound_at, excluded.first_bound_at)
-            """,
-            (
-                event.attempt_id,
-                event.provider,
-                event.binding_kind,
-                event.binding_native_id,
-                event.occurred_at,
-            ),
+        _upsert_attempt(
+            conn,
+            attempt_id=event.attempt_id,
+            provider=event.provider,
+            binding_kind=event.binding_kind,
+            native_id=event.binding_native_id,
+            occurred_at=event.occurred_at,
         )
-    if conflict is False:
-        return "duplicate"
     placeholders = ", ".join("?" for _ in (*_EVENT_COLUMNS, "ingested_at"))
     conn.execute(
         f"""
@@ -529,6 +791,48 @@ def _store_event(
         (*event.values(), ingested_at),
     )
     return "inserted"
+
+
+def _store_handoff(
+    conn: sqlite3.Connection,
+    handoff: SubfleetHandoff,
+    *,
+    ingested_at: str,
+) -> str:
+    conflict = _handoff_conflicts(conn, handoff)
+    if conflict is True or _handoff_relational_conflicts(conn, handoff):
+        return "rejected"
+    _upsert_attempt(
+        conn,
+        attempt_id=handoff.source_attempt_id,
+        provider=handoff.source_provider,
+        binding_kind=handoff.source_binding_kind,
+        native_id=handoff.source_native_id,
+        occurred_at=handoff.occurred_at,
+    )
+    if conflict is False:
+        return "duplicate"
+    placeholders = ", ".join("?" for _ in (*_HANDOFF_COLUMNS, "ingested_at"))
+    conn.execute(
+        f"""
+        INSERT INTO subfleet_handoffs (
+            {", ".join((*_HANDOFF_COLUMNS, "ingested_at"))}
+        ) VALUES ({placeholders})
+        """,
+        (*handoff.values(), ingested_at),
+    )
+    return "inserted"
+
+
+def _store_event(
+    conn: sqlite3.Connection,
+    event: SubfleetEvent | SubfleetHandoff,
+    *,
+    ingested_at: str,
+) -> str:
+    if isinstance(event, SubfleetHandoff):
+        return _store_handoff(conn, event, ingested_at=ingested_at)
+    return _store_lifecycle_event(conn, event, ingested_at=ingested_at)
 
 
 def _session_for_attempt(
@@ -678,15 +982,24 @@ def get_task_timeline(
             occurred_at,
             CASE event_type
                 WHEN 'run.started' THEN 0
-                WHEN 'run.bound' THEN 1
-                WHEN 'run.finished' THEN 2
-                ELSE 3
+                WHEN 'handoff.created' THEN 1
+                WHEN 'run.bound' THEN 2
+                WHEN 'run.finished' THEN 3
+                ELSE 4
             END,
             event_id
         """,
         (task_id,),
     ).fetchall()
-    return [dict(row) for row in rows]
+    result = []
+    for row in rows:
+        event = dict(row)
+        # Keep the structured query shape stable for a pre-handoff view. The
+        # next write-side sync will rebuild the view with real source joins.
+        for column in _TIMELINE_SOURCE_COLUMNS:
+            event.setdefault(column, None)
+        result.append(event)
+    return result
 
 
 def list_tasks(
@@ -710,6 +1023,9 @@ def list_tasks(
     result = []
     for row in rows:
         task = dict(row)
+        # Databases initialized before handoff.created remain queryable without
+        # a write-side migration; the next sync will rebuild the richer view.
+        task.setdefault("handoff_count", 0)
         task["providers"] = [
             provider
             for provider, column in (

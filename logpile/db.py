@@ -3,6 +3,7 @@
 import os
 import re
 import sqlite3
+import stat
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -348,6 +349,35 @@ CREATE TABLE IF NOT EXISTS subfleet_attempts (
     UNIQUE (provider, native_id)
 );
 
+-- Explicit continuity edges between provider-native attempts. The target is
+-- named by its run; its attempt arrives through the normal run.bound event.
+-- Keeping edges separate preserves the strict released subfleet_events shape.
+CREATE TABLE IF NOT EXISTS subfleet_handoffs (
+    event_id            TEXT PRIMARY KEY,
+    schema_version      INTEGER NOT NULL CHECK (schema_version = 1),
+    task_id             TEXT NOT NULL,
+    target_run_id       TEXT NOT NULL UNIQUE,
+    target_provider     TEXT NOT NULL CHECK (
+        target_provider IN ('claude', 'codex')
+    ),
+    lane_ref            TEXT,
+    workspace_ref       TEXT,
+    source_attempt_id   TEXT NOT NULL,
+    source_provider     TEXT NOT NULL CHECK (
+        source_provider IN ('claude', 'codex')
+    ),
+    source_binding_kind TEXT NOT NULL CHECK (
+        source_binding_kind IN ('session', 'thread')
+    ),
+    source_native_id    TEXT NOT NULL,
+    occurred_at         TEXT NOT NULL,
+    ingested_at         TEXT NOT NULL,
+    CHECK (
+        (source_provider = 'claude' AND source_binding_kind = 'session')
+        OR (source_provider = 'codex' AND source_binding_kind = 'thread')
+    )
+);
+
 CREATE TABLE IF NOT EXISTS tool_calls (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id  TEXT NOT NULL,
@@ -408,6 +438,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_subfleet_events_one_binding
     WHERE event_type = 'run.bound';
 CREATE INDEX IF NOT EXISTS idx_subfleet_attempts_native      ON subfleet_attempts(provider, native_id);
 CREATE INDEX IF NOT EXISTS idx_subfleet_attempts_session     ON subfleet_attempts(session_id);
+CREATE INDEX IF NOT EXISTS idx_subfleet_handoffs_task_time   ON subfleet_handoffs(task_id, occurred_at, event_id);
+CREATE INDEX IF NOT EXISTS idx_subfleet_handoffs_source      ON subfleet_handoffs(source_attempt_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session           ON tool_calls(session_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_name              ON tool_calls(tool_name);
 CREATE INDEX IF NOT EXISTS idx_session_paths_session        ON session_paths(session_id);
@@ -450,7 +482,8 @@ FROM sessions s
 LEFT JOIN users u ON u.username = s.username;
 
 -- Local/private task history. run.finished rows inherit their native session
--- through attempt_id; run.started intentionally remains unbound.
+-- through attempt_id; run.started and handoff targets remain unbound until the
+-- target run emits run.bound. Handoff source columns join the explicit source.
 DROP VIEW IF EXISTS subfleet_task_timeline;
 CREATE VIEW subfleet_task_timeline AS
 SELECT
@@ -476,10 +509,54 @@ SELECT
     s.project AS session_project,
     s.first_timestamp AS session_first_timestamp,
     s.last_timestamp AS session_last_timestamp,
-    s.session_status
+    s.session_status,
+    NULL AS source_attempt_id,
+    NULL AS source_provider,
+    NULL AS source_binding_kind,
+    NULL AS source_native_id,
+    NULL AS source_session_id,
+    NULL AS source_session_source,
+    NULL AS source_session_project
 FROM subfleet_events e
 LEFT JOIN subfleet_attempts a ON a.attempt_id = e.attempt_id
-LEFT JOIN sessions s ON s.session_id = a.session_id;
+LEFT JOIN sessions s ON s.session_id = a.session_id
+UNION ALL
+SELECT
+    h.event_id,
+    h.schema_version,
+    'handoff.created' AS event_type,
+    h.task_id,
+    h.target_run_id AS run_id,
+    NULL AS attempt_id,
+    h.target_provider AS provider,
+    h.lane_ref,
+    h.workspace_ref,
+    h.occurred_at,
+    NULL AS started_at,
+    NULL AS finished_at,
+    NULL AS binding_kind,
+    NULL AS native_id,
+    NULL AS outcome_status,
+    NULL AS outcome_exit_code,
+    NULL AS outcome_duration_s,
+    NULL AS session_id,
+    NULL AS session_source,
+    NULL AS session_project,
+    NULL AS session_first_timestamp,
+    NULL AS session_last_timestamp,
+    NULL AS session_status,
+    h.source_attempt_id,
+    h.source_provider,
+    h.source_binding_kind,
+    h.source_native_id,
+    source_attempt.session_id AS source_session_id,
+    source_session.source AS source_session_source,
+    source_session.project AS source_session_project
+FROM subfleet_handoffs h
+LEFT JOIN subfleet_attempts source_attempt
+    ON source_attempt.attempt_id = h.source_attempt_id
+LEFT JOIN sessions source_session
+    ON source_session.session_id = source_attempt.session_id;
 
 DROP VIEW IF EXISTS subfleet_task_catalog;
 CREATE VIEW subfleet_task_catalog AS
@@ -495,23 +572,51 @@ WITH ranked_finishes AS (
         ) AS outcome_rank
     FROM subfleet_events
     WHERE event_type = 'run.finished'
+), task_activity AS (
+    SELECT
+        task_id,
+        occurred_at,
+        provider,
+        run_id,
+        attempt_id,
+        NULL AS handoff_event_id
+    FROM subfleet_events
+    UNION ALL
+    SELECT
+        task_id,
+        occurred_at,
+        target_provider AS provider,
+        target_run_id AS run_id,
+        NULL AS attempt_id,
+        event_id AS handoff_event_id
+    FROM subfleet_handoffs
+    UNION ALL
+    SELECT
+        task_id,
+        occurred_at,
+        source_provider AS provider,
+        NULL AS run_id,
+        source_attempt_id AS attempt_id,
+        NULL AS handoff_event_id
+    FROM subfleet_handoffs
 )
 SELECT
-    e.task_id,
-    MIN(e.occurred_at) AS first_occurred_at,
-    MAX(e.occurred_at) AS last_occurred_at,
-    MAX(CASE WHEN e.provider = 'claude' THEN 1 ELSE 0 END) AS has_claude,
-    MAX(CASE WHEN e.provider = 'codex' THEN 1 ELSE 0 END) AS has_codex,
-    MAX(CASE WHEN e.provider = 'unknown' THEN 1 ELSE 0 END) AS has_unknown,
-    COUNT(DISTINCT e.run_id) AS run_count,
-    COUNT(DISTINCT e.attempt_id) AS attempt_count,
+    activity.task_id,
+    MIN(activity.occurred_at) AS first_occurred_at,
+    MAX(activity.occurred_at) AS last_occurred_at,
+    MAX(CASE WHEN activity.provider = 'claude' THEN 1 ELSE 0 END) AS has_claude,
+    MAX(CASE WHEN activity.provider = 'codex' THEN 1 ELSE 0 END) AS has_codex,
+    MAX(CASE WHEN activity.provider = 'unknown' THEN 1 ELSE 0 END) AS has_unknown,
+    COUNT(DISTINCT activity.run_id) AS run_count,
+    COUNT(DISTINCT activity.attempt_id) AS attempt_count,
+    COUNT(DISTINCT activity.handoff_event_id) AS handoff_count,
     MAX(f.outcome_status) AS last_outcome_status,
     MAX(f.outcome_exit_code) AS last_outcome_exit_code,
     MAX(f.finished_at) AS last_outcome_finished_at
-FROM subfleet_events e
+FROM task_activity activity
 LEFT JOIN ranked_finishes f
-    ON f.task_id = e.task_id AND f.outcome_rank = 1
-GROUP BY e.task_id;
+    ON f.task_id = activity.task_id AND f.outcome_rank = 1
+GROUP BY activity.task_id;
 
 -- Per-day usage with graceful degradation: sessions that have not been
 -- re-synced since session_daily_usage was introduced (or whose records carry
@@ -2821,20 +2926,24 @@ def get_db(db_path: Path):
 
 @contextmanager
 def get_readonly_db(db_path: Path):
-    """Open an existing database without migrations or avoidable sidecars.
+    """Open an existing database without running migrations.
 
-    A clean/checkpointed WAL database can be opened immutably, which also
-    works when its directory is not writable. A live nonempty WAL must use
-    SQLite's normal read-only coordination so committed WAL rows stay visible.
+    Normal databases use SQLite's coordinated read-only mode so commits made
+    through a live WAL stay visible. Immutable mode is reserved for an input
+    whose database file and containing directory have no write permission bits
+    and no existing WAL/SHM files; that explicitly frozen case cannot create
+    sidecars.
     """
     db_path = Path(db_path).resolve(strict=True)
-    wal_path = Path(f"{db_path}-wal")
-    try:
-        has_live_wal = wal_path.stat().st_size > 0
-    except FileNotFoundError:
-        has_live_wal = False
     uri = f"{db_path.as_uri()}?mode=ro"
-    if not has_live_wal:
+    write_bits = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+    explicitly_frozen = not (
+        db_path.stat().st_mode & write_bits
+        or db_path.parent.stat().st_mode & write_bits
+        or Path(f"{db_path}-wal").exists()
+        or Path(f"{db_path}-shm").exists()
+    )
+    if explicitly_frozen:
         uri += "&immutable=1"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row

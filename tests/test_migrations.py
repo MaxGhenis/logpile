@@ -148,6 +148,8 @@ class SubfleetEventMigrationTests(unittest.TestCase):
             init_db(db_path)
             with sqlite3.connect(db_path) as conn:
                 conn.execute("DROP VIEW subfleet_task_timeline")
+                conn.execute("DROP VIEW subfleet_task_catalog")
+                conn.execute("DROP TABLE subfleet_handoffs")
                 conn.execute("DROP TABLE subfleet_attempts")
                 conn.execute("DROP TABLE subfleet_events")
 
@@ -171,12 +173,20 @@ class SubfleetEventMigrationTests(unittest.TestCase):
                         "PRAGMA index_list(subfleet_attempts)"
                     ).fetchall()
                 }
+                handoff_indexes = {
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA index_list(subfleet_handoffs)"
+                    ).fetchall()
+                }
 
             self.assertIn(("table", "subfleet_events"), objects)
             self.assertIn(("table", "subfleet_attempts"), objects)
+            self.assertIn(("table", "subfleet_handoffs"), objects)
             self.assertIn(("view", "subfleet_task_timeline"), objects)
             self.assertIn(("view", "subfleet_task_catalog"), objects)
             self.assertIn("idx_subfleet_attempts_native", attempt_indexes)
+            self.assertIn("idx_subfleet_handoffs_source", handoff_indexes)
             self.assertIn(("index", "idx_subfleet_events_one_lifecycle"), objects)
             self.assertIn(("index", "idx_subfleet_events_one_binding"), objects)
             self.assertTrue(

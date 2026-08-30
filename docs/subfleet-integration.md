@@ -32,21 +32,26 @@ session sync.
 - `subfleet_events` stores the three v1 lifecycle records (`run.started`,
   `run.bound`, and `run.finished`) keyed by `event_id`. Each run may have one
   start, multiple native bindings, and one finish.
+- `subfleet_handoffs` stores an explicit `handoff.created` edge from a bound
+  Claude session or Codex thread to the target run. A target run can have at
+  most one handoff edge; Logpile never guesses continuity from prompt text,
+  workspace, or timing.
 - `subfleet_attempts` stores one provider-native binding per `attempt_id` and
   enforces uniqueness for `(provider, native_id)`. Its `session_id` is nullable
   until the corresponding native transcript reaches Logpile.
 - `subfleet_task_timeline` joins event, attempt, and selected session metadata.
   `logpile.subfleet.get_task_timeline()` is the Python query surface.
 - `subfleet_task_catalog` and `logpile.subfleet.list_tasks()` provide
-  recent-task discovery with provider and run/attempt counts plus the latest
-  outcome.
+  recent-task discovery with provider and run/attempt/handoff counts plus the
+  latest outcome.
 
 Ingestion tolerates lifecycle records arriving out of order. Every sync retries
 unresolved bindings after native transcripts are indexed, even when the spool
 is empty or no longer exists. Replaying an identical `event_id` is idempotent;
-replaying that ID with different normalized values is rejected. Timeline order
-is deterministic: `occurred_at`, lifecycle order (started, bound, finished),
-then `event_id`.
+replaying that ID with different normalized values is rejected. Event IDs are
+unique across lifecycle and handoff records. Timeline order is deterministic:
+`occurred_at`, lifecycle order (started, handoff, bound, finished), then
+`event_id`.
 
 Subfleet may prune a run's spool file with its private ledger retention. Logpile
 retains metadata it has already ingested; source pruning does not delete event
@@ -67,11 +72,13 @@ The first integration slice is deliberately local-only. It does not add a web
 or public API route because task membership and publication policy are separate
 from the existing per-session visibility gate.
 
-This consumer accepts only Subfleet's `run.*` schema-v1 events, never the
-separate `traycer.agent.*` receipt spool. The Subfleet Traycer bridge now emits
-that standard seam after querying Traycer's metadata-only `agent binding`
-command: the parent Traycer task becomes a pseudonymous `task_id`, each child
-dispatch becomes a `run_id`, and a validated Claude session or Codex thread UUID
-becomes `run.bound`. Logpile therefore joins bridge-created children through
-the same strict parser as native Subfleet runs. A bridge run can legitimately
-have no `run.finished` yet because prompt acceptance is not child completion.
+This consumer accepts only Subfleet's `run.*` and `handoff.created` schema-v1
+events, never the separate `traycer.agent.*` receipt spool. The Subfleet
+Traycer bridge emits that standard seam after querying Traycer's metadata-only
+`agent binding` command: the parent Traycer task becomes a pseudonymous
+`task_id`, each child dispatch becomes a `run_id`, and a validated Claude
+session or Codex thread UUID becomes `run.bound`. Native Subfleet handoffs carry
+the same task ID forward verbatim and name the exact source binding. Logpile
+therefore joins bridge-created children and provider handoffs through the same
+strict parser as native Subfleet runs. A bridge run can legitimately have no
+`run.finished` yet because prompt acceptance is not child completion.
