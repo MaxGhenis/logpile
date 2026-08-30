@@ -709,6 +709,7 @@ class SubfleetEventTests(unittest.TestCase):
                 before_schema = conn.execute(
                     "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
                 ).fetchall()
+            before_entries = sorted(path.name for path in db_path.parent.iterdir())
 
             results = [
                 CliRunner().invoke(
@@ -739,6 +740,34 @@ class SubfleetEventTests(unittest.TestCase):
                 self.assertIn("Task schema is not initialized", result.output)
             self.assertEqual(after_schema, before_schema)
             self.assertEqual(db_path.stat().st_mtime_ns, before_mtime)
+            self.assertEqual(
+                sorted(path.name for path in db_path.parent.iterdir()),
+                before_entries,
+            )
+
+    def test_task_cli_reads_clean_wal_database_in_readonly_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "logpile.db"
+            init_db(db_path)
+            self.assertFalse(Path(f"{db_path}-wal").exists())
+            self.assertFalse(Path(f"{db_path}-shm").exists())
+            before_entries = sorted(path.name for path in root.iterdir())
+            db_path.chmod(0o400)
+            root.chmod(0o500)
+            try:
+                result = CliRunner().invoke(
+                    cli,
+                    ["task-list", "--db", str(db_path), "--json"],
+                )
+                after_entries = sorted(path.name for path in root.iterdir())
+            finally:
+                root.chmod(0o700)
+                db_path.chmod(0o600)
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(json.loads(result.output)["tasks"], [])
+            self.assertEqual(after_entries, before_entries)
 
 
 if __name__ == "__main__":

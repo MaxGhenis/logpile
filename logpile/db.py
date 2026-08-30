@@ -2821,9 +2821,22 @@ def get_db(db_path: Path):
 
 @contextmanager
 def get_readonly_db(db_path: Path):
-    """Open an existing database without migrating or mutating its files."""
+    """Open an existing database without migrations or avoidable sidecars.
+
+    A clean/checkpointed WAL database can be opened immutably, which also
+    works when its directory is not writable. A live nonempty WAL must use
+    SQLite's normal read-only coordination so committed WAL rows stay visible.
+    """
     db_path = Path(db_path).resolve(strict=True)
-    conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+    wal_path = Path(f"{db_path}-wal")
+    try:
+        has_live_wal = wal_path.stat().st_size > 0
+    except FileNotFoundError:
+        has_live_wal = False
+    uri = f"{db_path.as_uri()}?mode=ro"
+    if not has_live_wal:
+        uri += "&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only=ON")
     try:
