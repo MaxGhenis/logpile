@@ -448,6 +448,19 @@ def _open_spool(spool_dir: Path) -> int | None:
         os.close(parent_fd)
 
 
+def validate_subfleet_spool(spool_dir: Path) -> None:
+    """Fail fast unless ``spool_dir`` is a safely openable v1 event spool.
+
+    A missing spool is valid: Subfleet may not have emitted any events yet.
+    Ingestion opens the directory again so this advisory preflight never
+    replaces the descriptor-pinned validation at the point of use.
+    """
+
+    spool_fd = _open_spool(Path(spool_dir))
+    if spool_fd is not None:
+        os.close(spool_fd)
+
+
 def _read_spool_file(spool_fd: int, name: str) -> bytes | None:
     flags = (
         os.O_RDONLY
@@ -457,6 +470,10 @@ def _read_spool_file(spool_fd: int, name: str) -> bytes | None:
     )
     try:
         descriptor = os.open(name, flags, dir_fd=spool_fd)
+    except FileNotFoundError:
+        # Subfleet retention may prune a run after listdir() but before open().
+        # It was never presented to this ingest pass, so this is not rejection.
+        raise
     except OSError:
         return None
     try:
@@ -929,7 +946,10 @@ def ingest_subfleet_events(
                     if name.endswith(".jsonl"):
                         rejected += 1
                     continue
-                payload = _read_spool_file(spool_fd, name)
+                try:
+                    payload = _read_spool_file(spool_fd, name)
+                except FileNotFoundError:
+                    continue
                 if payload is None:
                     rejected += 1
                     continue

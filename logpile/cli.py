@@ -689,7 +689,7 @@ def task_list_command(db: Path, limit: int, json_output: bool):
     try:
         with get_readonly_db(db) as conn:
             tasks = list_tasks(conn, limit=limit)
-    except sqlite3.OperationalError as exc:
+    except sqlite3.DatabaseError as exc:
         raise _task_database_error(exc) from exc
 
     payload = {"backend": "local", "tasks": tasks}
@@ -739,7 +739,7 @@ def task_timeline_command(task_id: str, db: Path, json_output: bool):
             events = get_task_timeline(conn, task_id)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
-    except sqlite3.OperationalError as exc:
+    except sqlite3.DatabaseError as exc:
         raise _task_database_error(exc) from exc
     if not events:
         raise click.ClickException(f"No Subfleet events found for task '{task_id}'.")
@@ -774,7 +774,7 @@ def task_timeline_command(task_id: str, db: Path, json_output: bool):
         click.echo(line)
 
 
-def _task_database_error(exc: sqlite3.OperationalError) -> click.ClickException:
+def _task_database_error(exc: sqlite3.DatabaseError) -> click.ClickException:
     """Map missing task views to the sync action that initializes them."""
     message = str(exc)
     if "no such table" in message.lower() or "no such view" in message.lower():
@@ -857,6 +857,14 @@ def sync(
     verbose,
 ):
     """Index local sessions, upload raw logs to cloud storage, or both."""
+    if backend in {"local", "both"} and subfleet_events_dir is not None:
+        from .subfleet import SubfleetSpoolError, validate_subfleet_spool
+
+        try:
+            validate_subfleet_spool(subfleet_events_dir)
+        except SubfleetSpoolError as exc:
+            raise click.ClickException(str(exc)) from exc
+
     if backend in {"local", "both"}:
         from .subfleet import SubfleetSpoolError
         from .sync import SyncLockError, SyncStatus, sync_sessions

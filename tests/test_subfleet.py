@@ -1014,6 +1014,68 @@ class SubfleetEventTests(unittest.TestCase):
             self.assertEqual((result.inserted, result.rejected), (1, 0))
             self.assertEqual(event_ids, [_ref("event", 1)])
 
+    def test_retention_prune_between_list_and_open_is_silently_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "logpile.db"
+            spool = _spool(root)
+            event_path = _write_events(
+                spool,
+                1,
+                [_started(event_number=1, run_number=1)],
+            )
+            original_listdir = os.listdir
+
+            def prune_after_list(directory_fd):
+                entries = original_listdir(directory_fd)
+                os.unlink(event_path.name, dir_fd=directory_fd)
+                return entries
+
+            init_db(db_path)
+            with (
+                mock.patch(
+                    "logpile.subfleet.os.listdir",
+                    side_effect=prune_after_list,
+                ),
+                get_db(db_path) as conn,
+            ):
+                result = ingest_subfleet_events(conn, spool)
+                count = conn.execute("SELECT COUNT(*) FROM subfleet_events").fetchone()[
+                    0
+                ]
+
+            self.assertEqual((result.inserted, result.rejected), (0, 0))
+            self.assertEqual(count, 0)
+
+    def test_non_missing_spool_open_error_remains_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "logpile.db"
+            spool = _spool(root)
+            event_path = _write_events(
+                spool,
+                1,
+                [_started(event_number=1, run_number=1)],
+            )
+            original_open = os.open
+
+            def deny_event_open(path, flags, *args, **kwargs):
+                if path == event_path.name:
+                    raise PermissionError("retention did not remove this file")
+                return original_open(path, flags, *args, **kwargs)
+
+            init_db(db_path)
+            with (
+                mock.patch(
+                    "logpile.subfleet.os.open",
+                    side_effect=deny_event_open,
+                ),
+                get_db(db_path) as conn,
+            ):
+                result = ingest_subfleet_events(conn, spool)
+
+            self.assertEqual((result.inserted, result.rejected), (0, 1))
+
     def test_sync_ingests_and_reconciles_after_native_transcript_parse(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1358,6 +1420,82 @@ class SubfleetEventTests(unittest.TestCase):
                 sorted(path.name for path in db_path.parent.iterdir()),
                 before_entries,
             )
+
+    def test_task_cli_maps_corrupt_database_errors_to_click_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "logpile.db"
+            db_path.write_bytes(b"this is not a SQLite database")
+            commands = (
+                ["task-list", "--db", str(db_path), "--json"],
+                [
+                    "task-timeline",
+                    _ref("task", 1),
+                    "--db",
+                    str(db_path),
+                    "--json",
+                ],
+            )
+
+            for command in commands:
+                with self.subTest(command=command[0]):
+                    result = CliRunner().invoke(cli, command)
+                    self.assertEqual(result.exit_code, 1, result.output)
+                    self.assertIn(
+                        "Could not read local task database",
+                        result.output,
+                    )
+                    self.assertNotIn("Traceback", result.output)
+
+    def test_invalid_spool_override_fails_before_local_or_cloud_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            invalid_spool = root / "private-runs"
+            with (
+                mock.patch("logpile.sync.sync_sessions") as local_sync,
+                mock.patch("logpile.backup.push_backup") as cloud_sync,
+            ):
+                result = CliRunner().invoke(
+                    cli,
+                    [
+                        "sync",
+                        "--backend",
+                        "both",
+                        "--db",
+                        str(root / "logpile.db"),
+                        "--shared",
+                        str(root / "shared"),
+                        "--db-url",
+                        "postgresql://example.invalid/logpile",
+                        "--subfleet-events-dir",
+                        str(invalid_spool),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 1, result.output)
+            self.assertIn("dedicated integration-events/v1 spool", result.output)
+            self.assertNotIn("Syncing local sessions", result.output)
+            local_sync.assert_not_called()
+            cloud_sync.assert_not_called()
+
+    def test_direct_sync_preflights_spool_before_creating_local_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "logpile.db"
+            shared = root / "shared"
+
+            with self.assertRaises(SubfleetSpoolError):
+                sync_sessions(
+                    shared_dir=shared,
+                    db_path=db_path,
+                    username="alice",
+                    machine="test-machine",
+                    home=root / "home",
+                    subfleet_events_dir=root / "private-runs",
+                )
+
+            self.assertFalse(db_path.exists())
+            self.assertFalse(shared.exists())
+            self.assertFalse(Path(f"{db_path}.sync.lock").exists())
 
     def test_task_cli_reads_clean_wal_database_in_readonly_directory(self) -> None:
         with tempfile.TemporaryDirectory() as td:

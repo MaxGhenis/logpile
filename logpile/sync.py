@@ -56,7 +56,11 @@ from .search import (
     backfill_search_index,
     replace_session_search_index,
 )
-from .subfleet import default_subfleet_spool, ingest_subfleet_events
+from .subfleet import (
+    default_subfleet_spool,
+    ingest_subfleet_events,
+    validate_subfleet_spool,
+)
 
 SESSION_ACTIVITY_VERSION = 1
 SESSION_NARRATIVE_VERSION = 1
@@ -1940,6 +1944,8 @@ def sync_sessions(
     usage-tracker launchd job overlapping a manual run) returns a typed
     lock-contended result instead of interleaving copies onto shared files.
     """
+    effective_subfleet_events_dir = subfleet_events_dir or default_subfleet_spool(home)
+    validate_subfleet_spool(effective_subfleet_events_dir)
     lock_path = Path(f"{db_path}.sync.lock")
     _secure_mkdir(lock_path.parent, harden_existing=False)
     lock_fd: int | None = None
@@ -1981,7 +1987,7 @@ def sync_sessions(
             machine,
             home,
             verbose,
-            subfleet_events_dir=subfleet_events_dir,
+            subfleet_events_dir=effective_subfleet_events_dir,
         )
 
 
