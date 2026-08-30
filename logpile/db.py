@@ -2819,6 +2819,19 @@ def get_db(db_path: Path):
         harden_database_files()
 
 
+@contextmanager
+def get_readonly_db(db_path: Path):
+    """Open an existing database without migrating or mutating its files."""
+    db_path = Path(db_path).resolve(strict=True)
+    conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def init_db(db_path: Path):
     db_path = Path(db_path)
     if not db_path.parent.exists():

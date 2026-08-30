@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import socket
+import sqlite3
 from datetime import UTC
 from pathlib import Path
 
@@ -682,12 +683,14 @@ def task_list_command(db: Path, limit: int, json_output: bool):
     if not db.is_file():
         raise click.ClickException(f"Local database not found: {db}")
 
-    from .db import get_db, init_db
+    from .db import get_readonly_db
     from .subfleet import list_tasks
 
-    init_db(db)
-    with get_db(db) as conn:
-        tasks = list_tasks(conn, limit=limit)
+    try:
+        with get_readonly_db(db) as conn:
+            tasks = list_tasks(conn, limit=limit)
+    except sqlite3.OperationalError as exc:
+        raise _task_database_error(exc) from exc
 
     payload = {"backend": "local", "tasks": tasks}
     if json_output:
@@ -728,15 +731,16 @@ def task_timeline_command(task_id: str, db: Path, json_output: bool):
     if not db.is_file():
         raise click.ClickException(f"Local database not found: {db}")
 
-    from .db import get_db, init_db
+    from .db import get_readonly_db
     from .subfleet import get_task_timeline
 
-    init_db(db)
     try:
-        with get_db(db) as conn:
+        with get_readonly_db(db) as conn:
             events = get_task_timeline(conn, task_id)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+    except sqlite3.OperationalError as exc:
+        raise _task_database_error(exc) from exc
     if not events:
         raise click.ClickException(f"No Subfleet events found for task '{task_id}'.")
 
@@ -757,6 +761,16 @@ def task_timeline_command(task_id: str, db: Path, json_output: bool):
         if event["outcome_status"]:
             line += f"  outcome={event['outcome_status']}({event['outcome_exit_code']})"
         click.echo(line)
+
+
+def _task_database_error(exc: sqlite3.OperationalError) -> click.ClickException:
+    """Map missing task views to the sync action that initializes them."""
+    message = str(exc)
+    if "no such table" in message.lower() or "no such view" in message.lower():
+        return click.ClickException(
+            "Task schema is not initialized; run 'logpile sync'."
+        )
+    return click.ClickException(f"Could not read local task database: {message}")
 
 
 @cli.command()

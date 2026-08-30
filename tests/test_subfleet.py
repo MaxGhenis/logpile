@@ -2,6 +2,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -655,6 +656,89 @@ class SubfleetEventTests(unittest.TestCase):
             task_payload = json.loads(task_list.output)
             self.assertEqual(task_payload["tasks"][0]["task_id"], _ref("task", 1))
             self.assertEqual(task_payload["tasks"][0]["providers"], ["claude"])
+
+    def test_task_cli_reads_while_writer_transaction_is_open(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            db_path = root / "logpile.db"
+            spool = _spool(root)
+            _write_events(spool, 1, [_started(event_number=1, run_number=1)])
+            init_db(db_path)
+            with get_db(db_path) as conn:
+                ingest_subfleet_events(conn, spool)
+
+            writer = sqlite3.connect(db_path)
+            try:
+                writer.execute("BEGIN IMMEDIATE")
+                task_list = CliRunner().invoke(
+                    cli,
+                    ["task-list", "--db", str(db_path), "--json"],
+                )
+                timeline = CliRunner().invoke(
+                    cli,
+                    [
+                        "task-timeline",
+                        _ref("task", 1),
+                        "--db",
+                        str(db_path),
+                        "--json",
+                    ],
+                )
+            finally:
+                writer.rollback()
+                writer.close()
+
+            self.assertEqual(task_list.exit_code, 0, task_list.output)
+            self.assertEqual(timeline.exit_code, 0, timeline.output)
+            self.assertEqual(
+                json.loads(task_list.output)["tasks"][0]["task_id"],
+                _ref("task", 1),
+            )
+            self.assertEqual(
+                json.loads(timeline.output)["events"][0]["event_type"],
+                "run.started",
+            )
+
+    def test_task_cli_does_not_migrate_uninitialized_database(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "logpile.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("CREATE TABLE sentinel (value TEXT)")
+            before_mtime = db_path.stat().st_mtime_ns
+            with sqlite3.connect(db_path) as conn:
+                before_schema = conn.execute(
+                    "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+                ).fetchall()
+
+            results = [
+                CliRunner().invoke(
+                    cli,
+                    ["task-list", "--db", str(db_path), "--json"],
+                ),
+                CliRunner().invoke(
+                    cli,
+                    [
+                        "task-timeline",
+                        _ref("task", 1),
+                        "--db",
+                        str(db_path),
+                        "--json",
+                    ],
+                ),
+            ]
+
+            with sqlite3.connect(db_path) as conn:
+                after_schema = conn.execute(
+                    "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+                ).fetchall()
+            self.assertTrue(
+                all(result.exit_code != 0 for result in results),
+                [result.output for result in results],
+            )
+            for result in results:
+                self.assertIn("Task schema is not initialized", result.output)
+            self.assertEqual(after_schema, before_schema)
+            self.assertEqual(db_path.stat().st_mtime_ns, before_mtime)
 
 
 if __name__ == "__main__":
