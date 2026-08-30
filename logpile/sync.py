@@ -56,6 +56,11 @@ from .search import (
     backfill_search_index,
     replace_session_search_index,
 )
+from .subfleet import (
+    default_subfleet_spool,
+    ingest_subfleet_events,
+    validate_subfleet_spool,
+)
 
 SESSION_ACTIVITY_VERSION = 1
 SESSION_NARRATIVE_VERSION = 1
@@ -1928,6 +1933,8 @@ def sync_sessions(
     machine: str,
     home: Path,
     verbose: bool = False,
+    *,
+    subfleet_events_dir: Path | None = None,
 ) -> SyncResult:
     """
     Discover, parse, and copy sessions.
@@ -1937,6 +1944,8 @@ def sync_sessions(
     usage-tracker launchd job overlapping a manual run) returns a typed
     lock-contended result instead of interleaving copies onto shared files.
     """
+    effective_subfleet_events_dir = subfleet_events_dir or default_subfleet_spool(home)
+    validate_subfleet_spool(effective_subfleet_events_dir)
     lock_path = Path(f"{db_path}.sync.lock")
     _secure_mkdir(lock_path.parent, harden_existing=False)
     lock_fd: int | None = None
@@ -1971,7 +1980,15 @@ def sync_sessions(
             # to humans and scripts checking the summary line.
             print("Skipped: another logpile sync holds the lock.", file=sys.stderr)
             return SyncLockContended(0, 0, 0)
-        return _sync_sessions(shared_dir, db_path, username, machine, home, verbose)
+        return _sync_sessions(
+            shared_dir,
+            db_path,
+            username,
+            machine,
+            home,
+            verbose,
+            subfleet_events_dir=effective_subfleet_events_dir,
+        )
 
 
 def _sync_sessions(
@@ -1981,6 +1998,8 @@ def _sync_sessions(
     machine: str,
     home: Path,
     verbose: bool = False,
+    *,
+    subfleet_events_dir: Path | None = None,
 ) -> SyncResult:
     """Locked body of sync_sessions."""
     init_db(db_path)
@@ -2813,6 +2832,34 @@ def _sync_sessions(
                 if verbose:
                     short = session_id[-20:] if len(session_id) > 20 else session_id
                     print(f"  {action}: …{short} ({project})")
+
+        event_result = ingest_subfleet_events(
+            conn,
+            subfleet_events_dir or default_subfleet_spool(home),
+            ingested_at=now,
+        )
+        if event_result.rejected:
+            print(
+                "Warning: rejected "
+                f"{event_result.rejected} unsafe or malformed Subfleet "
+                "integration event item(s).",
+                file=sys.stderr,
+            )
+        if verbose and any(
+            (
+                event_result.inserted,
+                event_result.duplicates,
+                event_result.rejected,
+                event_result.reconciled,
+            )
+        ):
+            print(
+                "  Subfleet events: "
+                f"{event_result.inserted} new, "
+                f"{event_result.duplicates} duplicate, "
+                f"{event_result.rejected} rejected, "
+                f"{event_result.reconciled} reconciled"
+            )
 
         backfilled, backfill_affected = _backfill_tokens_from_shared(
             conn, verbose=verbose
