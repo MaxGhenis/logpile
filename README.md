@@ -107,6 +107,13 @@ the planned copy count/volume and available free space; it refuses an
 insufficient-space plan. A source hash/mtime is committed only after the shared
 copy matches that hash, and failed verification is persisted for retry.
 
+On macOS with APFS, each shared copy is a `clonefile(2)` clone: an independent
+0600 file that shares data blocks with its source until either one changes, so
+it still survives the source being appended or deleted but costs almost no
+space. Other platforms and volumes (or a cross-volume shared directory) fall
+back to a byte copy. The free-space preflight stays byte-based because any copy
+may take that fallback.
+
 #### Token accounting
 
 - **Codex** `token_count` events carry *cumulative* counters, and resuming or
@@ -168,6 +175,40 @@ per-repo rollups) read `native_*`. Per-session rows in the UI still show
 transcript totals. `user_message_count` and `tool_call_count` remain
 transcript-level everywhere (only assistant records carry the identity
 needed for claims).
+
+### `logpile reclone-shared`
+
+One-time migration for shared copies written before sync cloned. It reclaims
+the space of every shared copy that is byte-identical to a source that still
+exists:
+
+```bash
+./logpile.sh reclone-shared            # dry run: counts, bytes, projected free space
+./logpile.sh reclone-shared --apply    # replace verified copies with clones
+```
+
+```
+Options:
+  --apply                  Replace verified identical copies (default: dry run)
+  --db PATH                SQLite database    [default: ~/logpile/logpile.db]
+  --shared-dir PATH        Shared directory   [default: ~/logpile/shared]
+  -v, --verbose            Print every file decision
+```
+
+For each `sessions.shared_path` under the shared directory or its private
+archive (`.shared-private`), the command requires the shared copy and
+`source_path` to be regular files (no symlinks) with the same size and the same
+full sha256. With `--apply` it clones the source into a temporary sibling,
+checks that the clone's sha256 matches the shared copy, confirms that the shared
+copy did not change during the run, and renames the clone over it with mode
+0600. Each file is always either the old full copy or a verified clone, so
+the run is safe to interrupt. Copies whose source is gone are sole survivors
+and are never touched. The command holds the sync lock for the whole run and
+exits with status 75 if a sync already holds it. It opens the database
+read-only. The report lists skips by reason, logical and reclaimable bytes (APFS
+private bytes), and `df` free space before and after. Blocks still held by APFS
+snapshots, such as Time Machine local snapshots, come back only when those
+snapshots expire.
 
 ### `logpile search` / `logpile show` / `logpile status`
 

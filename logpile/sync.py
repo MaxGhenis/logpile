@@ -5,17 +5,21 @@ import fcntl
 import fnmatch
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
+from . import apfs
 from .db import (
     SEARCH_INDEX_VERSION,
     apply_message_claims,
@@ -429,6 +433,146 @@ def _private_quarantine_path(private_root: Path, original: Path, suffix: str) ->
     return _temporary_sibling(quarantine_dir / original.name, suffix)
 
 
+_CLONE_TEMP_SUFFIX = ".tmp-sync"
+_CLONE_NAME_ATTEMPTS = 100
+
+
+def _discard_temporary(path: Path) -> None:
+    """Best-effort removal of a staging path this process created.
+
+    A clone of a directory (a source swapped for a directory mid-copy) is a
+    whole tree whose directories keep their source modes, possibly without
+    owner write, so grant owner access before retrying a failed removal.
+    """
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return
+    try:
+        if not stat.S_ISDIR(mode):
+            path.unlink()
+            return
+
+        def _grant_and_retry(function, target, _exc) -> None:
+            parent = os.path.dirname(target)
+            for directory in (parent, target):
+                try:
+                    if stat.S_ISDIR(os.lstat(directory).st_mode):
+                        os.chmod(directory, 0o700)
+                except OSError:
+                    pass
+            function(target)
+
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=_grant_and_retry)
+        else:  # pragma: no cover - exercised only on Python 3.11
+            shutil.rmtree(
+                path,
+                onerror=lambda function, target, info: _grant_and_retry(
+                    function, target, info[1]
+                ),
+            )
+    except OSError:
+        pass
+
+
+def _finalize_clone(src: Path, tmp: Path) -> bool:
+    """Make a fresh clone private, regular, and durable before it is published.
+
+    Returns False when the clone carries an extended ACL (only possible on
+    macOS releases whose clonefile(2) copies source ACLs, or under an
+    inheriting destination ACL); the caller then discards it and falls back to
+    the byte copy, which is what it would have produced before cloning.
+    Raises StorageSafetyError for anything but a regular file.
+    """
+    staged = tmp.lstat()
+    mode = staged.st_mode
+    if not stat.S_ISREG(mode):
+        kind = (
+            "directory"
+            if stat.S_ISDIR(mode)
+            else "symlink"
+            if stat.S_ISLNK(mode)
+            else "non-regular"
+        )
+        raise StorageSafetyError(f"Refusing {kind} clone of {src}: {tmp}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(tmp, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            staged.st_dev,
+            staged.st_ino,
+        ):
+            raise StorageSafetyError(f"Refusing replaced clone of {src}: {tmp}")
+        os.fchmod(fd, 0o600)
+        if apfs.has_extended_acl(fd):
+            return False
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return True
+
+
+def _clone_to_temporary_sibling(src: Path, dst: Path) -> Path | None:
+    """Clone src into a new 0600 regular file beside dst, or return None.
+
+    None means cloning does not apply here and the caller should byte-copy:
+    the platform or volume cannot clone, src (after following symlinks, the
+    same semantics as ``src.open``) is not a regular file, the staging
+    directory is reachable by other users, or the clone carries an ACL.  Any
+    other failure raises, and no staging file survives either outcome.
+
+    clonefile(2) copies the source's mode bits, so the clone can briefly be
+    0644 before the fchmod in _finalize_clone.  Every managed caller creates
+    or re-secures dst.parent as 0700 (_secure_managed_mkdir for the shared and
+    private roots, _secure_mkdir otherwise) before calling this, so that mode
+    is never visible to another user.  The group/other check below enforces
+    that precondition instead of assuming it.
+    """
+    if not apfs.clone_available():
+        return None
+    # Follows symlinks like src.open(); errors (missing source, EACCES)
+    # propagate exactly as the byte-copy path would raise them.
+    if not stat.S_ISREG(os.stat(src).st_mode):
+        return None
+    if os.stat(dst.parent).st_mode & 0o077:
+        return None
+
+    tmp: Path | None = None
+    for _ in range(_CLONE_NAME_ATTEMPTS):
+        candidate = dst.with_name(
+            f".{dst.name}.{secrets.token_hex(8)}{_CLONE_TEMP_SUFFIX}"
+        )
+        try:
+            apfs.clonefile(src, candidate)
+        except FileExistsError:
+            # Someone else's file: never discard it, just pick a new name.
+            continue
+        except apfs.CloneUnsupported:
+            return None
+        except BaseException:
+            # clonefile(2) is atomic, but an interrupt can land after it
+            # returned; the random name in a 0700 directory is ours.
+            _discard_temporary(candidate)
+            raise
+        tmp = candidate
+        break
+    if tmp is None:
+        raise StorageSafetyError(f"Could not reserve a clone name beside {dst}")
+
+    try:
+        if not _finalize_clone(src, tmp):
+            _discard_temporary(tmp)
+            return None
+    except BaseException:
+        _discard_temporary(tmp)
+        raise
+    return tmp
+
+
 def _secure_copy_file(
     src: Path,
     dst: Path,
@@ -436,7 +580,13 @@ def _secure_copy_file(
     private_root: Path | None = None,
     shared_root: Path | None = None,
 ) -> None:
-    """Copy bytes to a 0600 staging file and atomically replace lexical dst."""
+    """Copy src to a 0600 staging file and atomically replace lexical dst.
+
+    On APFS the staging file is a copy-on-write clone: an independent file
+    that shares data blocks with src until either side changes, so the copy
+    survives the source being appended or deleted.  Volumes or platforms that
+    cannot clone fall back to the byte copy below.
+    """
     if private_root is not None and shared_root is not None:
         raise ValueError("A copy destination cannot have two managed roots")
     if private_root is not None:
@@ -445,6 +595,14 @@ def _secure_copy_file(
         _secure_shared_mkdir(dst.parent, shared_root)
     else:
         _secure_mkdir(dst.parent)
+    clone = _clone_to_temporary_sibling(src, dst)
+    if clone is not None:
+        try:
+            os.replace(clone, dst)
+        except BaseException:
+            _discard_temporary(clone)
+            raise
+        return
     fd, temp_name = tempfile.mkstemp(
         prefix=f".{dst.name}.", suffix=".tmp-sync", dir=dst.parent
     )
@@ -1932,7 +2090,30 @@ def sync_sessions(
     usage-tracker launchd job overlapping a manual run) returns a typed
     lock-contended result instead of interleaving copies onto shared files.
     """
-    lock_path = Path(f"{db_path}.sync.lock")
+    with sync_lock(db_path) as acquired:
+        if not acquired:
+            # Always audible: a silent (0, 0, 0) reads as "synced, all quiet"
+            # to humans and scripts checking the summary line.
+            print("Skipped: another logpile sync holds the lock.", file=sys.stderr)
+            return SyncLockContended(0, 0, 0)
+        return _sync_sessions(shared_dir, db_path, username, machine, home, verbose)
+
+
+def sync_lock_path(db_path: Path) -> Path:
+    return Path(f"{db_path}.sync.lock")
+
+
+@contextmanager
+def sync_lock(db_path: Path) -> Iterator[bool]:
+    """Hold the exclusive per-database storage lock that serializes syncs.
+
+    Yields True while the lock is held, or False (holding nothing) when
+    another process holds it.  Raises SyncLockError when the lock path is
+    unsafe or the filesystem cannot lock, so callers never mistake a broken
+    lock for mere contention.  Anything that rewrites managed storage in bulk
+    (sync, reclone-shared) takes this lock so the two never interleave.
+    """
+    lock_path = sync_lock_path(db_path)
     _secure_mkdir(lock_path.parent, harden_existing=False)
     lock_fd: int | None = None
     try:
@@ -1962,11 +2143,9 @@ def sync_sessions(
                 raise SyncLockError(
                     f"Could not acquire sync lock {lock_path}: {exc}"
                 ) from exc
-            # Always audible: a silent (0, 0, 0) reads as "synced, all quiet"
-            # to humans and scripts checking the summary line.
-            print("Skipped: another logpile sync holds the lock.", file=sys.stderr)
-            return SyncLockContended(0, 0, 0)
-        return _sync_sessions(shared_dir, db_path, username, machine, home, verbose)
+            yield False
+            return
+        yield True
 
 
 def _sync_sessions(
