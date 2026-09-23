@@ -14,11 +14,11 @@ import struct
 import sys
 from functools import cache
 
-# <sys/clonefile.h>.  CLONE_ACL is deliberately never passed: on macOS 13+
-# the clone then inherits the destination directory's ACLs exactly as a newly
-# created file would, instead of copying the source's.  Older releases copied
-# source ACLs unconditionally, which is why logpile.sync also refuses to keep
-# any clone that ends up carrying an extended ACL.
+# <sys/clonefile.h>.  CLONE_ACL ("copy ACLs from the source file", per
+# clonefile(2)) is deliberately never passed, so a clone should not carry the
+# source's ACL (tests/test_clone_storage.py checks this on macOS).  logpile.sync
+# still refuses to keep any clone that ends up with an extended ACL, whatever
+# its origin, and byte-copies instead.
 CLONE_NOOWNERCOPY = 0x0002
 
 # errno values meaning "this volume or pair of paths cannot clone"; callers

@@ -479,11 +479,11 @@ def _discard_temporary(path: Path) -> None:
 def _finalize_clone(src: Path, tmp: Path) -> bool:
     """Make a fresh clone private, regular, and durable before it is published.
 
-    Returns False when the clone carries an extended ACL (only possible on
-    macOS releases whose clonefile(2) copies source ACLs, or under an
-    inheriting destination ACL); the caller then discards it and falls back to
-    the byte copy, which is what it would have produced before cloning.
-    Raises StorageSafetyError for anything but a regular file.
+    Returns False when the clone carries an extended ACL.  CLONE_ACL is never
+    passed, so that should not happen, but an ACL could grant access beyond
+    0600; the caller then discards the clone and falls back to the byte copy,
+    which is what it would have produced before cloning.  Raises
+    StorageSafetyError for anything but a regular file.
     """
     staged = tmp.lstat()
     mode = staged.st_mode
