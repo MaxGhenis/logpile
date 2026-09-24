@@ -111,8 +111,11 @@ On macOS with APFS, each shared copy is a `clonefile(2)` clone: an independent
 0600 file that shares data blocks with its source until either one changes, so
 it still survives the source being appended or deleted but costs almost no
 space. Other platforms and volumes (or a cross-volume shared directory) fall
-back to a byte copy. The free-space preflight stays byte-based because any copy
-may take that fallback.
+back to a byte copy, as does a source carrying the immutable (`uchg`),
+append-only (`uappnd`) or any superuser file flag. A clone keeps its source's
+modified time and extended attributes. It drops the source's other BSD file
+flags except `compressed`, which marks where a compressed file's bytes live. The
+free-space preflight stays byte-based because any copy may take the fallback.
 
 #### Token accounting
 
@@ -197,18 +200,37 @@ Options:
 
 For each `sessions.shared_path` under the shared directory or its private
 archive (`.shared-private`), the command requires the shared copy and
-`source_path` to be regular files (no symlinks) with the same size and the same
-full sha256. With `--apply` it clones the source into a temporary sibling,
-checks that the clone's sha256 matches the shared copy, confirms that the shared
-copy did not change during the run, and renames the clone over it with mode
-0600. Each file is always either the old full copy or a verified clone, so
-the run is safe to interrupt. Copies whose source is gone are sole survivors
-and are never touched. The command holds the sync lock for the whole run and
-exits with status 75 if a sync already holds it. It opens the database
-read-only. The report lists skips by reason, logical and reclaimable bytes (APFS
-private bytes), and `df` free space before and after. Blocks still held by APFS
-snapshots, such as Time Machine local snapshots, come back only when those
-snapshots expire.
+`source_path` to be regular files (no symlinks) on the same volume, with the
+same size and the same full sha256. It skips a copy that is already a clone of
+its source (the two share an APFS clone id) without hashing it. It never
+touches a copy with other hard links, because replacing one name would free
+nothing, or a copy whose source is gone, because that copy is the sole survivor.
+
+With `--apply` it clones the source into a temporary sibling. It checks that
+the clone's sha256 matches the shared copy and that the shared copy has not
+changed since it was hashed. Then it swaps the clone into place atomically with
+`renamex_np(RENAME_SWAP)`, and the result has mode 0600. The swap fails, rather
+than recreating the file, if a visibility change (`logpile private`, for
+example) moved the copy away in the meantime. If another file replaced the copy,
+that file gets its name back. Each file is always either the old full copy or a
+verified clone, so the run is safe to interrupt, even with `kill -9`. A killed
+run can leave a `*.tmp-sync` staging file. The next run removes a staging file
+once it is more than 10 minutes old, but only if it is byte-identical to the
+copy beside it. It reports any other staging file and leaves it in place.
+
+The command holds the sync lock for the whole run and exits with status 75 if a
+sync already holds it. It creates the lock file if it is missing. It opens the
+database read-only. SQLite may still create empty `-wal` and `-shm` sidecar
+files next to a WAL-mode database. The report lists skips by reason and `df`
+free space before and after. It gives two reclaim figures:
+
+- **Frees now**: the old copies' APFS private bytes, which deleting them frees
+  immediately.
+- **Frees up to**: their allocated bytes.
+
+The two differ when an APFS snapshot, such as a Time Machine local snapshot
+(`tmutil listlocalsnapshots /`), or another clone still holds the old copies'
+blocks. Blocks a snapshot holds come back only when that snapshot is deleted.
 
 ### `logpile search` / `logpile show` / `logpile status`
 
