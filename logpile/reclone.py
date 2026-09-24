@@ -115,6 +115,7 @@ STAGING_OTHER_OWNER = "other_owner"
 STAGING_UNSAFE_ANCESTRY = "unsafe_ancestry"
 STAGING_NO_COPY = "no_published_copy"
 STAGING_DIFFERS = "differs"
+STAGING_CHANGED = "changed"
 STAGING_ERROR = "error"
 
 # A live staging file exists for milliseconds (a clone) to seconds (a byte
@@ -130,6 +131,7 @@ STAGING_KEPT_REASONS = (
     STAGING_UNSAFE_ANCESTRY,
     STAGING_NO_COPY,
     STAGING_DIFFERS,
+    STAGING_CHANGED,
     STAGING_ERROR,
 )
 
@@ -143,6 +145,7 @@ STAGING_KEPT_DESCRIPTIONS = {
     STAGING_UNSAFE_ANCESTRY: "symlink or non-directory between the root and it",
     STAGING_NO_COPY: "no regular published copy beside it to compare with",
     STAGING_DIFFERS: "bytes differ from the published copy beside it",
+    STAGING_CHANGED: "it or the copy beside it changed while they were compared",
     STAGING_ERROR: "could not be read or removed",
 }
 
@@ -180,7 +183,9 @@ class RecloneReport:
     recloned_bytes: int = 0
     # APFS private bytes of those old copies: freed as soon as they are gone.
     reclaim_now_bytes: int = 0
-    reclaim_now_estimated: bool = False
+    # Copies whose volume reported no private size; their allocated size
+    # stands in for it.
+    reclaim_now_estimated: int = 0
     # Their allocated bytes: the most a reclone can free, once no APFS
     # snapshot (or other clone) still holds the old copies' blocks.
     reclaim_eventual_bytes: int = 0
@@ -206,6 +211,7 @@ class _Candidate:
     shared_stat: os.stat_result
     shared_sha256: str
     reclaim_now: int
+    reclaim_now_estimated: bool
     reclaim_eventual: int
 
 
@@ -315,10 +321,14 @@ class _Recloner:
 
         A staging file is removed only when it is a regular file this user
         owns, older than STAGING_MIN_AGE_SECONDS, under a symlink-free
-        ancestry, and byte-identical to the published copy beside it.  That
+        ancestry, and byte-identical to the published copy beside it, with
+        neither file changed or replaced while the two were compared.  That
         covers both leftovers a killed reclone can produce (the verified
-        clone before the swap, the displaced old copy after it) and never
-        deletes bytes that exist nowhere else.
+        clone before the swap, the displaced old copy after it), and at the
+        moment of the check its bytes also exist in the published copy.  A
+        writer that replaces the published copy in the instant between that
+        final check and the unlink goes unnoticed; this command holds the
+        sync lock, so only an unlocked visibility transition could do that.
         """
         if not _is_real_directory(root):
             return
@@ -385,11 +395,22 @@ class _Recloner:
             identical = copy.st_size == staged.st_size and file_hash(path) == file_hash(
                 published
             )
+            # The hashes describe the files only if neither changed or was
+            # replaced meanwhile (a hash reads an inode already opened).
+            unchanged = _identity(path.lstat()) == _identity(staged) and _identity(
+                published.lstat()
+            ) == _identity(copy)
+        except FileNotFoundError:
+            self._keep_staging(STAGING_CHANGED, path)
+            return
         except OSError as exc:
             self._keep_staging(STAGING_ERROR, path, str(exc))
             return
         if not identical:
             self._keep_staging(STAGING_DIFFERS, path)
+            return
+        if not unchanged:
+            self._keep_staging(STAGING_CHANGED, path)
             return
         if apply:
             _discard_temporary(path)
@@ -447,6 +468,7 @@ class _Recloner:
         report.recloned += 1
         report.recloned_bytes += candidate.shared_stat.st_size
         report.reclaim_now_bytes += candidate.reclaim_now
+        report.reclaim_now_estimated += candidate.reclaim_now_estimated
         report.reclaim_eventual_bytes += candidate.reclaim_eventual
 
     def examine(self, shared: Path, source: Path, root: Path) -> _Candidate | None:
@@ -504,10 +526,10 @@ class _Recloner:
 
         allocated = shared_stat.st_blocks * 512
         reclaim_now = shared_storage.private_size
-        if reclaim_now is None:
+        estimated = reclaim_now is None
+        if estimated:
             # No APFS accounting: allocated blocks are the best upper bound.
             reclaim_now = allocated
-            self.report.reclaim_now_estimated = True
 
         shared_sha256 = file_hash(shared)
         if file_hash(source) != shared_sha256:
@@ -520,6 +542,7 @@ class _Recloner:
             shared_stat=shared_stat,
             shared_sha256=shared_sha256,
             reclaim_now=reclaim_now,
+            reclaim_now_estimated=estimated,
             reclaim_eventual=allocated,
         )
 
@@ -587,38 +610,40 @@ class _Recloner:
         that a visibility transition moved away after the identity check (it
         fails with ENOENT instead) nor silently discard a file that replaced
         the copy (the swapped-out file is checked, and swapped back if it is
-        not the copy that was hashed).  Where swapping is unsupported, this
-        falls back to os.replace.
+        not the copy that was hashed).  A volume that cannot swap is skipped
+        rather than served by os.replace, which could recreate a moved copy.
 
-        However this returns or raises, the staging name is tidied last: it is
-        removed only while it holds our clone or the displaced old copy.
+        However this returns or raises, the staging name is tidied last (see
+        _tidy): it is removed only while it holds our clone or the old copy,
+        unchanged since it was hashed.
         """
         shared = candidate.shared
-        old = _inode(candidate.shared_stat)
         try:
             try:
                 apfs.rename_swap(clone, shared)
-            except apfs.SwapUnsupported:
-                os.replace(clone, shared)
-                return None, ""
+            except apfs.SwapUnsupported as exc:
+                return CLONE_UNSUPPORTED, str(exc)
             except FileNotFoundError:
                 return SHARED_CHANGED, "moved away before the swap"
             displaced = clone.lstat()
             if _swapped_identity(displaced) == _swapped_identity(candidate.shared_stat):
                 return None, ""
-            # Replaced after the identity check: give that file its name back.
+            # Replaced or changed after the identity check: give that file its
+            # name back.
             apfs.rename_swap(clone, shared)
-            return SHARED_CHANGED, "replaced before the swap; restored"
+            return SHARED_CHANGED, "replaced or changed before the swap; restored"
         finally:
-            self._tidy(clone, ours, old, shared)
+            self._tidy(clone, ours, candidate)
 
-    def _tidy(
-        self,
-        clone: Path,
-        ours: tuple[int, int],
-        old: tuple[int, int],
-        shared: Path,
-    ) -> None:
+    def _tidy(self, clone: Path, ours: tuple[int, int], candidate: _Candidate) -> None:
+        """Remove the staging name if it holds a file this run may discard.
+
+        That is our own clone (not yet swapped in, or swapped back out), or
+        the displaced old copy still exactly as it was hashed, whose bytes
+        the published clone now holds.  Anything else stays: a file that
+        replaced the copy, or the old copy after an in-place change (possible
+        when an interrupt lands between the swap and its check).
+        """
         try:
             left = clone.lstat()
         except FileNotFoundError:
@@ -626,10 +651,12 @@ class _Recloner:
         except OSError as exc:
             self.report.errors.append(f"{clone}: cannot inspect staging file: {exc}")
             return
-        if _inode(left) not in (ours, old):
+        if _inode(left) != ours and _swapped_identity(left) != _swapped_identity(
+            candidate.shared_stat
+        ):
             self.report.errors.append(
-                f"{clone}: left in place; it holds a file that replaced "
-                f"{shared} during the swap"
+                f"{clone}: left in place; it holds a file that replaced or "
+                f"changed {candidate.shared} during the swap"
             )
             return
         _discard_temporary(clone)
@@ -723,11 +750,12 @@ def format_report(report: RecloneReport) -> list[str]:
         f"{verb}: {_files(report.recloned)}, "
         f"{_format_copy_volume(report.recloned_bytes)} logical"
     )
-    now_note = (
-        "allocated-size estimate; APFS reported no private size"
-        if report.reclaim_now_estimated
-        else "APFS private bytes"
-    )
+    now_note = "APFS private bytes"
+    if report.reclaim_now_estimated:
+        now_note += (
+            f"; allocated size stands in for {_files(report.reclaim_now_estimated)} "
+            "whose volume reported none"
+        )
     lines.append(
         f"  Frees now:    {_format_bytes(report.reclaim_now_bytes)} ({now_note})"
     )

@@ -558,6 +558,9 @@ class CloneCopyTests(unittest.TestCase):
             compressed.lstat().st_flags & stat.UF_COMPRESSED
         ):
             self.skipTest("ditto could not make an HFS-compressed file here")
+        # A cosmetic flag too, so the clear-all-but-compressed mask does work.
+        os.chflags(compressed, stat.UF_COMPRESSED | stat.UF_HIDDEN)
+        self.addCleanup(clear_flags, compressed)
         with forbid_byte_copy():
             _secure_copy_file(compressed, self.dst, shared_root=self.shared)
         info = self.dst.lstat()
@@ -576,9 +579,17 @@ class CloneCopyTests(unittest.TestCase):
 
         with (
             mock.patch.object(apfs, "clonefile", side_effect=clone_then_lock),
+            # Flags change through the verified descriptor, never the path.
+            mock.patch.object(
+                sync_module.os, "lchflags", side_effect=AssertionError("by path")
+            ),
+            mock.patch.object(
+                apfs, "set_file_flags", wraps=apfs.set_file_flags
+            ) as set_flags,
             forbid_byte_copy(),
         ):
             self._copy()
+        set_flags.assert_called_once()
         info = self.dst.lstat()
         self.assertEqual(info.st_flags, 0)
         self.assertEqual(info.st_mode & 0o777, 0o600)
@@ -751,6 +762,8 @@ class ClonefileWrapperTests(unittest.TestCase):
             replace(clone, fsid=(2, 26)),  # ids are per volume
             replace(clone, clone_id=None),
             replace(clone, fsid=None),
+            replace(clone, ext_flags=0x3),  # the source must share too
+            replace(clone, ext_flags=None),
             apfs.FileStorage(),
         ):
             with self.subTest(other=other):
@@ -1506,16 +1519,96 @@ class RecloneSharedTests(_RecloneFixture):
         self.assertEqual(kept[0].read_bytes(), replacement)
         self.assertTrue(any("left in place" in error for error in report.errors))
 
-    def test_swap_unsupported_falls_back_to_replace(self) -> None:
+    def test_volume_without_swap_is_skipped_untouched(self) -> None:
+        # os.replace could recreate a copy a visibility change moved away, so
+        # a volume that cannot swap is skipped, never served by it.
         source, shared = self._pair("no-swap")
-        inode = shared.stat().st_ino
+        before = self._snapshot(source, shared)
         unsupported = apfs.SwapUnsupported("no swaps here", errno.ENOTSUP)
-        with simulated_clone(swap=unsupported):
+        with (
+            simulated_clone(swap=unsupported) as spy,
+            mock.patch.object(
+                reclone_module.os, "replace", side_effect=AssertionError("replace")
+            ),
+        ):
             report = self._run(apply=True)
-        self.assertEqual(report.recloned, 1)
-        self.assertNotEqual(shared.stat().st_ino, inode)
-        self.assertEqual(shared.read_bytes(), source.read_bytes())
+        spy.assert_called_once()
+        self.assertEqual(report.recloned, 0)
+        self.assertEqual(report.skipped[reclone_module.CLONE_UNSUPPORTED], 1)
+        self.assertEqual(self._snapshot(source, shared), before)
         self.assertEqual(self._leftovers(), [])
+
+    def test_interrupt_after_the_swap_keeps_an_original_changed_in_place(
+        self,
+    ) -> None:
+        """An in-place write to the old copy just before the swap, then an
+        interrupt before the swapped-out file is checked: the changed bytes
+        must survive (Astra review, finding 2)."""
+        _, shared = self._pair("rewritten")
+        original = shared.read_bytes()
+        rewritten = bytes(reversed(original))
+
+        def rewrite_swap_interrupt(first, second):
+            with open(second, "r+b") as handle:  # same inode, new bytes
+                handle.write(rewritten)
+            portable_rename_swap(first, second)
+            raise KeyboardInterrupt
+
+        with (
+            simulated_clone(swap=rewrite_swap_interrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self._run(apply=True)
+
+        self.assertEqual(shared.read_bytes(), original)  # the verified clone
+        kept = self._leftovers()
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_bytes(), rewritten)
+
+    def test_failed_swap_back_keeps_an_original_changed_in_place(self) -> None:
+        _, shared = self._pair("rewritten-then-stuck")
+        original = shared.read_bytes()
+        appended = original + b"written in place\n"
+        calls: list[int] = []
+
+        def append_then_swap(first, second):
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError(errno.EIO, "swap back failed")
+            with open(second, "ab") as handle:
+                handle.write(b"written in place\n")
+            portable_rename_swap(first, second)
+
+        with simulated_clone(swap=append_then_swap):
+            report = self._run(apply=True)
+
+        self.assertEqual(report.skipped[reclone_module.ERROR], 1)
+        self.assertEqual(shared.read_bytes(), original)
+        kept = self._leftovers()
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_bytes(), appended)
+        self.assertTrue(any("left in place" in error for error in report.errors))
+
+    def test_reclaim_estimate_is_counted_per_file(self) -> None:
+        measured_source, measured = self._pair("measured")
+        unmeasured_source, unmeasured = self._pair("unmeasured")
+        overrides = {
+            measured_source: apfs.FileStorage(fsid=(1, 1), clone_id=3),
+            unmeasured_source: apfs.FileStorage(fsid=(1, 1), clone_id=4),
+            measured: apfs.FileStorage(fsid=(1, 1), clone_id=1, private_size=4096),
+            unmeasured: apfs.FileStorage(fsid=(1, 1), clone_id=2),
+        }
+        with storage_overrides(overrides):
+            report = self._run(apply=False)
+        self.assertEqual(report.recloned, 2)
+        self.assertEqual(report.reclaim_now_estimated, 1)
+        self.assertEqual(
+            report.reclaim_now_bytes, 4096 + unmeasured.stat().st_blocks * 512
+        )
+        self.assertIn(
+            "allocated size stands in for 1 file whose volume reported none",
+            "\n".join(reclone_module.format_report(report)),
+        )
 
     @needs_darwin_clone
     def test_darwin_sigkill_during_apply_never_leaves_a_partial_copy(self) -> None:
@@ -1650,6 +1743,30 @@ class StaleStagingSweepTests(_RecloneFixture):
             self._snapshot(differs, orphan, link, target, unrelated), before
         )
         self.assertTrue((directory_clone / "inner").exists())
+
+    def test_published_copy_replaced_mid_compare_keeps_the_leftover(self) -> None:
+        """Astra review, finding 1: a hash reads an inode it already opened,
+        so a copy replaced mid-hash must not vouch for the leftover."""
+        leftover = self._staging("8888888888888888")
+        leftover_bytes = leftover.read_bytes()
+        real_hash = reclone_module.file_hash
+
+        def hash_then_republish(path):
+            digest = real_hash(path)
+            if Path(path) == self.published:
+                replacement = self.published.with_name("republished")
+                replacement.write_bytes(b"revision B\n")
+                os.replace(replacement, self.published)
+            return digest
+
+        with mock.patch.object(
+            reclone_module, "file_hash", side_effect=hash_then_republish
+        ):
+            report = self._run_old_enough(apply=True)
+
+        self.assertEqual(report.staging_removed, 0)
+        self.assertEqual(report.staging_kept[reclone_module.STAGING_CHANGED], 1)
+        self.assertEqual(leftover.read_bytes(), leftover_bytes)
 
     def test_recent_leftovers_are_left_for_a_running_copy(self) -> None:
         fresh = self._staging("5555555555555555")

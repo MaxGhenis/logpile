@@ -99,11 +99,18 @@ class FileStorage:
     private_size: int | None = None
     ext_flags: int | None = None
 
+    def shares_all_blocks(self) -> bool:
+        return self.ext_flags is not None and bool(
+            self.ext_flags & EF_SHARES_ALL_BLOCKS
+        )
+
     def is_clone_of(self, other: FileStorage) -> bool:
         """Whether both files are the same data stream on the same volume.
 
         True means the two already share every data block, so recloning one
-        from the other frees nothing.  Unknown values never count as a match:
+        from the other frees nothing: the same non-zero clone id on the same
+        real volume, with APFS reporting EF_SHARES_ALL_BLOCKS ("a full clone
+        of another file") for both.  Unknown values never count as a match:
         the caller then verifies and reclones, which is always safe.
         """
         return (
@@ -111,8 +118,8 @@ class FileStorage:
             and self.fsid == other.fsid
             and bool(self.clone_id)
             and self.clone_id == other.clone_id
-            and self.ext_flags is not None
-            and bool(self.ext_flags & EF_SHARES_ALL_BLOCKS)
+            and self.shares_all_blocks()
+            and other.shares_all_blocks()
         )
 
 
@@ -169,6 +176,12 @@ def _renamex_function():
         (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint),
         ctypes.c_int,
     )
+
+
+@cache
+def _fchflags_function():
+    # <sys/stat.h>: int fchflags(int, __uint32_t)
+    return _symbol("fchflags", (ctypes.c_int, ctypes.c_uint32), ctypes.c_int)
 
 
 @cache
@@ -252,6 +265,21 @@ def rename_swap(first: os.PathLike | str, second: os.PathLike | str) -> None:
             error,
         )
     raise OSError(error, os.strerror(error), os.fspath(first), None, os.fspath(second))
+
+
+def set_file_flags(fd: int, flags: int) -> None:
+    """Set the open file's BSD flags (fchflags(2)), acting on the descriptor
+    rather than a path.  Python's os.chflags takes paths only.  Raises OSError."""
+    function = _fchflags_function()
+    if function is None:
+        raise OSError(errno.ENOSYS, "fchflags(2) is unavailable on this platform")
+    while True:
+        ctypes.set_errno(0)
+        if function(fd, flags) == 0:
+            return
+        error = ctypes.get_errno()
+        if error != errno.EINTR:
+            raise OSError(error, os.strerror(error))
 
 
 def file_storage(path: os.PathLike | str) -> FileStorage | None:

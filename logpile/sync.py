@@ -437,7 +437,9 @@ _CLONE_TEMP_SUFFIX = ".tmp-sync"
 _CLONE_NAME_ATTEMPTS = 100
 # Staging files beside a managed copy: ".{name}.{16 hex}.tmp-sync" from the
 # clone path, ".{name}.{8 mkstemp chars}.tmp-sync" from the byte-copy path.
-# A process killed between staging and os.replace leaves one behind.
+# A process killed between staging and os.replace leaves one behind.  sync
+# never sweeps them; ``logpile reclone-shared`` lists them and, with --apply,
+# removes the ones that are byte-identical to the copy beside them.
 STAGING_NAME_PATTERN = re.compile(
     r"^\.(?P<name>.+)\.(?:[0-9a-f]{16}|[a-z0-9_]{8})"
     + re.escape(_CLONE_TEMP_SUFFIX)
@@ -566,13 +568,9 @@ def _finalize_clone(src: Path, tmp: Path) -> bool:
         if file_flags & ~_UF_SETTABLE:
             return False
         if file_flags & ~_KEPT_CLONE_FLAGS:
-            # By path: Python has no fchflags.  tmp is the inode just
-            # verified, inside a 0700 directory no other user can write.
-            os.lchflags(tmp, file_flags & _KEPT_CLONE_FLAGS)
-            cleared = os.fstat(fd)
-            if (cleared.st_dev, cleared.st_ino) != (opened.st_dev, opened.st_ino) or (
-                cleared.st_flags != file_flags & _KEPT_CLONE_FLAGS
-            ):
+            # Through the verified descriptor, never the path.
+            apfs.set_file_flags(fd, file_flags & _KEPT_CLONE_FLAGS)
+            if os.fstat(fd).st_flags != file_flags & _KEPT_CLONE_FLAGS:
                 raise StorageSafetyError(f"Could not clear clone flags on {tmp}")
         os.fchmod(fd, 0o600)
         if apfs.has_extended_acl(fd):
