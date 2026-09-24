@@ -342,10 +342,10 @@ class _Recloner:
         swap, the displaced old copy after it).
 
         Its bytes then survive the unlink even if a writer replaces the
-        published copy right after the final check.  This command holds the
-        sync lock, so only an unlocked visibility transition could, and every
-        transition republishes from the source whenever the source exists.
-        Logpile never writes sources.
+        published copy right after the final check, because they are the
+        source's bytes and Logpile never writes sources.  (This command holds
+        the sync lock, so that writer could only be an unlocked visibility
+        transition or its rollback, which can restore an older copy.)
         """
         if not _is_real_directory(root):
             return
