@@ -1565,6 +1565,53 @@ class RecloneSharedTests(_RecloneFixture):
         self.assertEqual(len(kept), 1)
         self.assertEqual(kept[0].read_bytes(), rewritten)
 
+    def _interrupt_between_swap_and_check(self, *, restore_mtime: bool) -> None:
+        """An interrupt between the swap and its check leaves the old copy
+        unverified, so it stays even when unchanged, and even when a writer
+        restored its mtime after changing it (Astra second pass, finding 2).
+        The next run's sweep removes it only if its bytes are redundant."""
+        source, shared = self._pair("interrupted")
+        original = shared.read_bytes()
+        changed = bytes(reversed(original))
+
+        def swap_then_interrupt(first, second):
+            if restore_mtime:
+                before = os.stat(second)
+                with open(second, "r+b") as handle:
+                    handle.write(changed)
+                os.utime(second, ns=(before.st_atime_ns, before.st_mtime_ns))
+            portable_rename_swap(first, second)
+            raise KeyboardInterrupt
+
+        with (
+            simulated_clone(swap=swap_then_interrupt),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            self._run(apply=True)
+
+        self.assertEqual(shared.read_bytes(), original)
+        kept = self._leftovers()
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_bytes(), changed if restore_mtime else original)
+
+        with (
+            mock.patch.object(reclone_module, "STAGING_MIN_AGE_SECONDS", 0),
+            simulated_clone(),
+        ):
+            later = self._run(apply=True)
+        # Unchanged bytes are redundant and go; changed bytes stay.
+        self.assertEqual(kept[0].exists(), restore_mtime)
+        self.assertEqual(later.staging_removed, 0 if restore_mtime else 1)
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_interrupt_before_the_displaced_check_keeps_the_old_copy(self) -> None:
+        self._interrupt_between_swap_and_check(restore_mtime=False)
+
+    def test_interrupt_keeps_an_old_copy_changed_with_its_mtime_restored(
+        self,
+    ) -> None:
+        self._interrupt_between_swap_and_check(restore_mtime=True)
+
     def test_failed_swap_back_keeps_an_original_changed_in_place(self) -> None:
         _, shared = self._pair("rewritten-then-stuck")
         original = shared.read_bytes()
@@ -1767,6 +1814,103 @@ class StaleStagingSweepTests(_RecloneFixture):
         self.assertEqual(report.staging_removed, 0)
         self.assertEqual(report.staging_kept[reclone_module.STAGING_CHANGED], 1)
         self.assertEqual(leftover.read_bytes(), leftover_bytes)
+
+    def test_leftover_needs_a_matching_source(self) -> None:
+        """Identical to the copy beside it is not enough: the bytes must
+        also be in the source, which Logpile never writes."""
+        orphaned_source, orphaned = self._pair("orphaned")
+        orphan_leftover = orphaned.with_name(
+            f".{orphaned.name}.9999999999999999.tmp-sync"
+        )
+        orphan_leftover.write_bytes(orphaned.read_bytes())
+        orphaned_source.unlink()  # the copy is now the sole survivor
+        drifted_source, drifted = self._pair("drifted")
+        drift_leftover = drifted.with_name(f".{drifted.name}.aaaaaaaaaaaaaaaa.tmp-sync")
+        drift_leftover.write_bytes(drifted.read_bytes())
+        drifted_source.write_bytes(b"x" * drifted.stat().st_size)  # same size
+
+        report = self._run_old_enough(apply=True)
+
+        self.assertTrue(orphan_leftover.exists())
+        self.assertTrue(drift_leftover.exists())
+        self.assertEqual(report.staging_kept[reclone_module.STAGING_NO_SOURCE], 1)
+        self.assertEqual(report.staging_kept[reclone_module.STAGING_DIFFERS], 1)
+
+    def test_transition_after_the_final_check_cannot_lose_the_bytes(self) -> None:
+        """Astra second pass, finding 1: a private-storage transition that
+        republishes the copy and commits (deleting its rollback) lands after
+        the sweep's last check.  The leftover's bytes still survive, because
+        the sweep also required them to be the source's bytes."""
+        source, archived = self._pair("archived", root=self.private_root)
+        revision_a = archived.read_bytes()
+        leftover = archived.with_name(f".{archived.name}.bbbbbbbbbbbbbbbb.tmp-sync")
+        leftover.write_bytes(revision_a)
+        real_discard = reclone_module._discard_temporary
+        transitions: list[int] = []
+
+        def transition_then_discard(path):
+            if Path(path) == leftover and not transitions:
+                transitions.append(1)
+                sync_module._prepare_private_storage(
+                    src=source,
+                    shared_dir=self.shared,
+                    username="alice",
+                    source="claudecode",
+                    project="demo",
+                    filename=source.name,
+                    existing_shared_path=str(archived),
+                ).commit()
+            real_discard(path)
+
+        with mock.patch.object(
+            reclone_module, "_discard_temporary", side_effect=transition_then_discard
+        ):
+            report = self._run_old_enough(apply=True)
+
+        self.assertEqual(transitions, [1])
+        self.assertEqual(report.staging_removed, 1)
+        self.assertFalse(leftover.exists())
+        # Revision A survives in the republished archive and in the source.
+        self.assertEqual(archived.read_bytes(), revision_a)
+        self.assertEqual(source.read_bytes(), revision_a)
+
+    def test_leftover_older_than_its_source_survives_a_racing_transition(
+        self,
+    ) -> None:
+        """The reviewer's exact case: leftover and archive hold revision A, the
+        source holds B.  A transition would republish B and delete A's
+        rollback; the sweep must not delete the last A."""
+        source, archived = self._pair(
+            "revised",
+            content=b"revision B, longer than A\n",
+            shared_content=b"revision A\n",
+            root=self.private_root,
+        )
+        leftover = archived.with_name(f".{archived.name}.cccccccccccccccc.tmp-sync")
+        leftover.write_bytes(b"revision A\n")
+        real_discard = reclone_module._discard_temporary
+
+        def transition_then_discard(path):
+            if Path(path) == leftover:
+                sync_module._prepare_private_storage(
+                    src=source,
+                    shared_dir=self.shared,
+                    username="alice",
+                    source="claudecode",
+                    project="demo",
+                    filename=source.name,
+                    existing_shared_path=str(archived),
+                ).commit()
+            real_discard(path)
+
+        with mock.patch.object(
+            reclone_module, "_discard_temporary", side_effect=transition_then_discard
+        ):
+            report = self._run_old_enough(apply=True)
+
+        self.assertEqual(report.staging_removed, 0)
+        self.assertEqual(report.staging_kept[reclone_module.STAGING_DIFFERS], 1)
+        self.assertEqual(leftover.read_bytes(), b"revision A\n")
 
     def test_recent_leftovers_are_left_for_a_running_copy(self) -> None:
         fresh = self._staging("5555555555555555")

@@ -114,6 +114,7 @@ STAGING_NOT_REGULAR = "not_regular"
 STAGING_OTHER_OWNER = "other_owner"
 STAGING_UNSAFE_ANCESTRY = "unsafe_ancestry"
 STAGING_NO_COPY = "no_published_copy"
+STAGING_NO_SOURCE = "no_source"
 STAGING_DIFFERS = "differs"
 STAGING_CHANGED = "changed"
 STAGING_ERROR = "error"
@@ -130,6 +131,7 @@ STAGING_KEPT_REASONS = (
     STAGING_OTHER_OWNER,
     STAGING_UNSAFE_ANCESTRY,
     STAGING_NO_COPY,
+    STAGING_NO_SOURCE,
     STAGING_DIFFERS,
     STAGING_CHANGED,
     STAGING_ERROR,
@@ -144,8 +146,9 @@ STAGING_KEPT_DESCRIPTIONS = {
     STAGING_OTHER_OWNER: "owned by another user",
     STAGING_UNSAFE_ANCESTRY: "symlink or non-directory between the root and it",
     STAGING_NO_COPY: "no regular published copy beside it to compare with",
-    STAGING_DIFFERS: "bytes differ from the published copy beside it",
-    STAGING_CHANGED: "it or the copy beside it changed while they were compared",
+    STAGING_NO_SOURCE: "the copy beside it has no single surviving source",
+    STAGING_DIFFERS: "bytes differ from the copy beside it or from its source",
+    STAGING_CHANGED: "it, the copy beside it, or the source changed meanwhile",
     STAGING_ERROR: "could not be read or removed",
 }
 
@@ -301,6 +304,17 @@ class _Recloner:
         self.report = report
         self.log = log
         self.seen: set[Path] = set()
+        # Lexical shared_path -> source_path (None: several rows disagree).
+        self.sources: dict[Path, Path | None] = {}
+
+    def index_sources(self, rows: list[sqlite3.Row]) -> None:
+        for row in rows:
+            shared = _lexical_path(Path(row["shared_path"]))
+            source = Path(row["source_path"])
+            if self.sources.get(shared, source) != source:
+                self.sources[shared] = None
+            else:
+                self.sources[shared] = source
 
     def _log(self, message: str) -> None:
         if self.log is not None:
@@ -321,14 +335,17 @@ class _Recloner:
 
         A staging file is removed only when it is a regular file this user
         owns, older than STAGING_MIN_AGE_SECONDS, under a symlink-free
-        ancestry, and byte-identical to the published copy beside it, with
-        neither file changed or replaced while the two were compared.  That
-        covers both leftovers a killed reclone can produce (the verified
-        clone before the swap, the displaced old copy after it), and at the
-        moment of the check its bytes also exist in the published copy.  A
-        writer that replaces the published copy in the instant between that
-        final check and the unlink goes unnoticed; this command holds the
-        sync lock, so only an unlocked visibility transition could do that.
+        ancestry, and byte-identical to both the published copy beside it
+        and that copy's source (per the database), with none of the three
+        changed or replaced while they were compared.  That covers both
+        leftovers a killed reclone can produce (the verified clone before the
+        swap, the displaced old copy after it).
+
+        Its bytes then survive the unlink even if a writer replaces the
+        published copy right after the final check.  This command holds the
+        sync lock, so only an unlocked visibility transition could, and every
+        transition republishes from the source whenever the source exists.
+        Logpile never writes sources.
         """
         if not _is_real_directory(root):
             return
@@ -391,15 +408,32 @@ class _Recloner:
         if not stat.S_ISREG(copy.st_mode):
             self._keep_staging(STAGING_NO_COPY, path)
             return
+        source = self.sources.get(published)
         try:
-            identical = copy.st_size == staged.st_size and file_hash(path) == file_hash(
-                published
+            origin = None if source is None else source.lstat()
+        except FileNotFoundError:
+            origin = None
+        except OSError as exc:
+            self._keep_staging(STAGING_ERROR, path, str(exc))
+            return
+        if origin is None or not stat.S_ISREG(origin.st_mode):
+            self._keep_staging(STAGING_NO_SOURCE, path)
+            return
+        try:
+            identical = staged.st_size == copy.st_size == origin.st_size and file_hash(
+                path
+            ) == file_hash(published) == file_hash(source)
+            # The hashes describe the files only if none changed or was
+            # replaced meanwhile (a hash reads an inode it already opened).
+            try:
+                staged_now = path.lstat()
+            except FileNotFoundError:
+                return  # already gone: nothing to remove
+            unchanged = (
+                _identity(staged_now) == _identity(staged)
+                and _identity(published.lstat()) == _identity(copy)
+                and _identity(source.lstat()) == _identity(origin)
             )
-            # The hashes describe the files only if neither changed or was
-            # replaced meanwhile (a hash reads an inode already opened).
-            unchanged = _identity(path.lstat()) == _identity(staged) and _identity(
-                published.lstat()
-            ) == _identity(copy)
         except FileNotFoundError:
             self._keep_staging(STAGING_CHANGED, path)
             return
@@ -614,10 +648,11 @@ class _Recloner:
         rather than served by os.replace, which could recreate a moved copy.
 
         However this returns or raises, the staging name is tidied last (see
-        _tidy): it is removed only while it holds our clone or the old copy,
-        unchanged since it was hashed.
+        _tidy): it is removed only while it holds our clone, or the displaced
+        old copy once the check below has passed.
         """
         shared = candidate.shared
+        displaced_verified = False
         try:
             try:
                 apfs.rename_swap(clone, shared)
@@ -627,22 +662,31 @@ class _Recloner:
                 return SHARED_CHANGED, "moved away before the swap"
             displaced = clone.lstat()
             if _swapped_identity(displaced) == _swapped_identity(candidate.shared_stat):
+                displaced_verified = True
                 return None, ""
             # Replaced or changed after the identity check: give that file its
             # name back.
             apfs.rename_swap(clone, shared)
             return SHARED_CHANGED, "replaced or changed before the swap; restored"
         finally:
-            self._tidy(clone, ours, candidate)
+            self._tidy(clone, ours, candidate, displaced_verified=displaced_verified)
 
-    def _tidy(self, clone: Path, ours: tuple[int, int], candidate: _Candidate) -> None:
+    def _tidy(
+        self,
+        clone: Path,
+        ours: tuple[int, int],
+        candidate: _Candidate,
+        *,
+        displaced_verified: bool,
+    ) -> None:
         """Remove the staging name if it holds a file this run may discard.
 
         That is our own clone (not yet swapped in, or swapped back out), or
-        the displaced old copy still exactly as it was hashed, whose bytes
-        the published clone now holds.  Anything else stays: a file that
-        replaced the copy, or the old copy after an in-place change (possible
-        when an interrupt lands between the swap and its check).
+        the displaced old copy after _publish verified it, whose bytes the
+        published clone now holds.  Anything else stays: a file that replaced
+        the copy, or an old copy that changed or was never checked because an
+        interrupt landed between the swap and the check.  An unchecked old
+        copy is left for the next run's staging sweep, which compares bytes.
         """
         try:
             left = clone.lstat()
@@ -651,9 +695,11 @@ class _Recloner:
         except OSError as exc:
             self.report.errors.append(f"{clone}: cannot inspect staging file: {exc}")
             return
-        if _inode(left) != ours and _swapped_identity(left) != _swapped_identity(
-            candidate.shared_stat
-        ):
+        disposable = _inode(left) == ours or (
+            displaced_verified
+            and _swapped_identity(left) == _swapped_identity(candidate.shared_stat)
+        )
+        if not disposable:
             self.report.errors.append(
                 f"{clone}: left in place; it holds a file that replaced or "
                 f"changed {candidate.shared} during the swap"
@@ -695,10 +741,11 @@ def reclone_shared_copies(
             clone_available=apfs.clone_available(),
         )
         report.free_before = _free_bytes(shared_dir)
+        rows = _load_rows(db_path)
         recloner = _Recloner(report, log=log)
+        recloner.index_sources(rows)
         for root in (report.shared_dir, report.private_root):
             recloner.sweep_staging(root, apply=apply)
-        rows = _load_rows(db_path)
         for index, row in enumerate(rows, start=1):
             recloner.process(row, apply=apply)
             if progress is not None:

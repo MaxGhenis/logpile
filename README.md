@@ -216,12 +216,14 @@ or it changed in place, that file gets its name back. A volume that cannot swap
 is skipped. Each file is always either the old full copy or a verified clone,
 so the run is safe to interrupt, even with `kill -9`.
 
-A killed run can leave a `*.tmp-sync` staging file. The next run removes a
-staging file once it is more than 10 minutes old, but only if it is
-byte-identical to the copy beside it and neither file changed while they were
-compared. It reports any other staging file and leaves it in place. `logpile
-sync` never removes staging files. A file left by a killed sync becomes
-removable once a later sync has published the same bytes beside it.
+A killed or interrupted run can leave a `*.tmp-sync` staging file. The next
+run removes a staging file once it is more than 10 minutes old, but only if it
+is byte-identical to both the copy beside it and that copy's source, and none of
+the three changed while they were compared. Logpile never writes sources, so
+those bytes survive the removal. It reports any other staging file and leaves
+it in place. `logpile sync` never removes staging files. A file left by a
+killed sync becomes removable once a later sync has published the same bytes
+beside it and the source still holds them.
 
 The command holds the sync lock for the whole run and exits with status 75 if a
 sync already holds it. It creates the lock file if it is missing. It opens the
