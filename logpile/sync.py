@@ -435,6 +435,50 @@ def _private_quarantine_path(private_root: Path, original: Path, suffix: str) ->
 
 _CLONE_TEMP_SUFFIX = ".tmp-sync"
 _CLONE_NAME_ATTEMPTS = 100
+# Staging files beside a managed copy: ".{name}.{16 hex}.tmp-sync" from the
+# clone path, ".{name}.{8 mkstemp chars}.tmp-sync" from the byte-copy path.
+# A process killed between staging and os.replace leaves one behind.
+STAGING_NAME_PATTERN = re.compile(
+    r"^\.(?P<name>.+)\.(?:[0-9a-f]{16}|[a-z0-9_]{8})"
+    + re.escape(_CLONE_TEMP_SUFFIX)
+    + "$"
+)
+
+# BSD file flags (<sys/stat.h>), which clonefile(2) copies from the source
+# along with its other attributes.  A byte copy starts with none.
+_UF_SETTABLE = 0x0000FFFF  # the owner-changeable flags
+_UF_TRACKED = 0x00000040
+# Source flags a clone may inherit: all owner-changeable, and _finalize_clone
+# clears every one but UF_COMPRESSED.  Anything else sends the copy down the
+# byte-copy path: UF_IMMUTABLE ("uchg") and UF_APPEND ("uappnd") would make
+# the clone refuse fchmod and unlink, and superuser flags cannot be cleared
+# by the owner at all.
+_CLONEABLE_SOURCE_FLAGS = (
+    stat.UF_NODUMP | stat.UF_HIDDEN | stat.UF_COMPRESSED | _UF_TRACKED
+)
+# UF_COMPRESSED marks a decmpfs file whose bytes live in an extended
+# attribute.  Clearing it on a compressed clone leaves an empty file, so the
+# flag stays: the clone then reads back exactly as its source does.
+_KEPT_CLONE_FLAGS = stat.UF_COMPRESSED
+_USER_LOCK_FLAGS = stat.UF_IMMUTABLE | stat.UF_APPEND
+
+
+def _clone_allowed_by_flags(source: os.stat_result) -> bool:
+    """Whether a source with these BSD flags may be cloned (see above)."""
+    return not getattr(source, "st_flags", 0) & ~_CLONEABLE_SOURCE_FLAGS
+
+
+def _clear_user_lock_flags(path: str | Path) -> None:
+    """Best effort: drop owner-settable immutable/append-only flags on path."""
+    lchflags = getattr(os, "lchflags", None)
+    if lchflags is None:
+        return
+    try:
+        flags = getattr(os.lstat(path), "st_flags", 0)
+        if flags & _USER_LOCK_FLAGS:
+            lchflags(path, flags & ~_USER_LOCK_FLAGS)
+    except OSError:
+        pass
 
 
 def _discard_temporary(path: Path) -> None:
@@ -442,7 +486,9 @@ def _discard_temporary(path: Path) -> None:
 
     A clone of a directory (a source swapped for a directory mid-copy) is a
     whole tree whose directories keep their source modes, possibly without
-    owner write, so grant owner access before retrying a failed removal.
+    owner write, so grant owner access before retrying a failed removal.  A
+    clone also keeps its source's immutable or append-only flag if one was
+    set after the flag check, so clear those before retrying too.
     """
     try:
         mode = path.lstat().st_mode
@@ -450,15 +496,20 @@ def _discard_temporary(path: Path) -> None:
         return
     try:
         if not stat.S_ISDIR(mode):
-            path.unlink()
+            try:
+                path.unlink()
+            except PermissionError:
+                _clear_user_lock_flags(path)
+                path.unlink()
             return
 
         def _grant_and_retry(function, target, _exc) -> None:
             parent = os.path.dirname(target)
-            for directory in (parent, target):
+            for entry in (parent, target):
+                _clear_user_lock_flags(entry)
                 try:
-                    if stat.S_ISDIR(os.lstat(directory).st_mode):
-                        os.chmod(directory, 0o700)
+                    if stat.S_ISDIR(os.lstat(entry).st_mode):
+                        os.chmod(entry, 0o700)
                 except OSError:
                     pass
             function(target)
@@ -479,11 +530,15 @@ def _discard_temporary(path: Path) -> None:
 def _finalize_clone(src: Path, tmp: Path) -> bool:
     """Make a fresh clone private, regular, and durable before it is published.
 
-    Returns False when the clone carries an extended ACL.  CLONE_ACL is never
-    passed, so that should not happen, but an ACL could grant access beyond
-    0600; the caller then discards the clone and falls back to the byte copy,
-    which is what it would have produced before cloning.  Raises
-    StorageSafetyError for anything but a regular file.
+    Clears the BSD flags the clone copied from its source, except
+    UF_COMPRESSED, so the result matches the flag-free byte copy.  Returns
+    False, and the caller discards the clone and byte-copies instead, when the
+    clone carries a flag only the superuser can clear or an extended ACL.  A
+    clone never copies the source's ACL (CLONE_ACL is not passed), but
+    clonefile(2) applies the destination directory's inheritable ACEs; the
+    byte copy then receives the same inherited ACEs, so the fallback keeps
+    exactly what a copy produced before cloning.  Raises StorageSafetyError
+    for anything but a regular file.
     """
     staged = tmp.lstat()
     mode = staged.st_mode
@@ -507,6 +562,18 @@ def _finalize_clone(src: Path, tmp: Path) -> bool:
             staged.st_ino,
         ):
             raise StorageSafetyError(f"Refusing replaced clone of {src}: {tmp}")
+        file_flags = getattr(opened, "st_flags", 0)
+        if file_flags & ~_UF_SETTABLE:
+            return False
+        if file_flags & ~_KEPT_CLONE_FLAGS:
+            # By path: Python has no fchflags.  tmp is the inode just
+            # verified, inside a 0700 directory no other user can write.
+            os.lchflags(tmp, file_flags & _KEPT_CLONE_FLAGS)
+            cleared = os.fstat(fd)
+            if (cleared.st_dev, cleared.st_ino) != (opened.st_dev, opened.st_ino) or (
+                cleared.st_flags != file_flags & _KEPT_CLONE_FLAGS
+            ):
+                raise StorageSafetyError(f"Could not clear clone flags on {tmp}")
         os.fchmod(fd, 0o600)
         if apfs.has_extended_acl(fd):
             return False
@@ -521,9 +588,11 @@ def _clone_to_temporary_sibling(src: Path, dst: Path) -> Path | None:
 
     None means cloning does not apply here and the caller should byte-copy:
     the platform or volume cannot clone, src (after following symlinks, the
-    same semantics as ``src.open``) is not a regular file, the staging
-    directory is reachable by other users, or the clone carries an ACL.  Any
-    other failure raises, and no staging file survives either outcome.
+    same semantics as ``src.open``) is not a regular file or carries BSD
+    flags a clone must not inherit, the staging directory is reachable by
+    other users, or the clone carries an ACL or a flag only the superuser
+    can clear.  Any other failure raises, and no staging file survives
+    either outcome.
 
     clonefile(2) copies the source's mode bits, so the clone can briefly be
     0644 before the fchmod in _finalize_clone.  Every managed caller creates
@@ -536,7 +605,8 @@ def _clone_to_temporary_sibling(src: Path, dst: Path) -> Path | None:
         return None
     # Follows symlinks like src.open(); errors (missing source, EACCES)
     # propagate exactly as the byte-copy path would raise them.
-    if not stat.S_ISREG(os.stat(src).st_mode):
+    source = os.stat(src)
+    if not stat.S_ISREG(source.st_mode) or not _clone_allowed_by_flags(source):
         return None
     if os.stat(dst.parent).st_mode & 0o077:
         return None
@@ -604,7 +674,7 @@ def _secure_copy_file(
             raise
         return
     fd, temp_name = tempfile.mkstemp(
-        prefix=f".{dst.name}.", suffix=".tmp-sync", dir=dst.parent
+        prefix=f".{dst.name}.", suffix=_CLONE_TEMP_SUFFIX, dir=dst.parent
     )
     tmp = Path(temp_name)
     try:
@@ -2110,8 +2180,12 @@ def sync_lock(db_path: Path) -> Iterator[bool]:
     Yields True while the lock is held, or False (holding nothing) when
     another process holds it.  Raises SyncLockError when the lock path is
     unsafe or the filesystem cannot lock, so callers never mistake a broken
-    lock for mere contention.  Anything that rewrites managed storage in bulk
-    (sync, reclone-shared) takes this lock so the two never interleave.
+    lock for mere contention.  sync and reclone-shared take this lock, so
+    they never interleave.  Visibility transitions (``logpile private``,
+    ``logpile visibility``, publish approval, visibility-rule recomputation)
+    do not: they move session files without it.  reclone-shared therefore
+    installs clones with apfs.rename_swap, which fails instead of recreating
+    a copy that such a transition moved away.
     """
     lock_path = sync_lock_path(db_path)
     _secure_mkdir(lock_path.parent, harden_existing=False)

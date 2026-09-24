@@ -1,4 +1,4 @@
-"""APFS copy-on-write primitives: clonefile(2) and private-size queries.
+"""APFS copy-on-write primitives: clonefile(2), clone identity, rename swaps.
 
 Everything here degrades to "unsupported" off macOS so callers can fall back
 to byte copies.  Nothing in this module decides policy (modes, managed roots,
@@ -12,26 +12,46 @@ import errno
 import os
 import struct
 import sys
+from dataclasses import dataclass
 from functools import cache
 
 # <sys/clonefile.h>.  CLONE_ACL ("copy ACLs from the source file", per
-# clonefile(2)) is deliberately never passed, so a clone should not carry the
-# source's ACL (tests/test_clone_storage.py checks this on macOS).  logpile.sync
-# still refuses to keep any clone that ends up with an extended ACL, whatever
-# its origin, and byte-copies instead.
+# clonefile(2)) is deliberately never passed, so a clone does not carry the
+# source's ACL (tests/test_clone_storage.py checks this on macOS).  A clone
+# does inherit the destination directory's inheritable ACEs, exactly as a
+# newly created byte copy would; logpile.sync keeps no clone that ends up with
+# any extended ACL and byte-copies instead.
 CLONE_NOOWNERCOPY = 0x0002
 
 # errno values meaning "this volume or pair of paths cannot clone"; callers
-# fall back to a byte copy.  Everything else is a real failure.
+# fall back to a byte copy.  Everything else is a real failure.  clonefile(2)
+# documents EINVAL only for an invalid flags value; it stays on this list
+# because the storage design treats it as "cannot clone here", and the macOS
+# tests that forbid the byte-copy fallback catch a flags regression.
 CLONE_UNSUPPORTED_ERRNOS = frozenset(
     {errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.ENOSYS, errno.EINVAL}
 )
 
+# <sys/stdio.h>: renamex_np(2) flag that atomically exchanges two paths.
+RENAME_SWAP = 0x00000002
+# errno values meaning "this volume cannot swap"; callers fall back to a
+# plain rename.  rename(2) documents EINVAL for invalid flags, so it is a
+# real failure here.
+SWAP_UNSUPPORTED_ERRNOS = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS})
+
 # <sys/attr.h>
 _ATTR_BIT_MAP_COUNT = 5
+_ATTR_CMN_RETURNED_ATTRS = 0x80000000
+# ATTR_CMNEXT_* live in the forkattr field when FSOPT_ATTR_CMN_EXTENDED is set.
 _ATTR_CMNEXT_PRIVATESIZE = 0x00000008
+_ATTR_CMNEXT_REALFSID = 0x00000080
+_ATTR_CMNEXT_CLONEID = 0x00000100
+_ATTR_CMNEXT_EXT_FLAGS = 0x00000200
 _FSOPT_NOFOLLOW = 0x00000001
 _FSOPT_ATTR_CMN_EXTENDED = 0x00000020
+
+# <sys/stat.h> extended flags (ATTR_CMNEXT_EXT_FLAGS).
+EF_SHARES_ALL_BLOCKS = 0x00000040
 
 # <sys/acl.h>
 _ACL_TYPE_EXTENDED = 0x00000100
@@ -47,6 +67,53 @@ class CloneUnsupported(Exception):
     def __init__(self, message: str, errno_value: int | None = None) -> None:
         super().__init__(message)
         self.errno = errno_value
+
+
+class SwapUnsupported(Exception):
+    """renamex_np(RENAME_SWAP) is unavailable here or unsupported by the volume."""
+
+    def __init__(self, message: str, errno_value: int | None = None) -> None:
+        super().__init__(message)
+        self.errno = errno_value
+
+
+@dataclass(frozen=True)
+class FileStorage:
+    """What APFS reports about one file's data stream (None: not reported).
+
+    ``private_size`` is ATTR_CMNEXT_PRIVATESIZE: the bytes "not trapped inside
+    a clone or snapshot", which deleting the file would free immediately.  An
+    APFS snapshot (for example a Time Machine local snapshot) traps the blocks
+    of every file written before it, so an old byte copy reports 0 while that
+    snapshot exists.  It measures immediate reclaim, never clone status.
+
+    ``clone_id`` is ATTR_CMNEXT_CLONEID, which getattrlist(2) documents as
+    uniquely identifying the file's data stream: "pure clones of each other"
+    share it.  Snapshots do not change it.  ``fsid`` is ATTR_CMNEXT_REALFSID,
+    the real volume, which tells the sealed system volume apart from the data
+    volume even where both report the same st_dev.
+    """
+
+    fsid: tuple[int, int] | None = None
+    clone_id: int | None = None
+    private_size: int | None = None
+    ext_flags: int | None = None
+
+    def is_clone_of(self, other: FileStorage) -> bool:
+        """Whether both files are the same data stream on the same volume.
+
+        True means the two already share every data block, so recloning one
+        from the other frees nothing.  Unknown values never count as a match:
+        the caller then verifies and reclones, which is always safe.
+        """
+        return (
+            self.fsid is not None
+            and self.fsid == other.fsid
+            and bool(self.clone_id)
+            and self.clone_id == other.clone_id
+            and self.ext_flags is not None
+            and bool(self.ext_flags & EF_SHARES_ALL_BLOCKS)
+        )
 
 
 class _AttrList(ctypes.Structure):
@@ -86,8 +153,21 @@ def _symbol(name: str, argtypes: tuple, restype):
 
 @cache
 def _clonefile_function():
+    # <sys/clonefile.h>: int clonefile(const char *, const char *, uint32_t)
     return _symbol(
-        "clonefile", (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int), ctypes.c_int
+        "clonefile",
+        (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32),
+        ctypes.c_int,
+    )
+
+
+@cache
+def _renamex_function():
+    # <sys/stdio.h>: int renamex_np(const char *, const char *, unsigned int)
+    return _symbol(
+        "renamex_np",
+        (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint),
+        ctypes.c_int,
     )
 
 
@@ -147,20 +227,51 @@ def clonefile(src: os.PathLike | str, dst: os.PathLike | str) -> None:
     raise OSError(error, os.strerror(error), os.fspath(src), None, os.fspath(dst))
 
 
-def private_size(path: os.PathLike | str) -> int | None:
-    """Bytes of ``path`` not shared with any other file, or None if unknown.
+def rename_swap(first: os.PathLike | str, second: os.PathLike | str) -> None:
+    """Atomically exchange two existing paths (renamex_np RENAME_SWAP).
 
-    APFS reports this as ATTR_CMNEXT_PRIVATESIZE: a byte copy's private size
-    is its whole allocation, and a fresh clone's is zero.  Symlinks are not
-    followed.  Returns None off macOS, on volumes without the attribute, or
-    on any lookup error, so callers must treat None as "no information".
+    Unlike rename(2), this never creates ``second``: it raises
+    FileNotFoundError when either path is missing.  Raises SwapUnsupported
+    off macOS or on a volume without swap support, and OSError otherwise.
+    """
+    function = _renamex_function()
+    if function is None:
+        raise SwapUnsupported("renamex_np(2) is unavailable on this platform")
+    first_bytes = os.fsencode(first)
+    second_bytes = os.fsencode(second)
+    while True:
+        ctypes.set_errno(0)
+        if function(first_bytes, second_bytes, RENAME_SWAP) == 0:
+            return
+        error = ctypes.get_errno()
+        if error != errno.EINTR:
+            break
+    if error in SWAP_UNSUPPORTED_ERRNOS:
+        raise SwapUnsupported(
+            f"renamex_np(2) cannot swap {os.fspath(first)!r}: {os.strerror(error)}",
+            error,
+        )
+    raise OSError(error, os.strerror(error), os.fspath(first), None, os.fspath(second))
+
+
+def file_storage(path: os.PathLike | str) -> FileStorage | None:
+    """APFS data-stream facts for ``path`` (symlinks not followed).
+
+    Returns None off macOS or on any lookup error; fields the volume does not
+    report are None.  Callers must treat None as "no information".
     """
     function = _getattrlist_function()
     if function is None:
         return None
     request = _AttrList(bitmapcount=_ATTR_BIT_MAP_COUNT)
-    request.forkattr = _ATTR_CMNEXT_PRIVATESIZE
-    buffer = ctypes.create_string_buffer(64)
+    request.commonattr = _ATTR_CMN_RETURNED_ATTRS
+    request.forkattr = (
+        _ATTR_CMNEXT_PRIVATESIZE
+        | _ATTR_CMNEXT_REALFSID
+        | _ATTR_CMNEXT_CLONEID
+        | _ATTR_CMNEXT_EXT_FLAGS
+    )
+    buffer = ctypes.create_string_buffer(128)
     result = function(
         os.fsencode(path),
         ctypes.byref(request),
@@ -170,11 +281,50 @@ def private_size(path: os.PathLike | str) -> int | None:
     )
     if result != 0:
         return None
-    # u_int32_t total length, then the off_t attribute at 4-byte alignment.
-    length, value = struct.unpack_from("=Iq", buffer.raw, 0)
-    if length < struct.calcsize("=Iq") or value < 0:
+    return _parse_file_storage(buffer.raw)
+
+
+def _parse_file_storage(raw: bytes) -> FileStorage | None:
+    """Decode a getattrlist(2) reply for the attributes file_storage asks for.
+
+    Layout: u_int32_t length, the attribute_set_t of attributes actually
+    returned (ATTR_CMN_RETURNED_ATTRS), then each returned attribute in
+    bit order, packed at 4-byte alignment.
+    """
+    header = struct.Struct("=I5I")
+    if len(raw) < header.size:
         return None
-    return value
+    length, _common, _vol, _dir, _file, returned = header.unpack_from(raw, 0)
+    offset = header.size
+    values: dict[str, object] = {}
+    for bit, name, layout in (
+        (_ATTR_CMNEXT_PRIVATESIZE, "private_size", "=q"),
+        (_ATTR_CMNEXT_REALFSID, "fsid", "=2i"),
+        (_ATTR_CMNEXT_CLONEID, "clone_id", "=Q"),
+        (_ATTR_CMNEXT_EXT_FLAGS, "ext_flags", "=Q"),
+    ):
+        if not returned & bit:
+            continue
+        size = struct.calcsize(layout)
+        if offset + size > min(length, len(raw)):
+            return None
+        unpacked = struct.unpack_from(layout, raw, offset)
+        values[name] = unpacked if name == "fsid" else unpacked[0]
+        offset += size
+    private = values.get("private_size")
+    if private is not None and private < 0:
+        values["private_size"] = None
+    return FileStorage(**values)
+
+
+def private_size(path: os.PathLike | str) -> int | None:
+    """Bytes of ``path`` that deleting it would free now, or None if unknown.
+
+    See FileStorage.private_size: blocks shared with a clone *or trapped in
+    a snapshot* are excluded, so 0 does not mean "already a clone".
+    """
+    storage = file_storage(path)
+    return None if storage is None else storage.private_size
 
 
 def has_extended_acl(fd: int) -> bool:
