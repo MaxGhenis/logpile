@@ -107,6 +107,16 @@ the planned copy count/volume and available free space; it refuses an
 insufficient-space plan. A source hash/mtime is committed only after the shared
 copy matches that hash, and failed verification is persisted for retry.
 
+On macOS with APFS, each shared copy is a `clonefile(2)` clone: an independent
+0600 file that shares data blocks with its source until either one changes, so
+it still survives the source being appended or deleted but costs almost no
+space. Other platforms and volumes (or a cross-volume shared directory) fall
+back to a byte copy, as does a source carrying the immutable (`uchg`),
+append-only (`uappnd`) or any superuser file flag. A clone keeps its source's
+modified time and extended attributes. It drops the source's other BSD file
+flags except `compressed`, which marks where a compressed file's bytes live. The
+free-space preflight stays byte-based because any copy may take the fallback.
+
 #### Token accounting
 
 - **Codex** `token_count` events carry *cumulative* counters, and resuming or
@@ -168,6 +178,66 @@ per-repo rollups) read `native_*`. Per-session rows in the UI still show
 transcript totals. `user_message_count` and `tool_call_count` remain
 transcript-level everywhere (only assistant records carry the identity
 needed for claims).
+
+### `logpile reclone-shared`
+
+One-time migration for shared copies written before sync cloned. It reclaims
+the space of every shared copy that is byte-identical to a source that still
+exists:
+
+```bash
+./logpile.sh reclone-shared            # dry run: counts, bytes, projected free space
+./logpile.sh reclone-shared --apply    # replace verified copies with clones
+```
+
+```
+Options:
+  --apply                  Replace verified identical copies (default: dry run)
+  --db PATH                SQLite database    [default: ~/logpile/logpile.db]
+  --shared-dir PATH        Shared directory   [default: ~/logpile/shared]
+  -v, --verbose            Print every file decision
+```
+
+For each `sessions.shared_path` under the shared directory or its private
+archive (`.shared-private`), the command requires the shared copy and
+`source_path` to be regular files (no symlinks) on the same volume, with the
+same size and the same full sha256. It skips a copy that is already a clone of
+its source (the two share an APFS clone id) without hashing it. It never
+touches a copy with other hard links, because replacing one name would free
+nothing, or a copy whose source is gone, because that copy is the sole survivor.
+
+With `--apply` it clones the source into a temporary sibling. It checks that
+the clone's sha256 matches the shared copy and that the shared copy has not
+changed since it was hashed. Then it swaps the clone into place atomically with
+`renamex_np(RENAME_SWAP)`, and the result has mode 0600. The swap fails, rather
+than recreating the file, if a visibility change (`logpile private`, for
+example) moved the copy away in the meantime. If another file replaced the copy,
+or it changed in place, that file gets its name back. A volume that cannot swap
+is skipped. Each file is always either the old full copy or a verified clone,
+so the run is safe to interrupt, even with `kill -9`.
+
+A killed or interrupted run can leave a `*.tmp-sync` staging file. The next
+run removes a staging file once it is more than 10 minutes old, but only if it
+is byte-identical to both the copy beside it and that copy's source, and none of
+the three changed while they were compared. Logpile never writes sources, so
+those bytes survive the removal. It reports any other staging file and leaves
+it in place. `logpile sync` never removes staging files. A file left by a
+killed sync becomes removable once a later sync has published the same bytes
+beside it and the source still holds them.
+
+The command holds the sync lock for the whole run and exits with status 75 if a
+sync already holds it. It creates the lock file if it is missing. It opens the
+database read-only. SQLite may still create empty `-wal` and `-shm` sidecar
+files next to a WAL-mode database. The report lists skips by reason and `df`
+free space before and after. It gives two reclaim figures:
+
+- **Frees now**: the old copies' APFS private bytes, which deleting them frees
+  immediately.
+- **Frees up to**: their allocated bytes.
+
+The two differ when an APFS snapshot, such as a Time Machine local snapshot
+(`tmutil listlocalsnapshots /`), or another clone still holds the old copies'
+blocks. Blocks a snapshot holds come back only when that snapshot is deleted.
 
 ### `logpile search` / `logpile show` / `logpile status`
 
