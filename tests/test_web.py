@@ -1,5 +1,4 @@
 import json
-import os
 import shutil
 import sqlite3
 import subprocess
@@ -709,6 +708,8 @@ class WebAppTests(unittest.TestCase):
             root = Path(td)
             shared, db_path = self._seed_mixed_visibility_codex_lineage(root)
             web_dir = Path(__file__).resolve().parents[1] / "web"
+            node = shutil.which("node")
+            self.assertIsNotNone(node)
             with tempfile.TemporaryDirectory(
                 prefix=".logpile-next-test-",
                 dir=web_dir,
@@ -734,10 +735,9 @@ class WebAppTests(unittest.TestCase):
                     "db.getContextExplosionWorkstreams(6)));"
                 )
                 result = subprocess.run(
-                    ["node", "-e", script],
+                    [node, "-e", script],
                     cwd=web_dir,
                     env={
-                        **os.environ,
                         "LOGPILE_DB_PATH": str(db_path),
                         "LOGPILE_SHARED_DIR": str(shared),
                         "LOGPILE_PUBLIC_MODE": "true",

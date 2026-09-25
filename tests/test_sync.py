@@ -2684,6 +2684,237 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             self.assertEqual(rows["rollout-codex2"], str(extra_home))
             self.assertEqual(rows["rollout-openclaw"], str(openclaw))
 
+    def test_sync_scans_subfleet_and_traycer_managed_profile_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            numbered_live = self._write_codex_rollout(
+                home,
+                root=".codex-4/sessions/2026/04/10",
+                session_id="rollout-numbered-live",
+            )
+            numbered_archive = self._write_codex_rollout(
+                home,
+                root=".codex-10/archived_sessions/2026/04/10",
+                session_id="rollout-numbered-archive",
+            )
+            traycer_codex_live = self._write_codex_rollout(
+                home,
+                root=(
+                    ".traycer/harness-accounts/codex/work-account/sessions/2026/04/10"
+                ),
+                session_id="rollout-traycer-live",
+            )
+            traycer_codex_archive = self._write_codex_rollout(
+                home,
+                root=(
+                    ".traycer/harness-accounts/codex/work-account/"
+                    "archived_sessions/2026/04/10"
+                ),
+                session_id="rollout-traycer-archive",
+            )
+            traycer_claude = (
+                home
+                / ".traycer"
+                / "harness-accounts"
+                / "claude-code"
+                / "max-account"
+                / "projects"
+                / "-tmp-demo"
+                / "traycer-claude.jsonl"
+            )
+            write_jsonl(
+                traycer_claude,
+                [
+                    {
+                        "timestamp": "2026-04-10T10:00:00Z",
+                        "type": "user",
+                        "cwd": "/tmp/demo",
+                        "message": {"content": "Use the managed Claude profile"},
+                    },
+                    {
+                        "timestamp": "2026-04-10T10:00:05Z",
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg-traycer-managed",
+                            "model": "claude-3.7",
+                            "usage": {"input_tokens": 1, "output_tokens": 2},
+                            "content": [{"type": "text", "text": "done"}],
+                        },
+                    },
+                ],
+            )
+
+            # Valid-looking transcript records outside the exact native
+            # subdirectories must remain invisible to sync.
+            self._write_codex_rollout(
+                home,
+                root=".codex-backup/sessions/2026/04/10",
+                session_id="rollout-numbered-decoy",
+            )
+            numbered_credential = self._write_codex_rollout(
+                home,
+                root=".codex-4/credentials-history",
+                session_id="rollout-numbered-credential",
+            )
+            traycer_credential = self._write_codex_rollout(
+                home,
+                root=(
+                    ".traycer/harness-accounts/codex/work-account/credentials-history"
+                ),
+                session_id="rollout-traycer-decoy",
+            )
+            write_jsonl(
+                home
+                / ".traycer"
+                / "harness-accounts"
+                / "claude-code"
+                / "max-account"
+                / "credentials.jsonl",
+                [
+                    {
+                        "timestamp": "2026-04-10T10:00:00Z",
+                        "type": "user",
+                        "message": {"content": "must not be indexed"},
+                    },
+                    {
+                        "timestamp": "2026-04-10T10:00:05Z",
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg-credential",
+                            "model": "claude-3.7",
+                            "usage": {"input_tokens": 1, "output_tokens": 2},
+                            "content": [{"type": "text", "text": "secret"}],
+                        },
+                    },
+                ],
+            )
+            claude_credential = (
+                home
+                / ".traycer"
+                / "harness-accounts"
+                / "claude-code"
+                / "max-account"
+                / "credentials.jsonl"
+            )
+            credential_links = (
+                (
+                    home
+                    / ".codex-4"
+                    / "sessions"
+                    / "2026"
+                    / "04"
+                    / "10"
+                    / "linked-numbered-credential.jsonl",
+                    numbered_credential,
+                ),
+                (
+                    home
+                    / ".traycer"
+                    / "harness-accounts"
+                    / "codex"
+                    / "work-account"
+                    / "sessions"
+                    / "2026"
+                    / "04"
+                    / "10"
+                    / "linked-traycer-credential.jsonl",
+                    traycer_credential,
+                ),
+                (
+                    home
+                    / ".traycer"
+                    / "harness-accounts"
+                    / "claude-code"
+                    / "max-account"
+                    / "projects"
+                    / "-tmp-demo"
+                    / "linked-claude-credential.jsonl",
+                    claude_credential,
+                ),
+            )
+            for link, target in credential_links:
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(target)
+
+            result = sync_sessions(
+                root / "shared", root / "logpile.db", "alice", "m1", home
+            )
+            self.assertEqual(result.new, 5)
+
+            with open_sqlite(root / "logpile.db") as conn:
+                rows = {
+                    row["session_id"]: row["source_path"]
+                    for row in conn.execute(
+                        "SELECT session_id, source_path FROM sessions"
+                    )
+                }
+            self.assertEqual(
+                rows,
+                {
+                    "rollout-numbered-live": str(numbered_live),
+                    "rollout-numbered-archive": str(numbered_archive),
+                    "rollout-traycer-live": str(traycer_codex_live),
+                    "rollout-traycer-archive": str(traycer_codex_archive),
+                    "traycer-claude": str(traycer_claude),
+                },
+            )
+
+    def test_sync_prefers_first_claude_root_for_duplicate_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            ambient = self._write_claude_session(
+                home,
+                session_id="duplicate-claude",
+                message="ambient profile wins",
+            )
+            managed = (
+                home
+                / ".traycer"
+                / "harness-accounts"
+                / "claude-code"
+                / "managed-profile"
+                / "projects"
+                / "-tmp-demo"
+                / "duplicate-claude.jsonl"
+            )
+            write_jsonl(
+                managed,
+                [
+                    {
+                        "timestamp": "2026-04-10T10:00:00Z",
+                        "type": "user",
+                        "cwd": "/tmp/demo",
+                        "message": {"content": "later managed profile loses"},
+                    },
+                    {
+                        "timestamp": "2026-04-10T10:00:05Z",
+                        "type": "assistant",
+                        "message": {
+                            "id": "msg-managed-duplicate",
+                            "model": "claude-3.7",
+                            "usage": {"input_tokens": 1, "output_tokens": 2},
+                            "content": [{"type": "text", "text": "done"}],
+                        },
+                    },
+                ],
+            )
+
+            result = sync_sessions(shared, root / "logpile.db", "alice", "m1", home)
+            self.assertEqual(result.new, 1)
+            with open_sqlite(root / "logpile.db") as conn:
+                row = conn.execute(
+                    "SELECT source_path, first_user_message FROM sessions "
+                    "WHERE session_id = 'duplicate-claude'"
+                ).fetchone()
+            self.assertEqual(row["source_path"], str(ambient))
+            self.assertEqual(row["first_user_message"], "ambient profile wins")
+            copies = list(shared.rglob("duplicate-claude.jsonl"))
+            self.assertEqual(len(copies), 1)
+            self.assertIn("ambient profile wins", copies[0].read_text())
+
     def test_sync_prefers_live_copy_when_stem_exists_in_archive_too(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

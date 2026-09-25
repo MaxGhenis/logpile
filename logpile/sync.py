@@ -41,7 +41,12 @@ from .db import (
     transition_session_visibility,
     upsert_session,
 )
-from .discovery import claude_projects_root, codex_session_roots, discover_transcripts
+from .discovery import (
+    claude_transcript_roots,
+    codex_transcript_roots,
+    discover_transcripts,
+    iter_transcript_files,
+)
 from .objectives import SESSION_OBJECTIVE_VERSION, derive_session_objective
 from .origins import SESSION_ORIGIN_VERSION, derive_session_origin
 from .parsers import (
@@ -2337,9 +2342,9 @@ def _sync_sessions(
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
         # ── Claude Code sessions ───────────────────────────────────────────────
-        claude_root = claude_projects_root(home)
-        if claude_root.exists():
-            for jsonl_path in sorted(claude_root.rglob("*.jsonl")):
+        seen_claude_session_ids: set[str] = set()
+        for claude_root in claude_transcript_roots(home):
+            for jsonl_path in iter_transcript_files(claude_root):
                 if should_ignore(jsonl_path, patterns):
                     skipped_count += 1
                     continue
@@ -2392,6 +2397,10 @@ def _sync_sessions(
                     else:
                         skipped_count += 1
                     continue
+                if session_id in seen_claude_session_ids:
+                    skipped_count += 1
+                    continue
+                seen_claude_session_ids.add(session_id)
                 needs_structure_backfill = bool(
                     existing_row
                     and (
@@ -2442,6 +2451,7 @@ def _sync_sessions(
                     if exc.errno == errno.ENOSPC:
                         raise
                     _report_rotation_skip(jsonl_path, exc, verbose)
+                    seen_claude_session_ids.discard(session_id)
                     skipped_count += 1
                     continue
 
@@ -2475,6 +2485,7 @@ def _sync_sessions(
                         )
                         conn.commit()
                         _report_rotation_skip(jsonl_path, exc, verbose)
+                        seen_claude_session_ids.discard(session_id)
                         skipped_count += 1
                         continue
                     _clear_copy_retry(conn, jsonl_path, session_id)
@@ -2517,9 +2528,12 @@ def _sync_sessions(
                     if exc.errno == errno.ENOSPC:
                         raise
                     _report_rotation_skip(jsonl_path, exc, verbose)
+                    seen_claude_session_ids.discard(session_id)
                     skipped_count += 1
                     continue
                 if info is None:
+                    if not jsonl_path.exists():
+                        seen_claude_session_ids.discard(session_id)
                     skipped_count += 1
                     continue
                 if isinstance(info, PrivateSessionMarker):
@@ -2539,6 +2553,7 @@ def _sync_sessions(
                             if exc.errno == errno.ENOSPC:
                                 raise
                             _report_rotation_skip(jsonl_path, exc, verbose)
+                            seen_claude_session_ids.discard(session_id)
                             skipped_count += 1
                             continue
                         flush_if_needed()
@@ -2627,6 +2642,7 @@ def _sync_sessions(
                     )
                     conn.commit()
                     _report_rotation_skip(jsonl_path, exc, verbose)
+                    seen_claude_session_ids.discard(session_id)
                     skipped_count += 1
                     continue
                 _clear_copy_retry(conn, jsonl_path, info.session_id)
@@ -2710,8 +2726,8 @@ def _sync_sessions(
 
         # ── Codex sessions ─────────────────────────────────────────────────────
         seen_codex_stems: set[str] = set()
-        for codex_root in codex_session_roots(home):
-            for jsonl_path in sorted(codex_root.rglob("*.jsonl")):
+        for codex_root in codex_transcript_roots(home):
+            for jsonl_path in iter_transcript_files(codex_root):
                 if should_ignore(jsonl_path, patterns):
                     skipped_count += 1
                     continue

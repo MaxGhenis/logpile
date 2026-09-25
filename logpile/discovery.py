@@ -9,6 +9,7 @@ leaving a managed artifact as the only copy of an indexed revision.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import stat
 from collections.abc import Iterator
@@ -20,6 +21,7 @@ from pathlib import Path
 class TranscriptRoot:
     path: Path
     source: str
+    reject_symlinks: bool = False
 
 
 @dataclass(frozen=True)
@@ -28,29 +30,125 @@ class DiscoveredTranscript:
     source: str
 
 
+_NUMBERED_CODEX_HOME = re.compile(r"\.codex-(?P<lane>[0-9]+)\Z")
+
+
+def _is_real_directory(path: Path) -> bool:
+    """Return whether ``path`` is a directory reached without a leaf symlink."""
+
+    try:
+        return stat.S_ISDIR(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _direct_real_directories(parent: Path) -> tuple[Path, ...]:
+    """List only immediate, non-symlink directory children deterministically."""
+
+    if not _is_real_directory(parent):
+        return ()
+    try:
+        children = tuple(parent.iterdir())
+    except OSError:
+        return ()
+    return tuple(
+        sorted(
+            (path for path in children if _is_real_directory(path)),
+            key=lambda path: path.name,
+        )
+    )
+
+
+def _numbered_codex_roots(home: Path) -> tuple[TranscriptRoot, ...]:
+    """Return exact ``.codex-N`` lane transcript roots in numeric order.
+
+    Subfleet gives each additional Codex subscription an isolated numbered
+    ``CODEX_HOME``. Match the complete directory name so similarly named
+    backups or config directories are never traversed.
+    """
+
+    lanes: list[tuple[int, str, Path]] = []
+    for path in _direct_real_directories(home):
+        match = _NUMBERED_CODEX_HOME.fullmatch(path.name)
+        if match is None:
+            continue
+        lanes.append((int(match.group("lane")), path.name, path))
+    lanes.sort(key=lambda item: (item[0], item[1]))
+
+    live = [
+        TranscriptRoot(path / "sessions", "codex", reject_symlinks=True)
+        for _, _, path in lanes
+        if _is_real_directory(path / "sessions")
+    ]
+    archived = [
+        TranscriptRoot(
+            path / "archived_sessions", "codex_archive", reject_symlinks=True
+        )
+        for _, _, path in lanes
+        if _is_real_directory(path / "archived_sessions")
+    ]
+    return (*live, *archived)
+
+
+def _traycer_profile_roots(home: Path) -> tuple[TranscriptRoot, ...]:
+    """Return exact transcript subdirectories for Traycer-managed profiles.
+
+    A managed profile's directory is also its provider config home. Enumerate
+    profile directories only one level deep, then admit the provider's exact
+    transcript subdirectory. Credential and configuration siblings are never
+    recursively scanned.
+    """
+
+    accounts_root = home / ".traycer" / "harness-accounts"
+    claude_profiles = _direct_real_directories(accounts_root / "claude-code")
+    codex_profiles = _direct_real_directories(accounts_root / "codex")
+
+    claude = [
+        TranscriptRoot(profile / "projects", "claudecode", reject_symlinks=True)
+        for profile in claude_profiles
+        if _is_real_directory(profile / "projects")
+    ]
+    codex_live = [
+        TranscriptRoot(profile / "sessions", "codex", reject_symlinks=True)
+        for profile in codex_profiles
+        if _is_real_directory(profile / "sessions")
+    ]
+    codex_archived = [
+        TranscriptRoot(
+            profile / "archived_sessions", "codex_archive", reject_symlinks=True
+        )
+        for profile in codex_profiles
+        if _is_real_directory(profile / "archived_sessions")
+    ]
+    return (*claude, *codex_live, *codex_archived)
+
+
 def transcript_roots(home: Path) -> tuple[TranscriptRoot, ...]:
     """Return every supported transcript root in deterministic priority order.
 
-    Primary Codex live sessions precede archives and alternate homes so sync's
-    existing session-stem collision behavior remains stable.  Standard roots
-    are returned even while absent: Codex can create or rotate into one during
-    an active discovery pass.
+    Every Codex live root precedes every archive root so a live rollout wins a
+    session-stem collision even when it moves between managed homes. Standard
+    ambient roots are returned even while absent; dynamically managed roots
+    must already be real directories and may not be symlinks.
     """
 
     home = Path(home)
-    roots = [
-        TranscriptRoot(home / ".claude" / "projects", "claudecode"),
-        TranscriptRoot(home / ".codex" / "sessions", "codex"),
-        TranscriptRoot(home / ".codex" / "archived_sessions", "codex_archive"),
-        TranscriptRoot(home / ".codex-2" / "sessions", "codex"),
-        TranscriptRoot(home / ".codex-3" / "sessions", "codex"),
-    ]
+    numbered = _numbered_codex_roots(home)
+    traycer = _traycer_profile_roots(home)
+    roots = [TranscriptRoot(home / ".claude" / "projects", "claudecode")]
+    roots.extend(root for root in traycer if root.source == "claudecode")
+    roots.append(TranscriptRoot(home / ".codex" / "sessions", "codex"))
+    roots.extend(root for root in numbered if root.source == "codex")
     openclaw_agents = home / ".openclaw" / "agents"
     if openclaw_agents.exists():
         roots.extend(
             TranscriptRoot(path, "codex")
             for path in sorted(openclaw_agents.glob("*/agent/codex-home/sessions"))
         )
+    roots.extend(root for root in traycer if root.source == "codex")
+    roots.append(TranscriptRoot(home / ".codex" / "archived_sessions", "codex_archive"))
+    roots.extend(root for root in numbered if root.source == "codex_archive")
+    roots.extend(root for root in traycer if root.source == "codex_archive")
     return tuple(roots)
 
 
@@ -60,11 +158,29 @@ def claude_projects_root(home: Path) -> Path:
     return Path(home) / ".claude" / "projects"
 
 
+def claude_project_roots(home: Path) -> tuple[Path, ...]:
+    """Return ambient and managed Claude Code transcript roots."""
+
+    return tuple(root.path for root in claude_transcript_roots(home))
+
+
+def claude_transcript_roots(home: Path) -> tuple[TranscriptRoot, ...]:
+    """Return ambient and managed Claude roots with traversal policy."""
+
+    return tuple(root for root in transcript_roots(home) if root.source == "claudecode")
+
+
 def codex_session_roots(home: Path) -> tuple[Path, ...]:
     """Return all Codex rollout roots with live/archive priority preserved."""
 
+    return tuple(root.path for root in codex_transcript_roots(home))
+
+
+def codex_transcript_roots(home: Path) -> tuple[TranscriptRoot, ...]:
+    """Return Codex rollout roots with source and traversal policy."""
+
     return tuple(
-        root.path for root in transcript_roots(home) if root.source.startswith("codex")
+        root for root in transcript_roots(home) if root.source.startswith("codex")
     )
 
 
@@ -97,6 +213,44 @@ def _safe_managed_file(path: Path, root: Path) -> bool:
         return bool(relative.parts) and stat.S_ISREG(current.lstat().st_mode)
     except OSError:
         return False
+
+
+def iter_transcript_files(root: TranscriptRoot) -> Iterator[Path]:
+    """Yield a root's JSONL transcripts in stable path order.
+
+    Ambient provider roots retain their historical traversal behavior. Dynamic
+    Subfleet and Traycer roots use a non-following walk and revalidate every
+    component before admission, preventing a transcript-looking symlink from
+    escaping into credential or configuration siblings.
+    """
+
+    if root.reject_symlinks:
+        if not _is_real_directory(root.path):
+            return
+        candidates: list[Path] = []
+        for directory, child_directories, filenames in os.walk(
+            root.path, topdown=True, followlinks=False
+        ):
+            directory_path = Path(directory)
+            child_directories[:] = sorted(
+                name
+                for name in child_directories
+                if _is_real_directory(directory_path / name)
+            )
+            for filename in filenames:
+                if not filename.endswith(".jsonl"):
+                    continue
+                candidate = directory_path / filename
+                if _safe_managed_file(candidate, root.path):
+                    candidates.append(candidate)
+        yield from sorted(candidates)
+        return
+
+    if not root.path.exists():
+        return
+    yield from sorted(
+        candidate for candidate in root.path.rglob("*.jsonl") if candidate.is_file()
+    )
 
 
 def _db_shared_transcripts(
@@ -195,11 +349,7 @@ def discover_transcripts(
 
     seen_paths: set[Path] = set()
     for root in transcript_roots(home):
-        if not root.path.exists():
-            continue
-        for path in sorted(
-            candidate for candidate in root.path.rglob("*.jsonl") if candidate.is_file()
-        ):
+        for path in iter_transcript_files(root):
             absolute = _absolute(path)
             if absolute in seen_paths:
                 continue
