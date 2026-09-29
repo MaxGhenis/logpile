@@ -33,23 +33,32 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
 
 
 class BackupTests(unittest.TestCase):
-    def test_discovers_exact_numbered_codex_transcript_roots(self) -> None:
+    def test_discovers_exact_subfleet_lane_and_legacy_codex_roots(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
+            lanes = home / ".subfleet" / "lanes"
 
-            numbered_2_live = home / ".codex-2" / "sessions" / "two-live.jsonl"
-            numbered_10_live = home / ".codex-10" / "sessions" / "ten-live.jsonl"
-            numbered_2_archive = (
+            lane_2_live = lanes / "codex-2" / "sessions" / "lane-two-live.jsonl"
+            lane_10_live = lanes / "codex-10" / "sessions" / "lane-ten-live.jsonl"
+            lane_2_archive = (
+                lanes / "codex-2" / "archived_sessions" / "lane-two-archive.jsonl"
+            )
+            legacy_2_live = home / ".codex-2" / "sessions" / "two-live.jsonl"
+            legacy_10_live = home / ".codex-10" / "sessions" / "ten-live.jsonl"
+            legacy_2_archive = (
                 home / ".codex-2" / "archived_sessions" / "two-archive.jsonl"
             )
-            numbered_10_archive = (
+            legacy_10_archive = (
                 home / ".codex-10" / "archived_sessions" / "ten-archive.jsonl"
             )
             expected_files = [
-                numbered_2_live,
-                numbered_10_live,
-                numbered_2_archive,
-                numbered_10_archive,
+                lane_2_live,
+                lane_10_live,
+                legacy_2_live,
+                legacy_10_live,
+                lane_2_archive,
+                legacy_2_archive,
+                legacy_10_archive,
             ]
             for index, path in enumerate(expected_files):
                 write_jsonl(
@@ -57,29 +66,50 @@ class BackupTests(unittest.TestCase):
                     [{"type": "session_meta", "payload": {"id": f"kept-{index}"}}],
                 )
 
-            # Complete-name matching excludes backup-like Codex homes.
+            # Complete-name matching excludes backup-like Codex homes and
+            # lanes that are not numbered Codex lanes.
             for path in (
                 home / ".codex-backup" / "sessions" / "backup.jsonl",
                 home / ".codex-4-old" / "sessions" / "old.jsonl",
-                home / ".codex-2" / "credentials.jsonl",
+                lanes / "claude-1" / "sessions" / "claude-lane.jsonl",
+                lanes / "codex-api" / "sessions" / "api.jsonl",
             ):
                 write_jsonl(
                     path, [{"type": "session_meta", "payload": {"id": "decoy"}}]
                 )
 
-            # A transcript-looking symlink inside an admitted dynamic root must
+            # Lane homes hold credentials and other JSONL beside their
+            # transcripts. Only the exact native transcript children count.
+            for path in (
+                home / ".codex-2" / "credentials.jsonl",
+                lanes / "codex-2" / "credentials.jsonl",
+                lanes / "codex-2" / "log" / "events.jsonl",
+            ):
+                write_jsonl(
+                    path, [{"type": "session_meta", "payload": {"id": "decoy"}}]
+                )
+
+            # A transcript-looking symlink inside an admitted managed root must
             # not escape to credential siblings. Directory symlinks are pruned
             # before traversal and file symlinks are rejected before admission.
-            (home / ".codex-2" / "sessions" / "linked-credentials.jsonl").symlink_to(
-                home / ".codex-2" / "credentials.jsonl"
+            for link, target in (
+                (
+                    home / ".codex-2" / "sessions" / "linked-credentials.jsonl",
+                    home / ".codex-2" / "credentials.jsonl",
+                ),
+                (
+                    lanes / "codex-2" / "sessions" / "linked-credentials.jsonl",
+                    lanes / "codex-2" / "credentials.jsonl",
+                ),
+                (
+                    lanes / "codex-2" / "archived_sessions" / "linked-events.jsonl",
+                    lanes / "codex-2" / "log" / "events.jsonl",
+                ),
+            ):
+                link.symlink_to(target)
+            (lanes / "codex-10" / "sessions" / "linked-log").symlink_to(
+                lanes / "codex-2" / "log", target_is_directory=True
             )
-            credential_directory = home / ".codex-2" / "credential-history"
-            write_jsonl(
-                credential_directory / "secret.jsonl",
-                [{"type": "session_meta", "payload": {"id": "directory-decoy"}}],
-            )
-            linked_directory = home / ".codex-2" / "sessions" / "linked-history"
-            linked_directory.symlink_to(credential_directory, target_is_directory=True)
 
             roots = list(transcript_roots(home))
             self.assertEqual(
@@ -87,9 +117,12 @@ class BackupTests(unittest.TestCase):
                 [
                     (home / ".claude" / "projects", "claudecode"),
                     (home / ".codex" / "sessions", "codex"),
+                    (lanes / "codex-2" / "sessions", "codex"),
+                    (lanes / "codex-10" / "sessions", "codex"),
                     (home / ".codex-2" / "sessions", "codex"),
                     (home / ".codex-10" / "sessions", "codex"),
                     (home / ".codex" / "archived_sessions", "codex_archive"),
+                    (lanes / "codex-2" / "archived_sessions", "codex_archive"),
                     (home / ".codex-2" / "archived_sessions", "codex_archive"),
                     (home / ".codex-10" / "archived_sessions", "codex_archive"),
                 ],

@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,9 +20,19 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class TranscriptRoot:
+    """One transcript root and the traversal policy that applies to it.
+
+    ``anchor`` is ``None`` for the fixed ambient roots, which keep their
+    historical traversal. Dynamically discovered managed roots (Subfleet lane
+    homes and numbered ``~/.codex-N`` homes) carry the trusted directory they
+    were discovered under: every component from ``anchor`` down to ``path``
+    must be a real directory, and nothing below ``path`` is followed through
+    a symlink.
+    """
+
     path: Path
     source: str
-    reject_symlinks: bool = False
+    anchor: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -30,7 +41,16 @@ class DiscoveredTranscript:
     source: str
 
 
-_NUMBERED_CODEX_HOME = re.compile(r"\.codex-(?P<lane>[0-9]+)\Z")
+# Subfleet v1 gave each extra Codex subscription the home ``~/.codex-<n>``.
+# Subfleet v2 renames a transferred home to ``$SUBFLEET_HOME/lanes/codex-<n>``
+# and mints new lanes there. Only these exact names are lane homes; similarly
+# named backups or config directories are never traversed.
+_LEGACY_CODEX_HOME = re.compile(r"\.codex-(?P<lane>[0-9]+)")
+_SUBFLEET_CODEX_LANE = re.compile(r"codex-(?P<lane>[0-9]+)")
+
+
+def _absolute(path: Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
 
 
 def _is_real_directory(path: Path) -> bool:
@@ -42,70 +62,186 @@ def _is_real_directory(path: Path) -> bool:
         return False
 
 
-def _direct_real_directories(parent: Path) -> tuple[Path, ...]:
-    """List only immediate, non-symlink directory children deterministically."""
+def _real_directory_below(anchor: Path, path: Path) -> bool:
+    """Return whether ``path`` is reached from ``anchor`` through real directories.
 
-    if not _is_real_directory(parent):
+    ``anchor`` is trusted: like a home directory, it may itself be a symlink.
+    Every component below it, ``path`` included, must be a directory that is
+    not a symlink, so a swapped-in link cannot redirect discovery elsewhere.
+    """
+
+    anchor = _absolute(anchor)
+    path = _absolute(path)
+    try:
+        relative = path.relative_to(anchor)
+    except ValueError:
+        return False
+    try:
+        if not stat.S_ISDIR(anchor.stat().st_mode):
+            return False
+        current = anchor
+        for component in relative.parts:
+            current = current / component
+            if not stat.S_ISDIR(current.lstat().st_mode):
+                return False
+    except OSError:
+        return False
+    return True
+
+
+# Symlinks discovery declined to follow, reported once per process so that a
+# relocated state root or lane never drops out of sync and backup unseen.
+_REPORTED_SYMLINKS: set[Path] = set()
+
+
+def _report_symlink_below(anchor: Path, path: Path) -> None:
+    """Warn once if a symlink between ``anchor`` and ``path`` hid a lane root.
+
+    Missing directories are the normal case (no Subfleet, no archive yet) and
+    stay silent.
+    """
+
+    anchor = _absolute(anchor)
+    try:
+        relative = _absolute(path).relative_to(anchor)
+    except ValueError:
+        return
+    current = anchor
+    for component in relative.parts:
+        current = current / component
+        try:
+            mode = current.lstat().st_mode
+        except OSError:
+            return
+        if stat.S_ISLNK(mode):
+            break
+        if not stat.S_ISDIR(mode):
+            return
+    else:
+        return
+    if current in _REPORTED_SYMLINKS:
+        return
+    _REPORTED_SYMLINKS.add(current)
+    print(
+        f"Warning: not following symlink {current} to Codex transcripts; lane "
+        "roots must be real directories. For a relocated Subfleet state root, "
+        "set SUBFLEET_HOME to its real path.",
+        file=sys.stderr,
+    )
+
+
+def _numbered_lane_homes(
+    anchor: Path, parent: Path, pattern: re.Pattern[str]
+) -> tuple[Path, ...]:
+    """Return ``parent``'s real lane-home children in numeric lane order."""
+
+    if not _real_directory_below(anchor, parent):
+        _report_symlink_below(anchor, parent)
         return ()
     try:
         children = tuple(parent.iterdir())
     except OSError:
         return ()
-    return tuple(
-        sorted(
-            (path for path in children if _is_real_directory(path)),
-            key=lambda path: path.name,
-        )
-    )
-
-
-def _numbered_codex_roots(home: Path) -> tuple[TranscriptRoot, ...]:
-    """Return exact ``.codex-N`` lane transcript roots in numeric order.
-
-    Subfleet gives each additional Codex subscription an isolated numbered
-    ``CODEX_HOME``. Match the complete directory name so similarly named
-    backups or config directories are never traversed.
-    """
-
     lanes: list[tuple[int, str, Path]] = []
-    for path in _direct_real_directories(home):
-        match = _NUMBERED_CODEX_HOME.fullmatch(path.name)
+    for path in children:
+        match = pattern.fullmatch(path.name)
         if match is None:
+            continue
+        if not _is_real_directory(path):
+            _report_symlink_below(anchor, path)
             continue
         lanes.append((int(match.group("lane")), path.name, path))
     lanes.sort(key=lambda item: (item[0], item[1]))
+    return tuple(path for _, _, path in lanes)
 
-    live = [
-        TranscriptRoot(path / "sessions", "codex", reject_symlinks=True)
-        for _, _, path in lanes
-        if _is_real_directory(path / "sessions")
-    ]
-    archived = [
-        TranscriptRoot(
-            path / "archived_sessions", "codex_archive", reject_symlinks=True
-        )
-        for _, _, path in lanes
-        if _is_real_directory(path / "archived_sessions")
-    ]
-    return (*live, *archived)
+
+def _codex_home_roots(
+    anchor: Path, homes: tuple[Path, ...]
+) -> tuple[tuple[TranscriptRoot, ...], tuple[TranscriptRoot, ...]]:
+    """Return the live and archived rollout roots of managed Codex homes.
+
+    A Codex home also holds credentials and configuration, so only its exact
+    ``sessions`` and ``archived_sessions`` children are ever admitted.
+    """
+
+    def roots(name: str, source: str) -> tuple[TranscriptRoot, ...]:
+        found: list[TranscriptRoot] = []
+        for home in homes:
+            if _real_directory_below(anchor, home / name):
+                found.append(TranscriptRoot(home / name, source, anchor=anchor))
+            else:
+                _report_symlink_below(anchor, home / name)
+        return tuple(found)
+
+    return roots("sessions", "codex"), roots("archived_sessions", "codex_archive")
+
+
+def _current_user_home() -> Path | None:
+    try:
+        return _absolute(Path.home())
+    except RuntimeError:
+        return None
+
+
+def subfleet_state_root(home: Path) -> tuple[Path, Path]:
+    """Return Subfleet's state root for ``home`` and its trusted anchor.
+
+    Subfleet resolves its state root from ``SUBFLEET_HOME`` (default
+    ``~/.subfleet``). That variable describes the current user's environment,
+    so it applies only when ``home`` is the current user's home; scanning any
+    other home (``logpile backup --home``) uses that home's ``.subfleet``. A
+    relative value is ignored: it would mean whatever the working directory of
+    the reading process makes it. A state root inside ``home`` is validated
+    from ``home`` down; one configured outside ``home`` is itself the trusted
+    anchor.
+    """
+
+    home = _absolute(home)
+    state_root = home / ".subfleet"
+    configured = os.environ.get("SUBFLEET_HOME", "")
+    if configured and home == _current_user_home():
+        expanded = Path(configured).expanduser()
+        if expanded.is_absolute():
+            state_root = _absolute(expanded)
+    try:
+        state_root.relative_to(home)
+    except ValueError:
+        return state_root, state_root
+    return state_root, home
 
 
 def transcript_roots(home: Path) -> tuple[TranscriptRoot, ...]:
     """Return every supported transcript root in deterministic priority order.
 
-    Every Codex live root precedes every archive root so a live rollout wins a
-    session-stem collision even when it moves between managed homes. Standard
-    ambient roots are returned even while absent; dynamically managed roots
-    must already be real directories and may not be symlinks.
+    Sync keeps the first copy of a session ID, so order is precedence. Every
+    Codex live root precedes every archive root, so a live rollout wins even
+    when it is archived under a different home. Within each tier the ambient
+    ``~/.codex`` root comes first, then Subfleet v2 lane homes, then legacy
+    ``~/.codex-N`` homes. Subfleet moves a lane between the two layouts with
+    one rename, so both copies exist only when a home was copied rather than
+    moved; the v2 layout, where Subfleet keeps and creates lanes, then wins.
+    Standard ambient roots are returned even while absent; managed roots must
+    already be real directories below their anchor.
     """
 
     home = Path(home)
-    numbered = _numbered_codex_roots(home)
+    # Managed roots are validated and walked through one absolute spelling.
+    managed_home = _absolute(home)
+    state_root, state_anchor = subfleet_state_root(home)
+    lane_live, lane_archived = _codex_home_roots(
+        state_anchor,
+        _numbered_lane_homes(state_anchor, state_root / "lanes", _SUBFLEET_CODEX_LANE),
+    )
+    legacy_live, legacy_archived = _codex_home_roots(
+        managed_home,
+        _numbered_lane_homes(managed_home, managed_home, _LEGACY_CODEX_HOME),
+    )
     roots = [
         TranscriptRoot(home / ".claude" / "projects", "claudecode"),
         TranscriptRoot(home / ".codex" / "sessions", "codex"),
+        *lane_live,
+        *legacy_live,
     ]
-    roots.extend(root for root in numbered if root.source == "codex")
     openclaw_agents = home / ".openclaw" / "agents"
     if openclaw_agents.exists():
         roots.extend(
@@ -113,7 +249,8 @@ def transcript_roots(home: Path) -> tuple[TranscriptRoot, ...]:
             for path in sorted(openclaw_agents.glob("*/agent/codex-home/sessions"))
         )
     roots.append(TranscriptRoot(home / ".codex" / "archived_sessions", "codex_archive"))
-    roots.extend(root for root in numbered if root.source == "codex_archive")
+    roots.extend(lane_archived)
+    roots.extend(legacy_archived)
     return tuple(roots)
 
 
@@ -135,10 +272,6 @@ def codex_transcript_roots(home: Path) -> tuple[TranscriptRoot, ...]:
     return tuple(
         root for root in transcript_roots(home) if root.source.startswith("codex")
     )
-
-
-def _absolute(path: Path) -> Path:
-    return Path(os.path.abspath(os.path.expanduser(str(path))))
 
 
 def _safe_managed_file(path: Path, root: Path) -> bool:
@@ -168,35 +301,51 @@ def _safe_managed_file(path: Path, root: Path) -> bool:
         return False
 
 
+def _managed_transcript_files(root: Path, anchor: Path) -> list[Path]:
+    """Walk a managed root without following symlinks, anchor to leaf."""
+
+    if not _real_directory_below(anchor, root):
+        _report_symlink_below(anchor, root)
+        return []
+    candidates: list[Path] = []
+    for directory, child_directories, filenames in os.walk(
+        root, topdown=True, followlinks=False
+    ):
+        directory_path = Path(directory)
+        child_directories[:] = sorted(
+            name
+            for name in child_directories
+            if _is_real_directory(directory_path / name)
+        )
+        for filename in filenames:
+            if not filename.endswith(".jsonl"):
+                continue
+            candidate = directory_path / filename
+            if _safe_managed_file(candidate, root):
+                candidates.append(candidate)
+    # os.walk trusts each path it is handed. If an ancestor is a symlink once
+    # the walk ends, the files it listed may live elsewhere: admit none. A swap
+    # undone before this check goes unseen, and callers reopen files by path.
+    # These checks stop stray and misconfigured links, not a concurrent writer.
+    if not _real_directory_below(anchor, root):
+        _report_symlink_below(anchor, root)
+        return []
+    return sorted(candidates)
+
+
 def iter_transcript_files(root: TranscriptRoot) -> Iterator[Path]:
     """Yield a root's JSONL transcripts in stable path order.
 
-    Ambient provider roots retain their historical traversal behavior. Dynamic
-    Subfleet roots use a non-following walk and revalidate every
-    component before admission, preventing a transcript-looking symlink from
-    escaping into credential or configuration siblings.
+    Ambient provider roots retain their historical traversal behavior. Managed
+    roots are checked from their anchor down before and after a non-following
+    walk, and every file is revalidated below the root, so a transcript-looking
+    symlink or a symlinked ancestor cannot pull in credential or configuration
+    files from elsewhere. Files are reopened by path afterwards: this guards
+    against stray and misconfigured links, not a process racing the scan.
     """
 
-    if root.reject_symlinks:
-        if not _is_real_directory(root.path):
-            return
-        candidates: list[Path] = []
-        for directory, child_directories, filenames in os.walk(
-            root.path, topdown=True, followlinks=False
-        ):
-            directory_path = Path(directory)
-            child_directories[:] = sorted(
-                name
-                for name in child_directories
-                if _is_real_directory(directory_path / name)
-            )
-            for filename in filenames:
-                if not filename.endswith(".jsonl"):
-                    continue
-                candidate = directory_path / filename
-                if _safe_managed_file(candidate, root.path):
-                    candidates.append(candidate)
-        yield from sorted(candidates)
+    if root.anchor is not None:
+        yield from _managed_transcript_files(root.path, root.anchor)
         return
 
     if not root.path.exists():

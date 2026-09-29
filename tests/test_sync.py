@@ -2684,41 +2684,69 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             self.assertEqual(rows["rollout-codex2"], str(extra_home))
             self.assertEqual(rows["rollout-openclaw"], str(openclaw))
 
-    def test_sync_scans_numbered_codex_homes(self) -> None:
+    def test_sync_scans_subfleet_lanes_and_legacy_codex_homes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home = root / "home"
-            numbered_live = self._write_codex_rollout(
+            lane_live = self._write_codex_rollout(
+                home,
+                root=".subfleet/lanes/codex-3/sessions/2026/04/10",
+                session_id="rollout-lane-live",
+            )
+            lane_archive = self._write_codex_rollout(
+                home,
+                root=".subfleet/lanes/codex-12/archived_sessions/2026/04/10",
+                session_id="rollout-lane-archive",
+            )
+            legacy_live = self._write_codex_rollout(
                 home,
                 root=".codex-4/sessions/2026/04/10",
-                session_id="rollout-numbered-live",
+                session_id="rollout-legacy-live",
             )
-            numbered_archive = self._write_codex_rollout(
+            legacy_archive = self._write_codex_rollout(
                 home,
                 root=".codex-10/archived_sessions/2026/04/10",
-                session_id="rollout-numbered-archive",
+                session_id="rollout-legacy-archive",
             )
 
-            # Valid-looking transcript records outside the exact native
-            # subdirectories must remain invisible to sync.
-            self._write_codex_rollout(
+            # Valid-looking rollouts outside a lane's exact native
+            # subdirectories, or under names that are not Codex lane homes,
+            # must remain invisible to sync.
+            for decoy_root, decoy_id in (
+                (".codex-backup/sessions/2026/04/10", "rollout-legacy-decoy"),
+                (".subfleet/lanes/claude-2/sessions/2026/04/10", "rollout-claude"),
+                (".subfleet/lanes/codex-api/sessions/2026/04/10", "rollout-api"),
+            ):
+                self._write_codex_rollout(home, root=decoy_root, session_id=decoy_id)
+            lane_credential = self._write_codex_rollout(
                 home,
-                root=".codex-backup/sessions/2026/04/10",
-                session_id="rollout-numbered-decoy",
+                root=".subfleet/lanes/codex-3/credentials-history",
+                session_id="rollout-lane-credential",
             )
-            numbered_credential = self._write_codex_rollout(
+            legacy_credential = self._write_codex_rollout(
                 home,
                 root=".codex-4/credentials-history",
-                session_id="rollout-numbered-credential",
+                session_id="rollout-legacy-credential",
             )
-            (numbered_live.parent / "linked-numbered-credential.jsonl").symlink_to(
-                numbered_credential
+            for link, target in (
+                (
+                    lane_live.parent / "linked-lane-credential.jsonl",
+                    lane_credential,
+                ),
+                (
+                    legacy_live.parent / "linked-legacy-credential.jsonl",
+                    legacy_credential,
+                ),
+            ):
+                link.symlink_to(target)
+            (lane_live.parent / "linked-history").symlink_to(
+                lane_credential.parent, target_is_directory=True
             )
 
             result = sync_sessions(
                 root / "shared", root / "logpile.db", "alice", "m1", home
             )
-            self.assertEqual(result.new, 2)
+            self.assertEqual(result.new, 4)
 
             with open_sqlite(root / "logpile.db") as conn:
                 rows = {
@@ -2730,10 +2758,108 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             self.assertEqual(
                 rows,
                 {
-                    "rollout-numbered-live": str(numbered_live),
-                    "rollout-numbered-archive": str(numbered_archive),
+                    "rollout-lane-live": str(lane_live),
+                    "rollout-lane-archive": str(lane_archive),
+                    "rollout-legacy-live": str(legacy_live),
+                    "rollout-legacy-archive": str(legacy_archive),
                 },
             )
+
+    def test_sync_ignores_lane_reached_through_symlinked_state_root(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            home.mkdir()
+            elsewhere = root / "elsewhere"
+            self._write_codex_rollout(
+                elsewhere,
+                root="lanes/codex-1/sessions/2026/04/10",
+                session_id="rollout-outside-home",
+            )
+            (home / ".subfleet").symlink_to(elsewhere, target_is_directory=True)
+
+            result = sync_sessions(
+                root / "shared", root / "logpile.db", "alice", "m1", home
+            )
+
+            self.assertEqual(result.new, 0)
+            with open_sqlite(root / "logpile.db") as conn:
+                count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            self.assertEqual(count, 0)
+
+    def test_sync_prefers_subfleet_lane_over_legacy_home_for_same_rollout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            lane = self._write_codex_rollout(
+                home,
+                root=".subfleet/lanes/codex-2/sessions/2026/04/10",
+                session_id="rollout-moved",
+                message="current lane copy",
+            )
+            self._write_codex_rollout(
+                home,
+                root=".codex-2/sessions/2026/04/10",
+                session_id="rollout-moved",
+                message="leftover legacy copy",
+            )
+
+            result = sync_sessions(shared, root / "logpile.db", "alice", "m1", home)
+
+            self.assertEqual(result.new, 1)
+            with open_sqlite(root / "logpile.db") as conn:
+                row = conn.execute(
+                    "SELECT source_path, first_user_message FROM sessions "
+                    "WHERE session_id = 'rollout-moved'"
+                ).fetchone()
+            self.assertEqual(row["source_path"], str(lane))
+            self.assertEqual(row["first_user_message"], "current lane copy")
+            copies = list(shared.rglob("rollout-moved.jsonl"))
+            self.assertEqual(len(copies), 1)
+            self.assertIn("current lane copy", copies[0].read_text())
+
+    def test_sync_follows_lane_home_renamed_between_layouts(self) -> None:
+        """Subfleet moves a lane between layouts with one rename of its home."""
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            db_path = root / "logpile.db"
+            legacy_home = home / ".codex-2"
+            lane_home = home / ".subfleet" / "lanes" / "codex-2"
+            legacy = self._write_codex_rollout(
+                home,
+                root=".codex-2/sessions/2026/04/10",
+                session_id="rollout-lane",
+            )
+            moved = lane_home / legacy.relative_to(legacy_home)
+
+            def indexed() -> list[tuple[str, str]]:
+                with open_sqlite(db_path) as conn:
+                    return [
+                        (row["session_id"], row["source_path"])
+                        for row in conn.execute(
+                            "SELECT session_id, source_path FROM sessions"
+                        )
+                    ]
+
+            first = sync_sessions(root / "shared", db_path, "alice", "m1", home)
+            self.assertEqual(first.new, 1)
+            self.assertEqual(indexed(), [("rollout-lane", str(legacy))])
+
+            lane_home.parent.mkdir(parents=True)
+            legacy_home.rename(lane_home)
+            to_v2 = sync_sessions(root / "shared", db_path, "alice", "m1", home)
+            self.assertEqual((to_v2.new, to_v2.updated), (0, 1))
+            self.assertEqual(indexed(), [("rollout-lane", str(moved))])
+
+            lane_home.rename(legacy_home)
+            back_to_v1 = sync_sessions(root / "shared", db_path, "alice", "m1", home)
+            self.assertEqual((back_to_v1.new, back_to_v1.updated), (0, 1))
+            self.assertEqual(indexed(), [("rollout-lane", str(legacy))])
 
     def test_sync_prefers_live_copy_when_stem_exists_in_archive_too(self) -> None:
         with tempfile.TemporaryDirectory() as td:
