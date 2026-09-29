@@ -707,7 +707,12 @@ class VisibilityArtifactTests(unittest.TestCase):
             self.assertNotEqual(final_hash, before["file_hash"])
             self.assertEqual(retry_count, 0)
 
-    def test_legacy_private_row_without_archive_is_planned_and_healed(self) -> None:
+    # Preflight skips same-volume APFS clones, so these byte-copy plans pin
+    # clones off to behave the same on macOS and Linux.
+    @mock.patch("logpile.sync.apfs.clone_available", return_value=False)
+    def test_legacy_private_row_without_archive_is_planned_and_healed(
+        self, _clone_available
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home, shared, db_path, source = self._sync_private(root)
@@ -785,7 +790,10 @@ class VisibilityArtifactTests(unittest.TestCase):
             self.assertEqual(healed_archive.read_bytes(), source.read_bytes())
             self.assertEqual(retry_count, 0)
 
-    def test_free_space_preflight_reports_plan_and_starts_no_copy(self) -> None:
+    @mock.patch("logpile.sync.apfs.clone_available", return_value=False)
+    def test_free_space_preflight_reports_plan_and_starts_no_copy(
+        self, _clone_available
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             home, shared, db_path, source = self._paths(root)

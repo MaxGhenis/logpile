@@ -705,6 +705,7 @@ def _unchanged_on_disk(
     shared_dir: Path,
     *,
     preflight_source: tuple[int, float, str] | None = None,
+    any_source_path: bool = False,
 ) -> bool:
     """Cheap no-op check for a synced session: same path, same size+mtime,
     and the shared copy (when one is expected) still present.
@@ -712,6 +713,10 @@ def _unchanged_on_disk(
     file_hash() reads the whole file, and _copy_session hashes both sides
     again — tens of GB per sync once immutable archives are scanned. Any
     mismatch here just falls through to the full hash-and-parse path.
+
+    ``any_source_path`` drops the same-path requirement, for preflight: a
+    rollout moved with its size and mtime intact (archived, or its Subfleet
+    lane renamed) only gets its row updated, not a new copy.
     """
     if (
         "copy_retry_pending" in existing_row.keys()
@@ -724,7 +729,7 @@ def _unchanged_on_disk(
         return False
     if existing_row["file_size"] is None or existing_row["file_mtime"] is None:
         return False
-    if existing_row["source_path"] != str(jsonl_path):
+    if not any_source_path and existing_row["source_path"] != str(jsonl_path):
         return False
     try:
         stat = jsonl_path.stat()
@@ -1322,6 +1327,26 @@ def _format_copy_volume(value: int) -> str:
     return f"{amount:.1f} {unit}"
 
 
+def _clone_device(shared_dir: Path) -> int | None:
+    """Device on which the copy path clones sources instead of copying bytes."""
+    if not apfs.clone_available():
+        return None
+    try:
+        return os.stat(shared_dir).st_dev
+    except OSError:
+        return None
+
+
+def _clones_onto(source: os.stat_result, clone_device: int | None) -> bool:
+    """Whether the copy path would clone this source (see _clone_to_temporary_sibling)."""
+    return (
+        clone_device is not None
+        and source.st_dev == clone_device
+        and stat.S_ISREG(source.st_mode)
+        and _clone_allowed_by_flags(source)
+    )
+
+
 def _preflight_shared_copy_volume(
     *,
     home: Path,
@@ -1329,9 +1354,19 @@ def _preflight_shared_copy_volume(
     existing: dict[str, object],
     patterns: list[str],
 ) -> tuple[int, int, dict[str, tuple[int, float, str]]]:
-    """Plan conservative archival-copy volume before mutating storage."""
+    """Plan conservative archival-copy volume before mutating storage.
+
+    Planned: transcripts whose archival copy would be new byte copies. A row
+    whose source moved with its size and mtime intact needs no copy, and on
+    APFS a same-volume copy is a clone that shares its source's blocks, so
+    neither plans bytes. A clone can still fall back to a byte copy (an ACL or
+    flag the copy path refuses, or a volume that cannot clone); if that copy
+    runs out of space it fails and is recorded for retry, like any other.
+    """
     planned_bytes = 0
     planned_files = 0
+    planned_clones = 0
+    clone_device = _clone_device(shared_dir)
     public_source_hashes: dict[str, tuple[int, float, str]] = {}
     seen_session_ids: set[tuple[str, str]] = set()
     for discovered in discover_transcripts(home):
@@ -1342,7 +1377,11 @@ def _preflight_shared_copy_volume(
             jsonl_path
         ):
             continue
-        session_key = (discovered.source, jsonl_path.stem)
+        # The Codex loop keeps one copy per stem across live and archive roots.
+        provider = (
+            "codex" if discovered.source.startswith("codex") else discovered.source
+        )
+        session_key = (provider, jsonl_path.stem)
         if session_key in seen_session_ids:
             continue
         seen_session_ids.add(session_key)
@@ -1364,21 +1403,27 @@ def _preflight_shared_copy_volume(
             jsonl_path,
             shared_dir,
             preflight_source=preflight_source,
+            any_source_path=True,
         ):
             continue
         try:
-            size = jsonl_path.stat().st_size
+            source_stat = jsonl_path.stat()
         except OSError:
             continue
-        planned_bytes += max(0, size)
+        if _clones_onto(source_stat, clone_device):
+            planned_clones += 1
+            continue
+        planned_bytes += max(0, source_stat.st_size)
         planned_files += 1
 
     if not planned_files:
         return 0, 0, public_source_hashes
     free_bytes = shutil.disk_usage(shared_dir).free
+    clones = f" (plus {planned_clones} as APFS clones)" if planned_clones else ""
     message = (
         "Archival shared-copy preflight plans "
-        f"{_format_copy_volume(planned_bytes)} across {planned_files} transcript(s); "
+        f"{_format_copy_volume(planned_bytes)} across {planned_files} "
+        f"transcript(s){clones}; "
         f"{_format_copy_volume(free_bytes)} free at {shared_dir}."
     )
     print(f"Warning: {message}", file=sys.stderr)

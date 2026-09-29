@@ -134,7 +134,13 @@ Unchanged files are skipped on a size+mtime fast path, so multi-GB immutable
 archives are hashed once, not every sync.
 Logpile intentionally keeps archival shared copies. Before copying, sync prints
 the planned copy count/volume and available free space; it refuses an
-insufficient-space plan. A source hash/mtime is committed only after the shared
+insufficient-space plan. The plan counts only new byte copies: a transcript
+whose row already holds it under another path with the same size and mtime
+(archived, or in a renamed lane) needs no copy, and on APFS a copy on the
+same volume is a clone (see below) that takes no new data blocks. If a clone
+falls back to a byte copy and the disk fills, that copy fails and is kept for
+retry, like any other failed copy.
+A source hash/mtime is committed only after the shared
 copy matches that hash, and failed verification is persisted for retry.
 
 On macOS with APFS, each shared copy is a `clonefile(2)` clone: an independent

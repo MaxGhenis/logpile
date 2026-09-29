@@ -24,6 +24,7 @@ from logpile.origins import derive_session_origin
 from logpile.sync import (
     SESSION_IDENTITY_VERSION,
     SESSION_TOKEN_VERSION,
+    _preflight_shared_copy_volume,
     sync_sessions,
 )
 from logpile.web.app import create_app
@@ -2860,6 +2861,70 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             back_to_v1 = sync_sessions(root / "shared", db_path, "alice", "m1", home)
             self.assertEqual((back_to_v1.new, back_to_v1.updated), (0, 1))
             self.assertEqual(indexed(), [("rollout-lane", str(legacy))])
+
+    def test_lane_rename_plans_no_copy_and_syncs_without_free_space(self) -> None:
+        """Renaming an indexed lane only updates rows, so a full disk is fine."""
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            db_path = root / "logpile.db"
+            self._write_codex_rollout(
+                home,
+                root=".codex-2/sessions/2026/04/10",
+                session_id="rollout-renamed",
+                message="x" * 50_000,
+            )
+            sync_sessions(root / "shared", db_path, "alice", "m1", home)
+            (home / ".subfleet" / "lanes").mkdir(parents=True)
+            (home / ".codex-2").rename(home / ".subfleet" / "lanes" / "codex-2")
+
+            full = shutil.disk_usage(root)._replace(free=0)
+            with (
+                mock.patch("logpile.sync.apfs.clone_available", return_value=False),
+                mock.patch("logpile.sync.shutil.disk_usage", return_value=full),
+            ):
+                result = sync_sessions(root / "shared", db_path, "alice", "m1", home)
+
+            self.assertEqual((result.new, result.updated), (0, 1))
+            with open_sqlite(db_path) as conn:
+                source_path = conn.execute(
+                    "SELECT source_path FROM sessions"
+                ).fetchone()[0]
+            self.assertIn("/.subfleet/lanes/codex-2/sessions/", source_path)
+
+    def test_preflight_counts_one_codex_copy_per_stem_and_skips_clones(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            shared = root / "shared"
+            shared.mkdir()
+            live = self._write_codex_rollout(
+                home, root=".codex/sessions", session_id="rollout-both"
+            )
+            self._write_codex_rollout(
+                home,
+                root=".codex/archived_sessions",
+                session_id="rollout-both",
+                message="an older archived copy of the same session",
+            )
+
+            def plan(clones: bool) -> tuple[int, int]:
+                with mock.patch(
+                    "logpile.sync.apfs.clone_available", return_value=clones
+                ):
+                    planned_bytes, planned_files, _ = _preflight_shared_copy_volume(
+                        home=home, shared_dir=shared, existing={}, patterns=[]
+                    )
+                return planned_bytes, planned_files
+
+            with mock.patch("sys.stderr"):
+                # Sync keeps the live copy, so only it is planned.
+                self.assertEqual(plan(clones=False), (live.stat().st_size, 1))
+                # A same-volume source becomes an APFS clone: no new blocks.
+                self.assertEqual(plan(clones=True), (0, 0))
 
     def test_sync_prefers_live_copy_when_stem_exists_in_archive_too(self) -> None:
         with tempfile.TemporaryDirectory() as td:
