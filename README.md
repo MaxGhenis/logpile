@@ -97,39 +97,47 @@ Options:
 Scans `~/.claude/projects/**/*.jsonl` plus every Codex rollout root —
 `~/.codex/{sessions,archived_sessions}`, Subfleet Codex lane homes
 `$SUBFLEET_HOME/lanes/codex-<n>/{sessions,archived_sessions}` (default
-`~/.subfleet`), legacy numbered Subfleet homes
-`~/.codex-<n>/{sessions,archived_sessions}`, and OpenClaw codex homes
-(`~/.openclaw/agents/*/agent/codex-home/sessions`). Lane names must match
-exactly, so `~/.codex-backup` or `lanes/codex-api` are never read. A lane home
-also holds credentials and configuration, so only its `sessions` and
-`archived_sessions` children are scanned, never the home itself.
-`SUBFLEET_HOME` applies only when scanning the current user's home;
-`logpile backup --home` pointing elsewhere uses that home's `.subfleet`.
+`~/.subfleet`), the legacy Subfleet v1 homes `~/.codex-1` through `~/.codex-9`
+with the same two children, and OpenClaw codex homes
+(`~/.openclaw/agents/*/agent/codex-home/sessions`). Names must match exactly,
+so `~/.codex-backup`, a dated `~/.codex-20260915` or `lanes/codex-api` are
+never read. A lane home also holds credentials and configuration, so only its
+`sessions` and `archived_sessions` children are scanned, never the home
+itself. Subfleet moves a lane under `lanes/` when it takes the lane over from
+v1; a lane Subfleet enrolled in place elsewhere is not discovered.
 
-Lane roots must be reached through real directories. Your home may be a
-symlink, but every directory below it down to a lane's transcript directory
-(`.subfleet`, `lanes`, `codex-<n>`, `sessions`) must not be. A `SUBFLEET_HOME`
-outside your home is trusted the same way as the home, and the rule applies
-below it; a relative `SUBFLEET_HOME` is ignored. When a symlink hides a lane,
-sync and backup print a warning naming it, once per run. To keep Subfleet
-state on another volume, point `SUBFLEET_HOME` at it rather than symlinking
-`~/.subfleet`. Symlinked files and directories inside a lane's transcript
-directory are skipped without a warning. The ancestor chain is checked before
-each root's walk and again after it. These checks keep stray or misconfigured
-links from pulling other JSONL files, such as a Codex home's `history.jsonl`,
-into sync or backup. They are not a defense against a process running as you:
-files are reopened by path afterwards, and a hard link, or a swap undone
-during a walk, goes undetected.
+`SUBFLEET_HOME` applies only when scanning the current user's home, so
+`logpile backup --home` pointing elsewhere uses that home's `.subfleet`.
+Logpile resolves it the way Subfleet does and trusts the result, so it may
+point through a symlink. A relative value, or a `~user` that does not exist,
+is ignored with a warning.
+
+Every directory from your home down to a lane's transcript directory
+(`.subfleet`, `lanes`, `codex-<n>`, `sessions`) must be a real directory, not
+a symlink; your home itself may be one, and below a configured `SUBFLEET_HOME`
+the same rule applies. Symlinked files and directories inside a transcript
+directory are skipped. When a symlink or an unreadable directory hides a lane,
+sync and backup print a warning naming it, once per run. To keep the default
+`~/.subfleet` on another volume, set `SUBFLEET_HOME` to its real path. The
+ancestor chain is checked before each root's walk and again after it. These
+checks keep stray or misconfigured links from pulling other JSONL files, such
+as a Codex home's `history.jsonl`, into sync or backup. They are not a defense
+against a process running as you: files are reopened by path afterwards, and
+a hard link, or a swap undone during a walk, goes undetected.
 
 Sync extracts repo metadata, activity counts, narrative fields, and origin
 classification, then writes to SQLite. If a session ID exists in more than one
-root for the same provider, the first root wins. Every live Codex `sessions/`
-root precedes every archive. Within each tier `~/.codex` comes first, then
-Subfleet lanes, then legacy `~/.codex-<n>` homes, each in lane-number order.
-Subfleet moves a lane between `~/.codex-<n>` and `lanes/codex-<n>` with a
-single rename, so a rollout is in both places only if a home was copied
-rather than moved; the lane copy then wins. A moved rollout keeps its indexed
-row, with its source path updated on the next sync.
+root for the same provider, the first root wins. Each Codex home lists its
+live `sessions/` root before its `archived_sessions/` root, so a rollout
+caught mid-archive is read from its live copy. Homes come in this order:
+`~/.codex`, Subfleet lanes, legacy `~/.codex-<n>` homes (each in lane-number
+order), then OpenClaw. Subfleet moves a lane between `~/.codex-<n>` and
+`lanes/codex-<n>` with a single rename, so a rollout appears in two homes only
+when a home was copied rather than moved; the earlier home then wins. A moved
+rollout keeps its indexed row, with its source path updated on the next sync.
+When a moved session's content later changes, sync resolves its visibility
+again against the new path, so visibility rules that match `source_path`
+should cover both layouts.
 Unchanged files are skipped on a size+mtime fast path, so multi-GB immutable
 archives are hashed once, not every sync.
 Logpile intentionally keeps archival shared copies. Before copying, sync prints

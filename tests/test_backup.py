@@ -44,21 +44,21 @@ class BackupTests(unittest.TestCase):
                 lanes / "codex-2" / "archived_sessions" / "lane-two-archive.jsonl"
             )
             legacy_2_live = home / ".codex-2" / "sessions" / "two-live.jsonl"
-            legacy_10_live = home / ".codex-10" / "sessions" / "ten-live.jsonl"
+            legacy_9_live = home / ".codex-9" / "sessions" / "nine-live.jsonl"
             legacy_2_archive = (
                 home / ".codex-2" / "archived_sessions" / "two-archive.jsonl"
             )
-            legacy_10_archive = (
-                home / ".codex-10" / "archived_sessions" / "ten-archive.jsonl"
+            legacy_9_archive = (
+                home / ".codex-9" / "archived_sessions" / "nine-archive.jsonl"
             )
             expected_files = [
                 lane_2_live,
+                lane_2_archive,
                 lane_10_live,
                 legacy_2_live,
-                legacy_10_live,
-                lane_2_archive,
                 legacy_2_archive,
-                legacy_10_archive,
+                legacy_9_live,
+                legacy_9_archive,
             ]
             for index, path in enumerate(expected_files):
                 write_jsonl(
@@ -66,11 +66,14 @@ class BackupTests(unittest.TestCase):
                     [{"type": "session_meta", "payload": {"id": f"kept-{index}"}}],
                 )
 
-            # Complete-name matching excludes backup-like Codex homes and
-            # lanes that are not numbered Codex lanes.
+            # Complete-name matching excludes backup-like Codex homes, homes
+            # outside Subfleet v1's ~/.codex-1 to ~/.codex-9, and lanes that
+            # are not numbered Codex lanes.
             for path in (
                 home / ".codex-backup" / "sessions" / "backup.jsonl",
                 home / ".codex-4-old" / "sessions" / "old.jsonl",
+                home / ".codex-10" / "sessions" / "ten.jsonl",
+                home / ".codex-20260915" / "sessions" / "dated-backup.jsonl",
                 lanes / "claude-1" / "sessions" / "claude-lane.jsonl",
                 lanes / "codex-api" / "sessions" / "api.jsonl",
             ):
@@ -117,14 +120,14 @@ class BackupTests(unittest.TestCase):
                 [
                     (home / ".claude" / "projects", "claudecode"),
                     (home / ".codex" / "sessions", "codex"),
+                    (home / ".codex" / "archived_sessions", "codex_archive"),
                     (lanes / "codex-2" / "sessions", "codex"),
+                    (lanes / "codex-2" / "archived_sessions", "codex_archive"),
                     (lanes / "codex-10" / "sessions", "codex"),
                     (home / ".codex-2" / "sessions", "codex"),
-                    (home / ".codex-10" / "sessions", "codex"),
-                    (home / ".codex" / "archived_sessions", "codex_archive"),
-                    (lanes / "codex-2" / "archived_sessions", "codex_archive"),
                     (home / ".codex-2" / "archived_sessions", "codex_archive"),
-                    (home / ".codex-10" / "archived_sessions", "codex_archive"),
+                    (home / ".codex-9" / "sessions", "codex"),
+                    (home / ".codex-9" / "archived_sessions", "codex_archive"),
                 ],
             )
             self.assertEqual(

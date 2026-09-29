@@ -2706,7 +2706,7 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             )
             legacy_archive = self._write_codex_rollout(
                 home,
-                root=".codex-10/archived_sessions/2026/04/10",
+                root=".codex-9/archived_sessions/2026/04/10",
                 session_id="rollout-legacy-archive",
             )
 
@@ -2715,6 +2715,7 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             # must remain invisible to sync.
             for decoy_root, decoy_id in (
                 (".codex-backup/sessions/2026/04/10", "rollout-legacy-decoy"),
+                (".codex-20260915/sessions/2026/04/10", "rollout-dated-backup"),
                 (".subfleet/lanes/claude-2/sessions/2026/04/10", "rollout-claude"),
                 (".subfleet/lanes/codex-api/sessions/2026/04/10", "rollout-api"),
             ):
@@ -2861,6 +2862,62 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             back_to_v1 = sync_sessions(root / "shared", db_path, "alice", "m1", home)
             self.assertEqual((back_to_v1.new, back_to_v1.updated), (0, 1))
             self.assertEqual(indexed(), [("rollout-lane", str(legacy))])
+
+    def test_sync_prefers_newer_ambient_archive_over_stale_copy_in_another_home(
+        self,
+    ) -> None:
+        """A home seeded by copying ~/.codex must not shadow ~/.codex itself.
+
+        Each home lists its live root before its archive, and ~/.codex comes
+        first, so a copied home's stale live rollout cannot beat the rollout
+        Codex kept appending to and then archived in ~/.codex.
+        """
+
+        for copy in (".codex-2", ".subfleet/lanes/codex-2"):
+            with self.subTest(copy), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                home = root / "home"
+                live = self._write_codex_rollout(
+                    home,
+                    root=".codex/sessions/2026/04/10",
+                    session_id="rollout-copied",
+                    message="first turn",
+                )
+                sync_sessions(root / "shared", root / "logpile.db", "alice", "m1", home)
+
+                (home / copy).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(home / ".codex", home / copy)
+                with live.open("a", encoding="utf-8") as fh:
+                    fh.write(
+                        json.dumps(
+                            {
+                                "timestamp": "2026-04-10T10:05:00Z",
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "input_text", "text": "second turn"}
+                                    ],
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+                archived = home / ".codex" / "archived_sessions" / live.name
+                archived.parent.mkdir(parents=True)
+                live.rename(archived)
+
+                sync_sessions(root / "shared", root / "logpile.db", "alice", "m1", home)
+
+                with open_sqlite(root / "logpile.db") as conn:
+                    row = conn.execute(
+                        "SELECT source_path, user_message_count, shared_path "
+                        "FROM sessions WHERE session_id = 'rollout-copied'"
+                    ).fetchone()
+                self.assertEqual(row["source_path"], str(archived))
+                self.assertEqual(row["user_message_count"], 2)
+                self.assertIn("second turn", Path(row["shared_path"]).read_text())
 
     def test_lane_rename_plans_no_copy_and_syncs_without_free_space(self) -> None:
         """Renaming an indexed lane only updates rows, so a full disk is fine."""
