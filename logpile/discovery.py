@@ -90,39 +90,6 @@ def _numbered_codex_roots(home: Path) -> tuple[TranscriptRoot, ...]:
     return (*live, *archived)
 
 
-def _traycer_profile_roots(home: Path) -> tuple[TranscriptRoot, ...]:
-    """Return exact transcript subdirectories for Traycer-managed profiles.
-
-    A managed profile's directory is also its provider config home. Enumerate
-    profile directories only one level deep, then admit the provider's exact
-    transcript subdirectory. Credential and configuration siblings are never
-    recursively scanned.
-    """
-
-    accounts_root = home / ".traycer" / "harness-accounts"
-    claude_profiles = _direct_real_directories(accounts_root / "claude-code")
-    codex_profiles = _direct_real_directories(accounts_root / "codex")
-
-    claude = [
-        TranscriptRoot(profile / "projects", "claudecode", reject_symlinks=True)
-        for profile in claude_profiles
-        if _is_real_directory(profile / "projects")
-    ]
-    codex_live = [
-        TranscriptRoot(profile / "sessions", "codex", reject_symlinks=True)
-        for profile in codex_profiles
-        if _is_real_directory(profile / "sessions")
-    ]
-    codex_archived = [
-        TranscriptRoot(
-            profile / "archived_sessions", "codex_archive", reject_symlinks=True
-        )
-        for profile in codex_profiles
-        if _is_real_directory(profile / "archived_sessions")
-    ]
-    return (*claude, *codex_live, *codex_archived)
-
-
 def transcript_roots(home: Path) -> tuple[TranscriptRoot, ...]:
     """Return every supported transcript root in deterministic priority order.
 
@@ -134,10 +101,10 @@ def transcript_roots(home: Path) -> tuple[TranscriptRoot, ...]:
 
     home = Path(home)
     numbered = _numbered_codex_roots(home)
-    traycer = _traycer_profile_roots(home)
-    roots = [TranscriptRoot(home / ".claude" / "projects", "claudecode")]
-    roots.extend(root for root in traycer if root.source == "claudecode")
-    roots.append(TranscriptRoot(home / ".codex" / "sessions", "codex"))
+    roots = [
+        TranscriptRoot(home / ".claude" / "projects", "claudecode"),
+        TranscriptRoot(home / ".codex" / "sessions", "codex"),
+    ]
     roots.extend(root for root in numbered if root.source == "codex")
     openclaw_agents = home / ".openclaw" / "agents"
     if openclaw_agents.exists():
@@ -145,10 +112,8 @@ def transcript_roots(home: Path) -> tuple[TranscriptRoot, ...]:
             TranscriptRoot(path, "codex")
             for path in sorted(openclaw_agents.glob("*/agent/codex-home/sessions"))
         )
-    roots.extend(root for root in traycer if root.source == "codex")
     roots.append(TranscriptRoot(home / ".codex" / "archived_sessions", "codex_archive"))
     roots.extend(root for root in numbered if root.source == "codex_archive")
-    roots.extend(root for root in traycer if root.source == "codex_archive")
     return tuple(roots)
 
 
@@ -156,18 +121,6 @@ def claude_projects_root(home: Path) -> Path:
     """Return the canonical Claude Code projects root."""
 
     return Path(home) / ".claude" / "projects"
-
-
-def claude_project_roots(home: Path) -> tuple[Path, ...]:
-    """Return ambient and managed Claude Code transcript roots."""
-
-    return tuple(root.path for root in claude_transcript_roots(home))
-
-
-def claude_transcript_roots(home: Path) -> tuple[TranscriptRoot, ...]:
-    """Return ambient and managed Claude roots with traversal policy."""
-
-    return tuple(root for root in transcript_roots(home) if root.source == "claudecode")
 
 
 def codex_session_roots(home: Path) -> tuple[Path, ...]:
@@ -219,7 +172,7 @@ def iter_transcript_files(root: TranscriptRoot) -> Iterator[Path]:
     """Yield a root's JSONL transcripts in stable path order.
 
     Ambient provider roots retain their historical traversal behavior. Dynamic
-    Subfleet and Traycer roots use a non-following walk and revalidate every
+    Subfleet roots use a non-following walk and revalidate every
     component before admission, preventing a transcript-looking symlink from
     escaping into credential or configuration siblings.
     """
