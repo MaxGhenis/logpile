@@ -2081,6 +2081,14 @@ from logpile.sync import _copy_session
 
 class CopySessionAtomicityTests(unittest.TestCase):
     def setUp(self) -> None:
+        # These cases pin the byte-copy path's failure handling, which is the
+        # fallback wherever clonefile(2) is unavailable.  Disable cloning so
+        # macOS runs them too; tests/test_clone_storage.py covers the clone.
+        no_clone = _mock.patch.object(
+            _sync_module, "_clone_to_temporary_sibling", return_value=None
+        )
+        no_clone.start()
+        self.addCleanup(no_clone.stop)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         root = Path(self._tmp.name)

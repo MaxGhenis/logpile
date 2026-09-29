@@ -776,6 +776,66 @@ def sync(
         )
 
 
+@cli.command(name="reclone-shared")
+@click.option(
+    "--apply",
+    "apply_changes",
+    is_flag=True,
+    help="Replace verified identical copies with clones (default: dry run).",
+)
+@click.option(
+    "--db", default=str(DEFAULT_DB), show_default=True, help="SQLite database path"
+)
+@click.option(
+    "--shared-dir",
+    "--shared",
+    "shared_dir",
+    default=str(DEFAULT_SHARED),
+    show_default=True,
+    help="Managed shared-copy directory",
+)
+@click.option("-v", "--verbose", is_flag=True, help="Print every file decision")
+def reclone_shared(apply_changes, db, shared_dir, verbose):
+    """Reclaim disk by turning byte-identical shared copies into APFS clones.
+
+    Shared copies written before sync cloned by default are full byte copies.
+    For every copy whose source still exists with the same size and sha256,
+    --apply clones the source beside the copy, verifies the clone's sha256,
+    and atomically renames it over the copy (mode 0600).  The clone stays an
+    independent file if the source is later appended or deleted.  Holds the
+    sync lock for the whole run; never writes the database; safe to
+    interrupt.
+    """
+    from .reclone import (
+        RecloneLockContended,
+        format_report,
+        reclone_shared_copies,
+    )
+    from .sync import SyncLockError
+
+    def progress(done: int, total: int) -> None:
+        if done % 5000 == 0 or done == total:
+            click.echo(f"  examined {done:,}/{total:,}", err=True)
+
+    try:
+        report = reclone_shared_copies(
+            Path(db),
+            Path(shared_dir),
+            apply=apply_changes,
+            progress=None if verbose else progress,
+            log=(lambda line: click.echo(line, err=True)) if verbose else None,
+        )
+    except RecloneLockContended as exc:
+        click.echo(f"Error: {exc}", err=True)
+        raise click.exceptions.Exit(75) from exc
+    except (SyncLockError, FileNotFoundError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    for line in format_report(report):
+        click.echo(line)
+    if report.errors:
+        raise click.exceptions.Exit(1)
+
+
 @cli.command()
 @click.option("--shared", default=str(DEFAULT_SHARED), show_default=True)
 @click.option("--db", default=str(DEFAULT_DB), show_default=True)
