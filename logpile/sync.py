@@ -3174,7 +3174,15 @@ def _sync_sessions(
                         skipped_count += 1
                         continue
                     if isinstance(info, PrivateSessionMarker):
-                        delete_transcript_checkpoint(conn, str(jsonl_path))
+                        _record_parse_checkpoint(
+                            conn,
+                            jsonl_path=jsonl_path,
+                            session_id=session_id,
+                            source="claudecode",
+                            transcript=transcript,
+                            parsed=parsed,
+                            now=now,
+                        )
                         if existing_row:
                             try:
                                 _tighten_private_marker(
@@ -3522,7 +3530,15 @@ def _sync_sessions(
                         skipped_count += 1
                         continue
                     if isinstance(info, PrivateSessionMarker):
-                        delete_transcript_checkpoint(conn, str(jsonl_path))
+                        _record_parse_checkpoint(
+                            conn,
+                            jsonl_path=jsonl_path,
+                            session_id=session_id,
+                            source="codex",
+                            transcript=transcript,
+                            parsed=parsed,
+                            now=now,
+                        )
                         if existing_row:
                             try:
                                 _tighten_private_marker(

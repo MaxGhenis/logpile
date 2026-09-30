@@ -2905,6 +2905,9 @@ IN_MEMORY_SPOOL_MAX_BYTES = 16 * 1024 * 1024
 # Bump whenever _ClaudeStream/_CodexStream fold differently or their state
 # changes shape: persisted parse states from another version are discarded.
 PARSE_STATE_VERSION = 1
+# Generation of a checkpoint that records only where a session's first privacy
+# marker lies (followed by the marker); such a checkpoint has no state file.
+MARKER_GENERATION = "marker:"
 
 
 def _new_spool(path: Path | TextIO, size: int | None = None) -> _ParseSpool:
@@ -3006,15 +3009,24 @@ def parse_transcript(
     stream_type = _STREAMS[source]
     stream = None
     resumed_from = 0
-    if (
-        state_path is not None
-        and checkpoint is not None
+    prefix_unchanged = bool(
+        checkpoint is not None
         and checkpoint.version == PARSE_STATE_VERSION
         and (checkpoint.dev, checkpoint.ino) == (scan.dev, scan.ino)
         and checkpoint.offset <= scan.line_end
         and scan.prefix_matches(checkpoint.offset, checkpoint.prefix_sha256)
-        and state_path.exists()
-    ):
+    )
+    if prefix_unchanged and checkpoint.generation.startswith(MARKER_GENERATION):
+        # The first privacy marker lies in the unchanged prefix, so a full
+        # parse returns exactly this marker whatever was appended.
+        return TranscriptParse(
+            info=PrivateSessionMarker(
+                path.stem, source, checkpoint.generation[len(MARKER_GENERATION) :]
+            ),
+            checkpoint=checkpoint,
+            resumed_from=checkpoint.offset,
+        )
+    if prefix_unchanged and state_path is not None and state_path.exists():
         try:
             stream = _resume_stream(source, state_path, checkpoint)
         except (OSError, sqlite3.Error):
@@ -3048,6 +3060,24 @@ def parse_transcript(
                     stream.feed(record)
             if stats.io_errors:
                 result.close()
+                return result
+            if spool.persistent and stream.private_marker:
+                # A session that opted out of indexing keeps no derived
+                # content (first message, commands, paths) between syncs,
+                # only where its marker sits: the result is the marker for
+                # as long as these bytes are unchanged.
+                result.close()
+                remove_parse_state(state_path)
+                result.checkpoint = ParseCheckpoint(
+                    offset=scan.line_end,
+                    prefix_sha256=scan.line_end_sha256,
+                    generation=MARKER_GENERATION + stream.private_marker,
+                    dev=scan.dev,
+                    ino=scan.ino,
+                )
+                result.info = PrivateSessionMarker(
+                    path.stem, source, stream.private_marker
+                )
                 return result
             if spool.persistent:
                 stream.settle()
@@ -3084,8 +3114,7 @@ def parse_transcript(
                     return result
         result.info = stream.finish(path)
         if isinstance(result.info, PrivateSessionMarker) and state_path is not None:
-            # A session that opted out of indexing keeps no derived content
-            # (first message, commands, paths) on disk between syncs.
+            # The marker is only in the unterminated tail: keep nothing.
             result.close()
             remove_parse_state(state_path)
             result.checkpoint = None

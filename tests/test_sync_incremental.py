@@ -870,12 +870,26 @@ class ParseStateCollectionTests(unittest.TestCase):
             harness.sync()
             self.assertEqual(list(state_dir.iterdir()), [])
             with closing(sqlite3.connect(harness.db)) as conn:
-                visibility, checkpoints = conn.execute(
-                    "SELECT visibility, (SELECT COUNT(*) FROM transcript_checkpoints) "
+                visibility, generation = conn.execute(
+                    "SELECT visibility, "
+                    "(SELECT parse_generation FROM transcript_checkpoints) "
                     "FROM sessions"
                 ).fetchone()
             self.assertEqual(visibility, "private")
-            self.assertEqual(checkpoints, 0)
+            # Only where the marker lies is kept, not any derived content.
+            self.assertEqual(generation, "marker:" + marker)
+
+            # While those bytes are unchanged, appends are never parsed.
+            _append(path, _lines(_session_records(2, start=10)))
+            import logpile.parsers as parsers_module
+
+            with mock.patch.object(
+                parsers_module._ClaudeStream,
+                "feed",
+                side_effect=AssertionError("parsed"),
+            ):
+                harness.sync()
+            self.assertEqual(list(state_dir.iterdir()), [])
 
     def test_damaged_state_file_falls_back_to_a_full_parse(self):
         with tempfile.TemporaryDirectory() as td:
