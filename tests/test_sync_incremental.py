@@ -564,6 +564,73 @@ class DuplicateSessionCopyTests(unittest.TestCase):
             self.assertEqual(source_path, str(older))
 
 
+class DuplicateCopyMarkerTests(unittest.TestCase):
+    def _copies(self, harness):
+        projects = harness.home / ".claude" / "projects"
+        marked = projects / "-Users-alice-demo" / "shared-id.jsonl"
+        newer = projects / "-Users-alice-demo-worktree" / "shared-id.jsonl"
+        marker = "logpile" + ":private"
+        _append(
+            marked,
+            _lines(
+                [
+                    {
+                        "type": "user",
+                        "timestamp": "2026-09-29T09:00:00Z",
+                        "cwd": "/tmp/demo",
+                        "message": {"content": f"keep this {marker}"},
+                    }
+                ]
+            ),
+        )
+        _append(newer, _lines(_session_records(3, start=50)))
+        os.utime(marked, (1_000_000_000, 1_000_000_000))
+        return marked, newer
+
+    def test_a_marker_in_an_older_copy_keeps_the_session_out(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = SyncHarness(Path(td), "dups")
+            self._copies(harness)
+            harness.sync()
+            with closing(sqlite3.connect(harness.db)) as conn:
+                rows = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            # A never-seen marker session is kept out entirely, as before.
+            self.assertEqual(rows, 0)
+            self.assertFalse(
+                any(harness.shared.rglob("*.jsonl"))
+                if harness.shared.exists()
+                else False
+            )
+
+    def test_a_marker_in_an_older_copy_tightens_an_existing_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = SyncHarness(Path(td), "dups")
+            projects = harness.home / ".claude" / "projects"
+            newer = projects / "-Users-alice-demo-worktree" / "shared-id.jsonl"
+            _append(newer, _lines(_session_records(3, start=50)))
+            harness.sync()
+            marked, _ = self._copies(harness)
+            harness.sync()
+            with closing(sqlite3.connect(harness.db)) as conn:
+                visibility, source_path = conn.execute(
+                    "SELECT visibility, source_path FROM sessions"
+                ).fetchone()
+            self.assertEqual(visibility, "private")
+            self.assertEqual(source_path, str(marked))
+
+    def test_unchanged_copies_are_not_rescanned_for_markers(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = SyncHarness(Path(td), "dups")
+            self._copies(harness)
+            harness.sync()
+            with mock.patch.object(
+                sync_module,
+                "find_private_marker",
+                side_effect=AssertionError("rescanned"),
+            ):
+                harness.sync()
+
+
 class SyncLimitTests(unittest.TestCase):
     def _three_sessions(self, harness: SyncHarness) -> None:
         # Distinct message ids, so no claims (and no native refreshes) are shared.
@@ -733,6 +800,75 @@ class SyncLimitTests(unittest.TestCase):
             self.assertEqual(stale, 2)
             self.assertEqual(harness.sync().status, SyncStatus.COMPLETED)
 
+    def test_disk_stop_skips_end_of_run_backfills(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = SyncHarness(Path(td), "tail-disk")
+            self._three_sessions(harness)
+            harness.sync()
+            with closing(sqlite3.connect(harness.db)) as conn:
+                conn.execute(
+                    "INSERT INTO native_refresh_queue (session_id) "
+                    "SELECT session_id FROM sessions"
+                )
+                conn.execute(
+                    "UPDATE session_search_state SET transcript_status = 'stale'"
+                )
+                conn.commit()
+            guarded = replace(
+                INCREMENTAL,
+                disk=DiskGuardPolicy.from_gib(40, 60),
+                disk_recheck_seconds=0.0,
+            )
+            ok = DiskGuardDecision(True, harness.db, 100 * GIB, 40 * GIB, 0, "ok")
+            low = DiskGuardDecision(False, harness.db, 1 * GIB, 40 * GIB, 0, "low")
+            # Fine at the start and through the (unchanged) passes, low after.
+            decisions = iter([ok, ok, ok, ok])
+            with (
+                mock.patch.object(
+                    sync_module,
+                    "check_disk_space",
+                    side_effect=lambda *a, **k: next(decisions, low),
+                ),
+                mock.patch.object(sync_module, "list_local_snapshots", return_value=()),
+            ):
+                result = harness.sync(guarded)
+            self.assertEqual(result.status, SyncStatus.PARTIAL)
+            self.assertEqual(result.reason, "low")
+            with closing(sqlite3.connect(harness.db)) as conn:
+                queued = conn.execute(
+                    "SELECT COUNT(*) FROM native_refresh_queue"
+                ).fetchone()[0]
+                stale = conn.execute(
+                    "SELECT COUNT(*) FROM session_search_state "
+                    "WHERE transcript_status = 'stale'"
+                ).fetchone()[0]
+            self.assertEqual((queued, stale), (3, 3))
+
+    def test_budget_stop_still_lets_search_backfill_make_progress(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = SyncHarness(Path(td), "tail-budget")
+            self._three_sessions(harness)
+            harness.sync()
+            with closing(sqlite3.connect(harness.db)) as conn:
+                conn.execute(
+                    "UPDATE session_search_state SET transcript_status = 'stale' "
+                    "WHERE session_id != 'session-a'"
+                )
+                conn.commit()
+            _append(
+                _claude_path(harness.home, "session-a"),
+                _lines(_session_records(1, start=4)),
+            )
+            result = harness.sync(replace(INCREMENTAL, budget_seconds=1e-9))
+            self.assertEqual(result.status, SyncStatus.PARTIAL)
+            with closing(sqlite3.connect(harness.db)) as conn:
+                stale = conn.execute(
+                    "SELECT COUNT(*) FROM session_search_state "
+                    "WHERE transcript_status = 'stale'"
+                ).fetchone()[0]
+            # One transcript of backfill progress, even past the deadline.
+            self.assertEqual(stale, 1)
+
     def test_second_sigterm_restores_the_default_disposition(self):
         with tempfile.TemporaryDirectory() as td:
             harness = SyncHarness(Path(td), "term2")
@@ -782,8 +918,15 @@ class SyncLimitTests(unittest.TestCase):
                 self.assertEqual(
                     sync.call_args.kwargs["limits"].budget_seconds, expected
                 )
-            result = CliRunner().invoke(cli, [*args, "--budget", "-1"])
-            self.assertEqual(result.exit_code, 2)
+            for bad in ("-1", "nan"):
+                result = CliRunner().invoke(cli, [*args, "--budget", bad])
+                self.assertEqual(result.exit_code, 2, bad)
+            with mock.patch(
+                "logpile.sync.sync_sessions", return_value=SyncResult(0, 0, 0)
+            ) as sync:
+                result = CliRunner().invoke(cli, [*args, "--budget", "inf"])
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIsNone(sync.call_args.kwargs["limits"].budget_seconds)
 
     def test_limits_from_env(self):
         limits = SyncLimits.from_env(

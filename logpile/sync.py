@@ -4,6 +4,8 @@ import errno
 import fcntl
 import fnmatch
 import hashlib
+import json
+import math
 import os
 import re
 import secrets
@@ -58,6 +60,7 @@ from .origins import SESSION_ORIGIN_VERSION, derive_session_origin
 from .parsers import (
     PrivateSessionMarker,
     file_hash,
+    find_private_marker,
     parse_claudecode_session,
     parse_codex_session,
     parse_transcript,
@@ -168,9 +171,9 @@ def _env_float(environ, name: str, default: float | None) -> float | None:
     if raw in {"none", "off", "unlimited"}:
         return None
     value = float(raw)
-    if value < 0:
-        raise ValueError(f"{name} must be non-negative")
-    return value
+    if math.isnan(value) or value < 0:
+        raise ValueError(f"{name} must be a non-negative number")
+    return None if math.isinf(value) else value
 
 
 @dataclass(frozen=True)
@@ -178,9 +181,11 @@ class SyncLimits:
     """Bounds on one sync run.
 
     ``budget_seconds`` is a wall-clock budget (None or 0 means unlimited).
-    When it runs out, or the disk guard trips, or SIGTERM arrives, the sync
-    stops at the next session boundary, finishes the bounded end-of-run
-    passes, commits, and reports a partial result.
+    When it runs out, the sync stops at the next session boundary, runs
+    this run's native refreshes, gives each end-of-run backfill its one
+    bounded step, commits, and reports a partial result. When the disk
+    guard trips or SIGTERM arrives it stops the same way but skips the
+    backfills, whose work stays queued for the next run.
     """
 
     budget_seconds: float | None = DEFAULT_SYNC_BUDGET_SECONDS
@@ -245,6 +250,7 @@ class _SyncControl:
         self.deadline = self.started + budget if budget else None
         self.stop_reason: str | None = None
         self.signal_name: str | None = None
+        self._hard_stop = False
         self.progress = 0
         self._next_disk_check = self.started + limits.disk_recheck_seconds
         self._next_snapshot_check = self.started + limits.snapshot_recheck_seconds
@@ -267,15 +273,17 @@ class _SyncControl:
         return None if decision.ok else decision.reason
 
     def stop_requested(self) -> bool:
-        """A reason to stop now, whatever this run has finished: a stop
-        already decided, a termination signal, or free space below the floor.
+        """A reason to stop now, whatever this run has finished: a
+        termination signal or free space below the floor (not the budget).
 
         End-of-run backfills take this as ``should_stop`` and the budget as
-        their ``deadline``, so a signal or low disk skips them outright."""
-        if self.stop_reason is not None:
+        their ``deadline``, so a signal or low disk skips them outright while
+        a spent budget still lets them make their bounded progress."""
+        if self._hard_stop:
             return True
         if self.signal_name is not None:
             self.stop_reason = f"received {self.signal_name}"
+            self._hard_stop = True
             return True
         now = self._clock()
         if self.limits.disk.enabled and now >= self._next_disk_check:
@@ -292,12 +300,13 @@ class _SyncControl:
             )
             if not decision.ok:
                 self.stop_reason = decision.reason
+                self._hard_stop = True
                 return True
         return False
 
     def should_stop(self) -> bool:
         """Whether to stop before the next session (or backfilled row)."""
-        if self.stop_requested():
+        if self.stop_reason is not None or self.stop_requested():
             return True
         # Every run finishes at least one session before the budget can stop
         # it, so a budget shorter than one session still converges.
@@ -330,13 +339,18 @@ def _graceful_termination(control: _SyncControl) -> Iterator[None]:
 
     def handle(signum, _frame) -> None:
         control.signal_name = signal.Signals(signum).name
-        signal.signal(signal.SIGTERM, previous)
+        # getsignal() returns None for a handler installed outside Python.
+        signal.signal(
+            signal.SIGTERM, previous if previous is not None else signal.SIG_DFL
+        )
 
     signal.signal(signal.SIGTERM, handle)
     try:
         yield
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        signal.signal(
+            signal.SIGTERM, previous if previous is not None else signal.SIG_DFL
+        )
 
 
 class SyncLockError(RuntimeError):
@@ -766,7 +780,7 @@ def _finalize_clone(src: Path, tmp: Path) -> tuple[int, int] | None:
 
     Clears the BSD flags the clone copied from its source, except
     UF_COMPRESSED, so the result matches the flag-free byte copy.  Returns
-    False, and the caller discards the clone and byte-copies instead, when the
+    None, and the caller discards the clone and byte-copies instead, when the
     clone carries a flag only the superuser can clear or an extended ACL, and
     otherwise returns the (st_dev, st_ino) it verified.  A
     clone never copies the source's ACL (CLONE_ACL is not passed), but
@@ -2482,14 +2496,60 @@ _STRUCTURE_VERSION_COLUMNS = (
 )
 
 
-def _canonical_claude_copies(paths: list[Path], patterns: list[str]) -> dict[str, Path]:
+class _CopyMarkerCache:
+    """Which privacy marker, if any, each duplicate transcript copy holds.
+
+    Keyed by path and remembered with the copy's (dev, ino, size, mtime), so
+    a copy is only read again after it changes. Stored as a small 0600 JSON
+    file beside the parse states; losing it only costs a rescan.
+    """
+
+    def __init__(self, state_dir: Path) -> None:
+        self.path = state_dir / "copy-markers.json"
+        try:
+            self.entries = json.loads(self.path.read_text())
+            if not isinstance(self.entries, dict):
+                self.entries = {}
+        except (OSError, ValueError):
+            self.entries = {}
+        self.dirty = False
+
+    def marker(self, path: Path) -> str | None:
+        info = path.stat()
+        identity = [info.st_dev, info.st_ino, info.st_size, info.st_mtime]
+        cached = self.entries.get(str(path))
+        if isinstance(cached, list) and cached[:4] == identity:
+            return cached[4]
+        marker = find_private_marker(path)
+        self.entries[str(path)] = [*identity, marker]
+        self.dirty = True
+        return marker
+
+    def save(self, keep: set[str]) -> None:
+        stale = set(self.entries) - keep
+        for key in stale:
+            del self.entries[key]
+        if not (self.dirty or stale):
+            return
+        tmp = self.path.with_name(f".{self.path.name}.{secrets.token_hex(4)}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(self.entries, handle)
+        os.replace(tmp, self.path)
+
+
+def _canonical_claude_copies(
+    paths: list[Path], patterns: list[str], markers: _CopyMarkerCache
+) -> dict[str, Path]:
     """For session ids with several transcript files, the one copy to sync.
 
     One session id can have a transcript under more than one project
     directory. Rows are keyed by session id, so syncing every copy made the
     row flip between them, and every copy was reparsed and every derived row
-    rewritten on every run. The most recently modified copy wins; ties go to
-    the last path in sorted order, the copy whose row used to survive a run.
+    rewritten on every run. A copy carrying a privacy marker wins, so the
+    session stays private even when a newer copy lacks the marker; otherwise
+    the most recently modified copy wins. Ties go to the last path in sorted
+    order, the copy whose row used to survive a run.
     """
     by_stem: dict[str, list[Path]] = {}
     for path in paths:
@@ -2497,17 +2557,25 @@ def _canonical_claude_copies(paths: list[Path], patterns: list[str]) -> dict[str
             continue
         by_stem.setdefault(path.stem, []).append(path)
 
-    def recency(path: Path) -> tuple[float, str]:
+    def preference(path: Path) -> tuple[bool, float, str]:
         try:
-            return (path.stat().st_mtime, str(path))
+            return (
+                markers.marker(path) is not None,
+                path.stat().st_mtime,
+                str(path),
+            )
         except OSError:
-            return (float("-inf"), str(path))
+            return (False, float("-inf"), str(path))
 
-    return {
-        stem: max(copies, key=recency)
+    chosen = {
+        stem: max(copies, key=preference)
         for stem, copies in by_stem.items()
         if len(copies) > 1
     }
+    markers.save(
+        {str(path) for copies in by_stem.values() if len(copies) > 1 for path in copies}
+    )
+    return chosen
 
 
 def _needs_structure_backfill(existing_row) -> bool:
@@ -2989,7 +3057,9 @@ def _sync_sessions(
             claude_root = claude_projects_root(home)
             if claude_root.exists():
                 claude_paths = sorted(claude_root.rglob("*.jsonl"))
-                canonical = _canonical_claude_copies(claude_paths, patterns)
+                canonical = _canonical_claude_copies(
+                    claude_paths, patterns, _CopyMarkerCache(state_dir)
+                )
                 for jsonl_path in claude_paths:
                     parse_slot.release()
                     if control.should_stop():

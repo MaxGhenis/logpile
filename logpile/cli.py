@@ -2,6 +2,7 @@
 
 import ipaddress
 import json
+import math
 import os
 import socket
 from datetime import UTC
@@ -675,9 +676,10 @@ class _BudgetSeconds(click.ParamType):
                 number = float(text)
             except ValueError:
                 self.fail(f"{value!r} is not a number of seconds or 'off'", param, ctx)
-        if number < 0:
-            self.fail("the budget cannot be negative", param, ctx)
-        return number
+        if math.isnan(number) or number < 0:
+            self.fail("the budget must be a non-negative number", param, ctx)
+        # An infinite budget is no budget.
+        return 0.0 if math.isinf(number) else number
 
 
 _BUDGET = _BudgetSeconds()

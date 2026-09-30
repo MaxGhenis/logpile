@@ -3124,6 +3124,19 @@ def parse_transcript(
     return result
 
 
+def find_private_marker(path: Path) -> str | None:
+    """The first privacy marker in a transcript, exactly as a parse finds it.
+
+    Both streams check every valid record with _private_marker and keep the
+    first hit, so this returns the marker a full parse of ``path`` would.
+    """
+    for record in _iter_jsonl(path, report_malformed=False):
+        marker = _private_marker((record,))
+        if marker:
+            return marker
+    return None
+
+
 def file_hash(path: Path) -> str:
     """SHA256 of the full file."""
     h = hashlib.sha256()
