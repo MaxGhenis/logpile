@@ -1,6 +1,7 @@
 import hashlib
 import tempfile
 import unittest
+from itertools import pairwise
 from pathlib import Path
 
 from hypothesis import HealthCheck, given, settings
@@ -96,7 +97,7 @@ class TranscriptScanTests(unittest.TestCase):
         )
         pieces = []
         with open(self.path, "rb") as handle:
-            for start, end in zip(boundaries, boundaries[1:]):
+            for start, end in pairwise(boundaries):
                 with open_text_range(handle, start, end) as stream:
                     pieces.extend(_iter_jsonl(stream, report_malformed=False))
         self.assertEqual(pieces, whole)
