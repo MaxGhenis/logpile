@@ -86,7 +86,7 @@ class DiskGuardTests(unittest.TestCase):
         with mock.patch.object(
             diskguard.os,
             "stat",
-            side_effect=lambda p: SimpleNamespace(
+            side_effect=lambda p, **_kwargs: SimpleNamespace(
                 st_dev=1 if Path(p) == self.root else 2
             ),
         ):
