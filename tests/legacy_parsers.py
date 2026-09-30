@@ -1,21 +1,25 @@
-"""Parse Claude Code and Codex JSONL session files."""
+"""Verbatim copy of logpile/parsers.py at cfc10ea (origin/main before PR #9).
+
+The differential oracle for the streaming parsers: test_incremental_parse.py
+checks that parse_claudecode_session / parse_codex_session still return what
+these two-pass, whole-file parsers returned. Do not edit.
+"""
+
+# ruff: noqa
 
 import base64
 import binascii
-import copy
-import errno
 import hashlib
 import json
 import logging
 import os
 import re
-import secrets
 import shlex
 import sqlite3
 import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
@@ -178,129 +182,73 @@ class _SqliteSequence(Sequence):
         return self._factory(row)
 
 
-_SPOOL_SCHEMA = """
-CREATE TABLE IF NOT EXISTS messages (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id TEXT NOT NULL UNIQUE,
-    fresh_input INTEGER NOT NULL,
-    cached_input INTEGER NOT NULL,
-    cache_creation INTEGER NOT NULL,
-    cache_creation_5m INTEGER NOT NULL,
-    cache_creation_1h INTEGER NOT NULL,
-    cache_creation_unknown INTEGER NOT NULL,
-    output INTEGER NOT NULL,
-    model TEXT,
-    timestamp TEXT,
-    request_id TEXT,
-    uuid TEXT
-);
-CREATE TABLE IF NOT EXISTS tool_calls (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    tool_name TEXT NOT NULL,
-    command TEXT,
-    timestamp TEXT,
-    is_error INTEGER NOT NULL DEFAULT 0,
-    operation TEXT NOT NULL,
-    input_paths_json TEXT NOT NULL,
-    command_paths_json TEXT NOT NULL,
-    call_id_json TEXT
-);
-CREATE INDEX IF NOT EXISTS tool_calls_call_id
-    ON tool_calls(call_id_json) WHERE call_id_json IS NOT NULL;
-CREATE TABLE IF NOT EXISTS session_paths (
-    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    raw_path TEXT NOT NULL,
-    normalized_path TEXT NOT NULL,
-    display_path TEXT NOT NULL,
-    relative_path TEXT,
-    operation TEXT NOT NULL,
-    source TEXT NOT NULL,
-    tool_name TEXT,
-    timestamp TEXT
-);
-CREATE TABLE IF NOT EXISTS spool_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-"""
-
-
 class _ParseSpool:
-    """Mode-0600 SQLite spill storage for cardinality-dependent parse state.
+    """Mode-0600 SQLite spill storage for cardinality-dependent parse state."""
 
-    Without ``path`` the spool is a throwaway file in a private temporary
-    directory. With ``path`` it is a resumable parse state that incremental
-    sync keeps between runs: the caller owns the enclosing 0700 directory,
-    and transactions are explicit (``begin``/``commit``; ``close`` rolls back
-    anything uncommitted) so a provisional tail never becomes durable state.
-    """
-
-    def __init__(self, path: Path | None = None, *, in_memory: bool = False) -> None:
-        self._temporary_directory = None
-        self.persistent = path is not None
-        if in_memory and path is None:
-            # Small transcripts: the spill file only bounds memory for huge
-            # ones, and creating it costs more than the parse itself.
-            self.connection = sqlite3.connect(":memory:")
-        elif path is None:
-            self._temporary_directory = tempfile.TemporaryDirectory(
-                prefix="logpile-session-parse-"
-            )
-            path = Path(self._temporary_directory.name) / "state.sqlite"
-            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-            os.close(fd)
-            self.connection = sqlite3.connect(path)
-            # Bound SQLite's own page cache and keep sensitive transcript-derived
-            # state on disk in the mode-0700 temporary directory.
-            self.connection.execute("PRAGMA journal_mode = OFF")
-            self.connection.execute("PRAGMA synchronous = OFF")
-        else:
-            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-            fd = os.open(path, flags, 0o600)
-            try:
-                os.fchmod(fd, 0o600)
-            finally:
-                os.close(fd)
-            self.connection = sqlite3.connect(path, isolation_level=None)
-            # A rollback journal lets close() discard a provisional tail; the
-            # generation check in sync turns any torn state into a full parse.
-            self.connection.execute("PRAGMA journal_mode = DELETE")
-            self.connection.execute("PRAGMA synchronous = NORMAL")
+    def __init__(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="logpile-session-parse-"
+        )
+        path = Path(self._temporary_directory.name) / "state.sqlite"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+        self.connection = sqlite3.connect(path)
+        # Bound SQLite's own page cache and keep sensitive transcript-derived
+        # state on disk in the mode-0700 temporary directory.
+        self.connection.execute("PRAGMA journal_mode = OFF")
+        self.connection.execute("PRAGMA synchronous = OFF")
         self.connection.execute("PRAGMA temp_store = FILE")
         self.connection.execute("PRAGMA cache_size = -1024")
         self.connection.execute("PRAGMA mmap_size = 0")
-        self.connection.executescript(_SPOOL_SCHEMA)
-
-    def begin(self) -> None:
-        if self.persistent and not self.connection.in_transaction:
-            self.connection.execute("BEGIN IMMEDIATE")
-
-    def commit(self) -> None:
-        if self.persistent and self.connection.in_transaction:
-            self.connection.execute("COMMIT")
-
-    def get_meta(self, key: str) -> str | None:
-        row = self.connection.execute(
-            "SELECT value FROM spool_meta WHERE key = ?", (key,)
-        ).fetchone()
-        return row[0] if row else None
-
-    def set_meta(self, key: str, value: str) -> None:
-        self.connection.execute(
-            "INSERT INTO spool_meta (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
+        self.connection.executescript(
+            """
+            CREATE TABLE messages (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT NOT NULL UNIQUE,
+                fresh_input INTEGER NOT NULL,
+                cached_input INTEGER NOT NULL,
+                cache_creation INTEGER NOT NULL,
+                cache_creation_5m INTEGER NOT NULL,
+                cache_creation_1h INTEGER NOT NULL,
+                cache_creation_unknown INTEGER NOT NULL,
+                output INTEGER NOT NULL,
+                model TEXT,
+                timestamp TEXT,
+                request_id TEXT,
+                uuid TEXT
+            );
+            CREATE TABLE tool_calls (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_name TEXT NOT NULL,
+                command TEXT,
+                timestamp TEXT,
+                is_error INTEGER NOT NULL DEFAULT 0,
+                operation TEXT NOT NULL,
+                input_paths_json TEXT NOT NULL,
+                command_paths_json TEXT NOT NULL,
+                call_id_json TEXT
+            );
+            CREATE INDEX tool_calls_call_id
+                ON tool_calls(call_id_json) WHERE call_id_json IS NOT NULL;
+            CREATE TABLE session_paths (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                raw_path TEXT NOT NULL,
+                normalized_path TEXT NOT NULL,
+                display_path TEXT NOT NULL,
+                relative_path TEXT,
+                operation TEXT NOT NULL,
+                source TEXT NOT NULL,
+                tool_name TEXT,
+                timestamp TEXT
+            );
+            """
         )
 
     def close(self) -> None:
         connection = getattr(self, "connection", None)
         if connection is not None:
             self.connection = None
-            try:
-                if getattr(self, "persistent", False) and connection.in_transaction:
-                    connection.execute("ROLLBACK")
-            finally:
-                connection.close()
+            connection.close()
         temporary_directory = getattr(self, "_temporary_directory", None)
         if temporary_directory is not None:
             self._temporary_directory = None
@@ -493,22 +441,9 @@ class _ParseSpool:
             lambda row: self._message_usage(row, fallback_day),
         )
 
-    def ensure_session_paths(self, workspace_root: str | None) -> None:
-        """Extend path rows to cover every spooled tool call.
-
-        Paths depend only on each call and the workspace root, so a resumed
-        parse extends them from the last covered call; a changed root
-        renormalizes from scratch. Rows stay in tool-call order either way.
-        """
-        workspace_key = json.dumps(workspace_root)
-        covered = self.get_meta("paths_workspace")
-        through = int(self.get_meta("paths_through_seq") or 0)
-        if covered != workspace_key:
-            self.connection.execute("DELETE FROM session_paths")
-            through = 0
-        last_seq = through
-        for seq, tool_call in self._tool_calls_after(through):
-            last_seq = seq
+    def build_session_paths(self, workspace_root: str | None) -> None:
+        self.connection.execute("DELETE FROM session_paths")
+        for tool_call in self.tool_calls():
             for source_name, candidates in (
                 ("tool_input", tool_call.input_paths),
                 ("command", tool_call.command_paths),
@@ -537,20 +472,6 @@ class _ParseSpool:
                             tool_call.timestamp,
                         ),
                     )
-        self.set_meta("paths_workspace", workspace_key)
-        self.set_meta("paths_through_seq", str(last_seq))
-
-    def _tool_calls_after(self, seq: int) -> Iterator[tuple[int, ToolCall]]:
-        rows = self.connection.execute(
-            """
-            SELECT seq, tool_name, command, timestamp, is_error, operation,
-                   input_paths_json, command_paths_json, call_id_json
-            FROM tool_calls WHERE seq > ? ORDER BY seq
-            """,
-            (seq,),
-        )
-        for row in rows:
-            yield row[0], self._tool_call(row[1:])
 
     @staticmethod
     def _session_path(row) -> SessionPath:
@@ -2215,88 +2136,58 @@ def _claude_session_identity_from_observations(
     return path.stem, thread_id, None, None, 0
 
 
-def _daily_state(daily: dict[str, DailyUsage]) -> list[dict]:
-    return [asdict(bucket) for bucket in _sorted_daily(daily)]
+def parse_claudecode_session(path: Path) -> SessionInfo | PrivateSessionMarker | None:
+    """Parse a Claude Code JSONL file and return a SessionInfo."""
+    record_count = 0
+    private_marker = None
+    raw_session_id = None
+    agent_id = None
+    sidechain_flag = False
+    project = "unknown"
+    fallback_day = None
 
+    # Deduplicate assistant messages by message.id, keep last (highest tokens).
+    # NOTE: this is per-file only. Resuming a Claude Code session copies the
+    # prior history into a NEW file and re-stamps each record's sessionId to
+    # the new session, so replayed messages are indistinguishable locally and
+    # this file's totals count them again. Cross-session dedup happens in the
+    # ledger: each kept message is also emitted as a MessageUsage claim
+    # (message_usage) and sync resolves one owning session per claim_key in
+    # the message_claims table, which feeds the native_* columns.
+    # Cardinality-dependent state lives in a mode-0600 disk spool.  The
+    # resulting sequences remain reusable/indexable, but a session with
+    # millions of messages or tool calls does not retain millions of Python
+    # objects (or an equally large id->index dictionary) in memory.
+    spool = _ParseSpool()
+    first_timestamp = None
+    last_timestamp = None
+    user_message_count = 0
+    first_user_message = ""
+    error_count = 0
+    model = None
+    daily: dict[str, DailyUsage] = {}
 
-def _daily_from_state(rows: list[dict]) -> dict[str, DailyUsage]:
-    return {row["day"]: DailyUsage(**row) for row in rows}
-
-
-class _ClaudeStream:
-    """Left fold over one Claude Code transcript's records.
-
-    Cardinality-dependent state lives in the spool; the rest is the handful
-    of scalars in ``state()``. A persisted spool plus those scalars resumes
-    the fold after the last record a previous sync consumed, and folding the
-    remaining records gives exactly what one pass over the whole file gives.
-    """
-
-    _SCALARS = (
-        "record_count",
-        "private_marker",
-        "raw_session_id",
-        "agent_id",
-        "sidechain_flag",
-        "project",
-        "fallback_day",
-        "first_timestamp",
-        "last_timestamp",
-        "user_message_count",
-        "first_user_message",
-        "error_count",
-        "model",
-    )
-
-    def __init__(self, spool: _ParseSpool, state: dict | None = None) -> None:
-        self.spool = spool
-        self.record_count = 0
-        self.private_marker = None
-        self.raw_session_id = None
-        self.agent_id = None
-        self.sidechain_flag = False
-        self.project = "unknown"
-        self.fallback_day = None
-        self.first_timestamp = None
-        self.last_timestamp = None
-        self.user_message_count = 0
-        self.first_user_message = ""
-        self.error_count = 0
-        self.model = None
-        # Only record-driven counts (user messages, tool calls) accumulate
-        # here; message token buckets are derived from the spool at finish.
-        self.daily: dict[str, DailyUsage] = {}
-        if state is not None:
-            for name in self._SCALARS:
-                setattr(self, name, state[name])
-            self.daily = _daily_from_state(state["daily"])
-
-    def state(self) -> dict:
-        data = {name: getattr(self, name) for name in self._SCALARS}
-        data["daily"] = _daily_state(self.daily)
-        return data
-
-    def feed(self, r: dict) -> None:
-        spool = self.spool
-        self.record_count += 1
-        if self.private_marker is None:
-            self.private_marker = _private_marker((r,))
-        if self.raw_session_id is None:
-            self.raw_session_id = _string_id(r.get("sessionId"))
-        if self.agent_id is None:
-            self.agent_id = _string_id(r.get("agentId"))
-        self.sidechain_flag = self.sidechain_flag or r.get("isSidechain") is True
-        if self.project == "unknown" and r.get("cwd"):
-            self.project = r["cwd"]
-        if self.fallback_day is None:
-            self.fallback_day = _day_of(r.get("timestamp"))
+    load_stats = JsonlLoadStats()
+    for r in _iter_jsonl(path, stats=load_stats):
+        record_count += 1
+        if private_marker is None:
+            private_marker = _private_marker((r,))
+        if raw_session_id is None:
+            raw_session_id = _string_id(r.get("sessionId"))
+        if agent_id is None:
+            agent_id = _string_id(r.get("agentId"))
+        sidechain_flag = sidechain_flag or r.get("isSidechain") is True
+        if project == "unknown" and r.get("cwd"):
+            project = r["cwd"]
+        if fallback_day is None:
+            fallback_day = _day_of(r.get("timestamp"))
 
         rtype = r.get("type", "")
         ts = r.get("timestamp")
         if ts:
-            if not self.first_timestamp:
-                self.first_timestamp = ts
-            self.last_timestamp = ts
+            if not first_timestamp:
+                first_timestamp = ts
+            last_timestamp = ts
 
         if rtype == "user":
             msg = r.get("message", {})
@@ -2317,11 +2208,11 @@ class _ClaudeStream:
                         ):
                             is_error = bool(block.get("is_error"))
                             if is_error:
-                                self.error_count += 1
+                                error_count += 1
                             tool_use_id = block.get("tool_use_id")
                             if tool_use_id:
                                 spool.set_tool_result(tool_use_id, is_error)
-                    return
+                    continue
 
             text = " ".join(
                 _iter_search_content_text(
@@ -2330,12 +2221,12 @@ class _ClaudeStream:
                 )
             )
             if text.strip():
-                self.user_message_count += 1
+                user_message_count += 1
                 # Harness-injected records (isMeta: caveats, command echoes)
                 # keep their count semantics but must not become the title.
-                if not self.first_user_message and not r.get("isMeta"):
-                    self.first_user_message = text.strip()[:500]
-                bucket = _daily_bucket(self.daily, ts)
+                if not first_user_message and not r.get("isMeta"):
+                    first_user_message = text.strip()[:500]
+                bucket = _daily_bucket(daily, ts)
                 if bucket is not None:
                     bucket.user_message_count += 1
 
@@ -2368,8 +2259,8 @@ class _ClaudeStream:
                     request_id=r.get("requestId"),
                     uuid=r.get("uuid"),
                 )
-                if mdl and not self.model:
-                    self.model = mdl
+                if mdl and not model:
+                    model = mdl
 
             # Extract tool calls from content blocks
             content = msg.get("content", [])
@@ -2403,280 +2294,176 @@ class _ClaudeStream:
                                 call_id=tool_use_id,
                             )
                         )
-                        bucket = _daily_bucket(self.daily, ts)
+                        bucket = _daily_bucket(daily, ts)
                         if bucket is not None:
                             bucket.tool_call_count += 1
 
-    def settle(self) -> None:
-        """Bring derived spool rows up to date with the records fed so far."""
-        self.spool.ensure_session_paths(self.project)
-
-    def finish(self, path: Path) -> SessionInfo | PrivateSessionMarker | None:
-        """Materialize the session from the fold (the caller checks I/O errors)."""
-        if not self.record_count:
-            return None
-        if self.private_marker:
-            return PrivateSessionMarker(path.stem, "claudecode", self.private_marker)
-        spool = self.spool
-
-        (
-            session_id,
-            thread_id,
-            parent_thread_id,
-            parent_session_id,
-            spawn_depth,
-        ) = _claude_session_identity_from_observations(
-            path,
-            raw_session_id=self.raw_session_id,
-            agent_id=self.agent_id,
-            sidechain_flag=self.sidechain_flag,
-        )
-        fallback_day = self.fallback_day
-        if fallback_day is None:
-            fallback_day = _fallback_usage_day(path, ())
-        workspace_root = self.project
-
-        (
-            assistant_message_count,
-            fresh_input,
-            cached_input,
-            cache_creation_input,
-            cache_creation_5m,
-            cache_creation_1h,
-            cache_creation_unknown,
-            total_output,
-        ) = spool.message_totals()
-        tool_calls = spool.tool_calls()
-        tool_call_count = len(tool_calls)
-        self.settle()
-        session_paths = spool.session_paths()
-        message_usage = spool.message_usage(fallback_day)
-        # Every prompt token reaches the model exactly one way: uncached (fresh),
-        # written to cache, or read from cache.
-        total_input = fresh_input + cache_creation_input + cached_input
-        daily = copy.deepcopy(self.daily)
-        for v in spool.iter_message_state():
-            bucket = _daily_bucket(daily, v[9])
-            if bucket is None:
-                continue
-            bucket.assistant_message_count += 1
-            bucket.fresh_input_tokens += v[1]
-            bucket.cached_input_tokens += v[2]
-            bucket.cache_creation_input_tokens += v[3]
-            bucket.cache_creation_5m_input_tokens += v[4]
-            bucket.cache_creation_1h_input_tokens += v[5]
-            bucket.cache_creation_unknown_input_tokens += v[6]
-            bucket.total_input_tokens += v[1] + v[3] + v[2]
-            bucket.total_output_tokens += v[7]
-
-        _reconcile_daily_usage(
-            daily,
-            fallback_day,
-            {
-                "total_input_tokens": total_input,
-                "total_output_tokens": total_output,
-                "fresh_input_tokens": fresh_input,
-                "cached_input_tokens": cached_input,
-                "cache_creation_input_tokens": cache_creation_input,
-                "cache_creation_5m_input_tokens": cache_creation_5m,
-                "cache_creation_1h_input_tokens": cache_creation_1h,
-                "cache_creation_unknown_input_tokens": cache_creation_unknown,
-                "reasoning_output_tokens": 0,
-                "user_message_count": self.user_message_count,
-                "assistant_message_count": assistant_message_count,
-                "tool_call_count": tool_call_count,
-            },
-        )
-
-        return SessionInfo(
-            session_id=session_id,
-            source="claudecode",
-            project=self.project,
-            first_timestamp=self.first_timestamp,
-            last_timestamp=self.last_timestamp,
-            user_message_count=self.user_message_count,
-            assistant_message_count=assistant_message_count,
-            tool_call_count=tool_call_count,
-            error_count=self.error_count,
-            total_input_tokens=total_input,
-            total_output_tokens=total_output,
-            fresh_input_tokens=fresh_input,
-            cached_input_tokens=cached_input,
-            cache_creation_input_tokens=cache_creation_input,
-            cache_creation_5m_input_tokens=cache_creation_5m,
-            cache_creation_1h_input_tokens=cache_creation_1h,
-            cache_creation_unknown_input_tokens=cache_creation_unknown,
-            first_user_message=self.first_user_message,
-            model=self.model,
-            workspace_root=workspace_root,
-            thread_id=thread_id,
-            parent_thread_id=parent_thread_id,
-            parent_session_id=parent_session_id,
-            spawn_depth=spawn_depth,
-            tool_calls=tool_calls,
-            session_paths=session_paths,
-            daily_usage=_sorted_daily(daily),
-            message_usage=message_usage,
-        )
-
-
-def parse_claudecode_session(path: Path) -> SessionInfo | PrivateSessionMarker | None:
-    """Parse a Claude Code JSONL file and return a SessionInfo."""
-    # Deduplicate assistant messages by message.id, keep last (highest tokens).
-    # NOTE: this is per-file only. Resuming a Claude Code session copies the
-    # prior history into a NEW file and re-stamps each record's sessionId to
-    # the new session, so replayed messages are indistinguishable locally and
-    # this file's totals count them again. Cross-session dedup happens in the
-    # ledger: each kept message is also emitted as a MessageUsage claim
-    # (message_usage) and sync resolves one owning session per claim_key in
-    # the message_claims table, which feeds the native_* columns.
-    # Cardinality-dependent state lives in a mode-0600 disk spool.  The
-    # resulting sequences remain reusable/indexable, but a session with
-    # millions of messages or tool calls does not retain millions of Python
-    # objects (or an equally large id->index dictionary) in memory.
-    stream = _ClaudeStream(_new_spool(path))
-    load_stats = JsonlLoadStats()
-    for r in _iter_jsonl(path, stats=load_stats):
-        stream.feed(r)
-    if load_stats.io_errors:
+    if load_stats.io_errors or not record_count:
         return None
-    return stream.finish(path)
+    if private_marker:
+        return PrivateSessionMarker(path.stem, "claudecode", private_marker)
 
+    (
+        session_id,
+        thread_id,
+        parent_thread_id,
+        parent_session_id,
+        spawn_depth,
+    ) = _claude_session_identity_from_observations(
+        path,
+        raw_session_id=raw_session_id,
+        agent_id=agent_id,
+        sidechain_flag=sidechain_flag,
+    )
+    if fallback_day is None:
+        fallback_day = _fallback_usage_day(path, ())
+    workspace_root = project
 
-class _CodexStream:
-    """Single-pass left fold over one Codex rollout's records.
+    (
+        assistant_message_count,
+        fresh_input,
+        cached_input,
+        cache_creation_input,
+        cache_creation_5m,
+        cache_creation_1h,
+        cache_creation_unknown,
+        total_output,
+    ) = spool.message_totals()
+    tool_calls = spool.tool_calls()
+    tool_call_count = len(tool_calls)
+    spool.build_session_paths(workspace_root)
+    session_paths = spool.session_paths()
+    message_usage = spool.message_usage(fallback_day)
+    # Every prompt token reaches the model exactly one way: uncached (fresh),
+    # written to cache, or read from cache.
+    total_input = fresh_input + cache_creation_input + cached_input
+    for v in spool.iter_message_state():
+        bucket = _daily_bucket(daily, v[9])
+        if bucket is None:
+            continue
+        bucket.assistant_message_count += 1
+        bucket.fresh_input_tokens += v[1]
+        bucket.cached_input_tokens += v[2]
+        bucket.cache_creation_input_tokens += v[3]
+        bucket.cache_creation_5m_input_tokens += v[4]
+        bucket.cache_creation_1h_input_tokens += v[5]
+        bucket.cache_creation_unknown_input_tokens += v[6]
+        bucket.total_input_tokens += v[1] + v[3] + v[2]
+        bucket.total_output_tokens += v[7]
 
-    This merges what used to be two passes. Everything the second pass took
-    from the first is fixed by records at or before the one being folded:
-    replay candidacy is decided by the first two valid records, the replay
-    boundary is the first matching ``task_started`` at index 2 or later (so no
-    later record can reclassify an earlier one), and identity, project, model
-    and the fallback day are only read at ``finish``. Timestamps keep both
-    passes' rules: ``first_timestamp`` is the first-pass value, or else the
-    first truthy record timestamp; ``last_timestamp`` is the last truthy
-    record timestamp, or else ``first_timestamp``.
-    """
-
-    _SCALARS = (
-        "record_count",
-        "first_normalized",
-        "replay_candidate",
-        "replay_boundary",
-        "private_marker",
-        "project",
-        "model",
-        "fallback_day",
-        "thread_id",
-        "meta_first_timestamp",
-        "parent_thread_id",
-        "parent_session_id",
-        "spawn_depth",
-        "leaf_meta_found",
-        "first_record_timestamp",
-        "last_record_timestamp",
-        "user_message_count",
-        "assistant_message_count",
-        "first_user_message",
-        "error_count",
-        "fresh_input_tokens",
-        "cached_input_tokens",
-        "total_output_tokens",
-        "reasoning_output_tokens",
-        "baseline",
+    _reconcile_daily_usage(
+        daily,
+        fallback_day,
+        {
+            "total_input_tokens": total_input,
+            "total_output_tokens": total_output,
+            "fresh_input_tokens": fresh_input,
+            "cached_input_tokens": cached_input,
+            "cache_creation_input_tokens": cache_creation_input,
+            "cache_creation_5m_input_tokens": cache_creation_5m,
+            "cache_creation_1h_input_tokens": cache_creation_1h,
+            "cache_creation_unknown_input_tokens": cache_creation_unknown,
+            "reasoning_output_tokens": 0,
+            "user_message_count": user_message_count,
+            "assistant_message_count": assistant_message_count,
+            "tool_call_count": tool_call_count,
+        },
     )
 
-    def __init__(self, spool: _ParseSpool, state: dict | None = None) -> None:
-        self.spool = spool
-        self.record_count = 0
-        # (record_type, forked_from_id) of record 0, kept for candidacy.
-        self.first_normalized: list | None = None
-        self.replay_candidate = False
-        self.replay_boundary: int | None = None
-        self.private_marker = None
-        self.project = "unknown"
-        self.model = None
-        self.fallback_day = None
-        # None means "the path stem", resolved at finish.
-        self.thread_id: str | None = None
-        self.meta_first_timestamp = None
-        self.parent_thread_id = None
-        self.parent_session_id = None
-        self.spawn_depth = 0
-        self.leaf_meta_found = False
-        self.first_record_timestamp = None
-        self.last_record_timestamp = None
-        self.user_message_count = 0
-        self.assistant_message_count = 0
-        self.first_user_message = ""
-        self.error_count = 0
-        self.fresh_input_tokens = 0
-        self.cached_input_tokens = 0
-        self.total_output_tokens = 0
-        self.reasoning_output_tokens = 0
-        # Codex token_count events carry cumulative counters. A structurally
-        # copied prefix establishes the starting counter state but contributes
-        # no native usage. Explicit all-zero vectors start a new billing epoch;
-        # maxima are retained only inside an epoch so small downward telemetry
-        # wobbles clamp to zero without erasing genuine post-reset usage.
-        self.baseline = [0, 0, 0, 0]  # current epoch maxima
-        self.daily: dict[str, DailyUsage] = {}
-        if state is not None:
-            for name in self._SCALARS:
-                setattr(self, name, state[name])
-            self.daily = _daily_from_state(state["daily"])
+    return SessionInfo(
+        session_id=session_id,
+        source="claudecode",
+        project=project,
+        first_timestamp=first_timestamp,
+        last_timestamp=last_timestamp,
+        user_message_count=user_message_count,
+        assistant_message_count=assistant_message_count,
+        tool_call_count=tool_call_count,
+        error_count=error_count,
+        total_input_tokens=total_input,
+        total_output_tokens=total_output,
+        fresh_input_tokens=fresh_input,
+        cached_input_tokens=cached_input,
+        cache_creation_input_tokens=cache_creation_input,
+        cache_creation_5m_input_tokens=cache_creation_5m,
+        cache_creation_1h_input_tokens=cache_creation_1h,
+        cache_creation_unknown_input_tokens=cache_creation_unknown,
+        first_user_message=first_user_message,
+        model=model,
+        workspace_root=workspace_root,
+        thread_id=thread_id,
+        parent_thread_id=parent_thread_id,
+        parent_session_id=parent_session_id,
+        spawn_depth=spawn_depth,
+        tool_calls=tool_calls,
+        session_paths=session_paths,
+        daily_usage=_sorted_daily(daily),
+        message_usage=message_usage,
+    )
 
-    def state(self) -> dict:
-        data = {name: getattr(self, name) for name in self._SCALARS}
-        data["daily"] = _daily_state(self.daily)
-        return data
 
-    def feed(self, record: dict) -> None:
-        index = self.record_count
-        self.record_count += 1
+def parse_codex_session(path: Path) -> SessionInfo | PrivateSessionMarker | None:
+    """Parse a Codex JSONL file and return a SessionInfo."""
+    inspection_stats = JsonlLoadStats()
+    record_count = 0
+    first_rec: dict | None = None
+    first_normalized: tuple[str, dict, str | None] | None = None
+    replay_candidate = False
+    replay_boundary: int | None = None
+    private_marker = None
+    project = "unknown"
+    model = None
+    fallback_day = None
+    thread_id = path.stem
+    first_timestamp = None
+    parent_thread_id = None
+    parent_session_id = None
+    spawn_depth = 0
+    leaf_meta_found = False
+
+    for index, record in enumerate(_iter_jsonl(path, stats=inspection_stats)):
+        record_count += 1
         record_type, payload, timestamp = _normalize_codex_record(record)
-        if self.first_normalized is None:
-            self.first_normalized = [
-                record_type,
-                _string_id(payload.get("forked_from_id")),
-            ]
-            self.thread_id = _string_id(record.get("id"))
-            self.meta_first_timestamp = record.get("timestamp")
-        elif index == 1:
-            first_type, first_forked_from = self.first_normalized
-            self.replay_candidate = (
+        if first_rec is None:
+            first_rec = record
+            first_normalized = (record_type, payload, timestamp)
+            thread_id = _string_id(record.get("id")) or path.stem
+            first_timestamp = record.get("timestamp")
+        elif index == 1 and first_normalized is not None:
+            first_type, first_payload, _ = first_normalized
+            replay_candidate = (
                 first_type == "session_meta"
                 and record_type == "session_meta"
-                and bool(first_forked_from)
-                and _string_id(payload.get("id")) == first_forked_from
+                and bool(_string_id(first_payload.get("forked_from_id")))
+                and _string_id(payload.get("id"))
+                == _string_id(first_payload.get("forked_from_id"))
             )
-        elif self.replay_candidate and self.replay_boundary is None:
+        elif replay_candidate and replay_boundary is None:
             if record_type == "event_msg" and payload.get("type") == "task_started":
                 started_at = _started_at_epoch_second(payload.get("started_at"))
                 record_second = _timestamp_epoch_second(timestamp)
                 if started_at is not None and started_at == record_second:
-                    self.replay_boundary = index
+                    replay_boundary = index
 
-        if self.private_marker is None:
-            self.private_marker = _private_marker((record,))
-        if self.fallback_day is None:
-            self.fallback_day = _day_of(record.get("timestamp"))
-        if self.project == "unknown":
+        if private_marker is None:
+            private_marker = _private_marker((record,))
+        if fallback_day is None:
+            fallback_day = _day_of(record.get("timestamp"))
+        if project == "unknown":
             if record_type in {"session_meta", "turn_context"} and payload.get("cwd"):
-                self.project = str(payload["cwd"])
+                project = str(payload["cwd"])
             elif record_type == "message" and payload.get("role") == "user":
                 text = _extract_text(payload.get("content", []))
                 match = re.search(r"<cwd>(.*?)</cwd>", text, flags=re.DOTALL)
                 if match:
-                    self.project = match.group(1).strip()
+                    project = match.group(1).strip()
 
         # A copied ancestor can contain any number of session_meta records.
         # Leaf identity and lineage come exclusively from the first one.
-        if record_type == "session_meta" and not self.leaf_meta_found:
-            self.leaf_meta_found = True
-            self.thread_id = _string_id(payload.get("id")) or self.thread_id
-            self.meta_first_timestamp = (
-                payload.get("timestamp") or timestamp or self.meta_first_timestamp
-            )
+        if record_type == "session_meta" and not leaf_meta_found:
+            leaf_meta_found = True
+            thread_id = _string_id(payload.get("id")) or thread_id
+            first_timestamp = payload.get("timestamp") or timestamp or first_timestamp
             top_level_parent = _string_id(payload.get("parent_thread_id"))
             nested_parent = None
             source = payload.get("source")
@@ -2686,37 +2473,69 @@ class _CodexStream:
                     thread_spawn = subagent.get("thread_spawn", {})
                     if isinstance(thread_spawn, dict):
                         nested_parent = _string_id(thread_spawn.get("parent_thread_id"))
-                        self.spawn_depth = int(thread_spawn.get("depth", 0) or 0)
-            self.parent_thread_id = (
+                        spawn_depth = int(thread_spawn.get("depth", 0) or 0)
+            parent_thread_id = (
                 top_level_parent
                 or nested_parent
                 or _string_id(payload.get("forked_from_id"))
             )
-            self.parent_session_id = self.parent_thread_id
-        if record_type == "turn_context" and payload.get("model") and not self.model:
-            self.model = payload["model"]
+            parent_session_id = parent_thread_id
+        if record_type == "turn_context" and payload.get("model") and not model:
+            model = payload["model"]
 
-        self._fold_usage(index, record_type, payload, timestamp)
+    if inspection_stats.io_errors or not record_count or first_rec is None:
+        return None
+    if private_marker:
+        return PrivateSessionMarker(path.stem, "codex", private_marker)
 
-    def _fold_usage(
-        self, index: int, record_type: str, payload: dict, timestamp: str | None
-    ) -> None:
+    session_id = path.stem
+    workspace_root = project
+    if fallback_day is None:
+        fallback_day = _fallback_usage_day(path, ())
+
+    user_message_count = 0
+    assistant_message_count = 0
+    spool = _ParseSpool()
+    first_user_message = ""
+    error_count = 0
+    last_timestamp = first_timestamp
+    fresh_input_tokens = 0
+    cached_input_tokens = 0
+    total_output_tokens = 0
+    reasoning_output_tokens = 0
+    daily: dict[str, DailyUsage] = {}
+
+    # Codex token_count events carry cumulative counters. A structurally
+    # copied prefix establishes the starting counter state but contributes no
+    # native usage. Explicit all-zero vectors start a new billing epoch;
+    # maxima are retained only inside an epoch so small downward telemetry
+    # wobbles clamp to zero without erasing genuine post-reset usage.
+    replay_start = 1 if replay_candidate else 0
+    replay_end = (
+        replay_boundary
+        if replay_candidate and replay_boundary is not None
+        else record_count
+        if replay_candidate
+        else 0
+    )
+    baseline = [0, 0, 0, 0]  # current epoch maxima
+
+    parse_stats = JsonlLoadStats()
+    for index, record in enumerate(
+        _iter_jsonl(path, stats=parse_stats, report_malformed=False)
+    ):
+        record_type, payload, timestamp = _normalize_codex_record(record)
         if timestamp:
-            if not self.first_record_timestamp:
-                self.first_record_timestamp = timestamp
-            self.last_record_timestamp = timestamp
+            if not first_timestamp:
+                first_timestamp = timestamp
+            last_timestamp = timestamp
 
-        in_replay = (
-            self.replay_candidate
-            and index >= 1
-            and (self.replay_boundary is None or index < self.replay_boundary)
-        )
+        in_replay = replay_start <= index < replay_end
 
         token_totals = _extract_codex_token_totals(record_type, payload)
         if token_totals is not None:
             input_tokens, cached_tokens, output_tokens, reasoning_tokens = token_totals
             current = [input_tokens, cached_tokens, output_tokens, reasoning_tokens]
-            baseline = self.baseline
             if any(baseline) and _is_explicit_codex_counter_reset(record_type, payload):
                 # Applies while folding replay too: only the terminal
                 # inherited epoch may baseline the leaf-native continuation.
@@ -2730,19 +2549,19 @@ class _CodexStream:
                 # fresh is the remainder — adding cached again would
                 # double-count it.
                 delta_fresh = max(0, delta_input - delta_cached)
-                self.fresh_input_tokens += delta_fresh
-                self.cached_input_tokens += delta_cached
-                self.total_output_tokens += delta_output
-                self.reasoning_output_tokens += delta_reasoning
+                fresh_input_tokens += delta_fresh
+                cached_input_tokens += delta_cached
+                total_output_tokens += delta_output
+                reasoning_output_tokens += delta_reasoning
                 if delta_fresh or delta_cached or delta_output or delta_reasoning:
-                    bucket = _daily_bucket(self.daily, timestamp)
+                    bucket = _daily_bucket(daily, timestamp)
                     if bucket is not None:
                         bucket.fresh_input_tokens += delta_fresh
                         bucket.cached_input_tokens += delta_cached
                         bucket.total_input_tokens += delta_fresh + delta_cached
                         bucket.total_output_tokens += delta_output
                         bucket.reasoning_output_tokens += delta_reasoning
-            self.baseline = [max(base, cur) for base, cur in zip(baseline, current)]
+            baseline = [max(base, cur) for base, cur in zip(baseline, current)]
 
         if record_type == "message":
             role = payload.get("role", "")
@@ -2758,37 +2577,37 @@ class _CodexStream:
                 )
                 clean = _clean_codex_user_text(text)
                 if not clean or len(clean) < 3:
-                    return
+                    continue
                 # Keep first_user_message from the replayed history: it names
                 # the session's actual topic. Counts stay live-only. Injected
                 # AGENTS.md payloads are not the topic.
-                if not self.first_user_message and not _is_codex_agents_payload(clean):
-                    self.first_user_message = clean[:500]
+                if not first_user_message and not _is_codex_agents_payload(clean):
+                    first_user_message = clean[:500]
                 if in_replay:
-                    return
-                self.user_message_count += 1
-                bucket = _daily_bucket(self.daily, timestamp)
+                    continue
+                user_message_count += 1
+                bucket = _daily_bucket(daily, timestamp)
                 if bucket is not None:
                     bucket.user_message_count += 1
 
             elif role == "assistant":
                 if in_replay:
-                    return
+                    continue
                 text = _extract_text(content)
                 if text.strip():
-                    self.assistant_message_count += 1
-                    bucket = _daily_bucket(self.daily, timestamp)
+                    assistant_message_count += 1
+                    bucket = _daily_bucket(daily, timestamp)
                     if bucket is not None:
                         bucket.assistant_message_count += 1
 
         elif in_replay:
-            return
+            continue
 
         elif record_type == "function_call":
             tool_name = payload.get("name", "unknown")
             args = _load_tool_args(payload.get("arguments", {}))
             cmd = _extract_command(args)
-            self.spool.append_tool_call(
+            spool.append_tool_call(
                 ToolCall(
                     tool_name=tool_name,
                     command=str(cmd)[:500] if cmd else None,
@@ -2799,347 +2618,71 @@ class _CodexStream:
                     call_id=payload.get("call_id") or payload.get("id"),
                 )
             )
-            bucket = _daily_bucket(self.daily, timestamp)
+            bucket = _daily_bucket(daily, timestamp)
             if bucket is not None:
                 bucket.tool_call_count += 1
 
         elif record_type == "function_call_output":
             _, is_error = _parse_tool_output(payload.get("output", ""))
             if is_error:
-                self.error_count += 1
+                error_count += 1
             call_id = payload.get("call_id") or payload.get("id")
             if call_id:
-                self.spool.set_tool_result(call_id, is_error)
+                spool.set_tool_result(call_id, is_error)
 
-    def settle(self) -> None:
-        """Bring derived spool rows up to date with the records fed so far."""
-        self.spool.ensure_session_paths(self.project)
-
-    def finish(self, path: Path) -> SessionInfo | PrivateSessionMarker | None:
-        """Materialize the session from the fold (the caller checks I/O errors)."""
-        if not self.record_count:
-            return None
-        if self.private_marker:
-            return PrivateSessionMarker(path.stem, "codex", self.private_marker)
-
-        session_id = path.stem
-        workspace_root = self.project
-        fallback_day = self.fallback_day
-        if fallback_day is None:
-            fallback_day = _fallback_usage_day(path, ())
-        # The first pass's value wins when truthy; otherwise the first truthy
-        # record timestamp; otherwise the first pass's (possibly "") value.
-        first_timestamp = (
-            self.meta_first_timestamp
-            or self.first_record_timestamp
-            or self.meta_first_timestamp
-        )
-        last_timestamp = self.last_record_timestamp or self.meta_first_timestamp
-
-        tool_calls = self.spool.tool_calls()
-        tool_call_count = len(tool_calls)
-        self.settle()
-        session_paths = self.spool.session_paths()
-        total_input_tokens = self.fresh_input_tokens + self.cached_input_tokens
-        daily = copy.deepcopy(self.daily)
-        _reconcile_daily_usage(
-            daily,
-            fallback_day,
-            {
-                "total_input_tokens": total_input_tokens,
-                "total_output_tokens": self.total_output_tokens,
-                "fresh_input_tokens": self.fresh_input_tokens,
-                "cached_input_tokens": self.cached_input_tokens,
-                "cache_creation_input_tokens": 0,
-                "cache_creation_5m_input_tokens": 0,
-                "cache_creation_1h_input_tokens": 0,
-                "cache_creation_unknown_input_tokens": 0,
-                "reasoning_output_tokens": self.reasoning_output_tokens,
-                "user_message_count": self.user_message_count,
-                "assistant_message_count": self.assistant_message_count,
-                "tool_call_count": tool_call_count,
-            },
-        )
-
-        return SessionInfo(
-            session_id=session_id,
-            source="codex",
-            project=self.project,
-            first_timestamp=first_timestamp,
-            last_timestamp=last_timestamp,
-            user_message_count=self.user_message_count,
-            assistant_message_count=self.assistant_message_count,
-            tool_call_count=tool_call_count,
-            error_count=self.error_count,
-            total_input_tokens=total_input_tokens,
-            total_output_tokens=self.total_output_tokens,
-            fresh_input_tokens=self.fresh_input_tokens,
-            cached_input_tokens=self.cached_input_tokens,
-            reasoning_output_tokens=self.reasoning_output_tokens,
-            first_user_message=self.first_user_message,
-            model=self.model,
-            workspace_root=workspace_root,
-            thread_id=self.thread_id or path.stem,
-            parent_thread_id=self.parent_thread_id,
-            parent_session_id=self.parent_session_id,
-            spawn_depth=self.spawn_depth,
-            tool_calls=tool_calls,
-            session_paths=session_paths,
-            daily_usage=_sorted_daily(daily),
-        )
-
-
-def parse_codex_session(path: Path) -> SessionInfo | PrivateSessionMarker | None:
-    """Parse a Codex JSONL file and return a SessionInfo."""
-    stream = _CodexStream(_new_spool(path))
-    load_stats = JsonlLoadStats()
-    for record in _iter_jsonl(path, stats=load_stats):
-        stream.feed(record)
-    if load_stats.io_errors:
+    if parse_stats.io_errors:
         return None
-    return stream.finish(path)
 
-
-# Transcripts below this size spool in memory instead of a temporary file.
-IN_MEMORY_SPOOL_MAX_BYTES = 16 * 1024 * 1024
-# Bump whenever _ClaudeStream/_CodexStream fold differently or their state
-# changes shape: persisted parse states from another version are discarded.
-PARSE_STATE_VERSION = 1
-# Generation of a checkpoint that records only where a session's first privacy
-# marker lies (followed by the marker); such a checkpoint has no state file.
-MARKER_GENERATION = "marker:"
-
-
-def _new_spool(path: Path | TextIO, size: int | None = None) -> _ParseSpool:
-    if size is None:
-        try:
-            size = os.stat(path).st_size
-        except (OSError, TypeError):
-            size = None
-    return _ParseSpool(in_memory=size is not None and size <= IN_MEMORY_SPOOL_MAX_BYTES)
-
-
-_STREAMS = {"claudecode": _ClaudeStream, "codex": _CodexStream}
-
-
-@dataclass(frozen=True)
-class ParseCheckpoint:
-    """How far a persisted parse state has folded one transcript.
-
-    ``offset`` sits just past a line terminator, ``prefix_sha256`` hashes
-    bytes [0, offset), and ``generation`` names the exact spool commit, so a
-    state file that ran ahead of (or fell behind) the database row is never
-    resumed.
-    """
-
-    offset: int
-    prefix_sha256: str
-    generation: str
-    dev: int
-    ino: int
-    version: int = PARSE_STATE_VERSION
-
-
-@dataclass
-class TranscriptParse:
-    """A parse result plus the spool its lazy sequences read from."""
-
-    info: SessionInfo | PrivateSessionMarker | None
-    # Durable state now covers [0, checkpoint.offset); None if none was kept.
-    checkpoint: ParseCheckpoint | None
-    # Byte offset parsing started from (0 means a full parse).
-    resumed_from: int
-    spool: _ParseSpool | None = None
-
-    def close(self) -> None:
-        """Release the spool; an uncommitted provisional tail is discarded."""
-        if self.spool is not None:
-            self.spool.close()
-            self.spool = None
-
-
-def remove_parse_state(state_path: Path) -> None:
-    for candidate in (state_path, Path(f"{state_path}-journal")):
-        try:
-            candidate.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def _resume_stream(source: str, state_path: Path, checkpoint: ParseCheckpoint):
-    spool = _ParseSpool(state_path)
-    try:
-        stored = json.loads(spool.get_meta("stream") or "null")
-        if (
-            isinstance(stored, dict)
-            and stored.get("version") == PARSE_STATE_VERSION == checkpoint.version
-            and stored.get("source") == source
-            and stored.get("generation") == checkpoint.generation
-            and stored.get("offset") == checkpoint.offset
-        ):
-            return _STREAMS[source](spool, stored["state"])
-    except (sqlite3.Error, KeyError, TypeError, ValueError, AttributeError):
-        pass
-    spool.close()
-    return None
-
-
-def parse_transcript(
-    source: str,
-    path: Path,
-    scan,
-    *,
-    state_path: Path | None = None,
-    checkpoint: ParseCheckpoint | None = None,
-) -> TranscriptParse:
-    """Parse exactly the ``scan.size`` bytes a TranscriptScan hashed.
-
-    With ``state_path`` the fold is resumable. It resumes from ``checkpoint``
-    when the file is the same inode and its first ``checkpoint.offset`` bytes
-    hash as recorded; otherwise it restarts from byte 0. Records through the
-    last line terminator are committed to the state; an unterminated final
-    line is folded provisionally (a full parse includes it when it is valid
-    JSON) and rolled back on close, so the next run re-reads it once complete.
-
-    Raises OSError when the file no longer matches the scan (rotated or
-    truncated), exactly as a vanished file would.
-    """
-    from .transcript_io import open_text_range
-
-    stream_type = _STREAMS[source]
-    stream = None
-    resumed_from = 0
-    prefix_unchanged = bool(
-        checkpoint is not None
-        and checkpoint.version == PARSE_STATE_VERSION
-        and (checkpoint.dev, checkpoint.ino) == (scan.dev, scan.ino)
-        and checkpoint.offset <= scan.line_end
-        and scan.prefix_matches(checkpoint.offset, checkpoint.prefix_sha256)
+    tool_calls = spool.tool_calls()
+    tool_call_count = len(tool_calls)
+    spool.build_session_paths(workspace_root)
+    session_paths = spool.session_paths()
+    total_input_tokens = fresh_input_tokens + cached_input_tokens
+    _reconcile_daily_usage(
+        daily,
+        fallback_day,
+        {
+            "total_input_tokens": total_input_tokens,
+            "total_output_tokens": total_output_tokens,
+            "fresh_input_tokens": fresh_input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "cache_creation_input_tokens": 0,
+            "cache_creation_5m_input_tokens": 0,
+            "cache_creation_1h_input_tokens": 0,
+            "cache_creation_unknown_input_tokens": 0,
+            "reasoning_output_tokens": reasoning_output_tokens,
+            "user_message_count": user_message_count,
+            "assistant_message_count": assistant_message_count,
+            "tool_call_count": tool_call_count,
+        },
     )
-    if prefix_unchanged and checkpoint.generation.startswith(MARKER_GENERATION):
-        # The first privacy marker lies in the unchanged prefix, so a full
-        # parse returns exactly this marker whatever was appended.
-        return TranscriptParse(
-            info=PrivateSessionMarker(
-                path.stem, source, checkpoint.generation[len(MARKER_GENERATION) :]
-            ),
-            checkpoint=checkpoint,
-            resumed_from=checkpoint.offset,
-        )
-    if prefix_unchanged and state_path is not None and state_path.exists():
-        try:
-            stream = _resume_stream(source, state_path, checkpoint)
-        except (OSError, sqlite3.Error):
-            stream = None
-        if stream is not None:
-            resumed_from = checkpoint.offset
-    if stream is None:
-        if state_path is not None:
-            remove_parse_state(state_path)
-            spool = _ParseSpool(state_path)
-        else:
-            spool = _new_spool(path, scan.size)
-        stream = stream_type(spool)
-    spool = stream.spool
-    result = TranscriptParse(
-        info=None, checkpoint=None, resumed_from=resumed_from, spool=spool
+
+    return SessionInfo(
+        session_id=session_id,
+        source="codex",
+        project=project,
+        first_timestamp=first_timestamp,
+        last_timestamp=last_timestamp,
+        user_message_count=user_message_count,
+        assistant_message_count=assistant_message_count,
+        tool_call_count=tool_call_count,
+        error_count=error_count,
+        total_input_tokens=total_input_tokens,
+        total_output_tokens=total_output_tokens,
+        fresh_input_tokens=fresh_input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        reasoning_output_tokens=reasoning_output_tokens,
+        first_user_message=first_user_message,
+        model=model,
+        workspace_root=workspace_root,
+        thread_id=thread_id,
+        parent_thread_id=parent_thread_id,
+        parent_session_id=parent_session_id,
+        spawn_depth=spawn_depth,
+        tool_calls=tool_calls,
+        session_paths=session_paths,
+        daily_usage=_sorted_daily(daily),
     )
-    try:
-        spool.begin()
-        with open(path, "rb") as handle:
-            opened = os.fstat(handle.fileno())
-            if (opened.st_dev, opened.st_ino) != (scan.dev, scan.ino) or (
-                opened.st_size < scan.size
-            ):
-                raise FileNotFoundError(
-                    errno.ENOENT, "transcript changed after it was hashed", str(path)
-                )
-            stats = JsonlLoadStats()
-            with open_text_range(handle, resumed_from, scan.line_end) as text:
-                for record in _iter_jsonl(text, stats=stats):
-                    stream.feed(record)
-            if stats.io_errors:
-                result.close()
-                return result
-            if spool.persistent and stream.private_marker:
-                # A session that opted out of indexing keeps no derived
-                # content (first message, commands, paths) between syncs,
-                # only where its marker sits: the result is the marker for
-                # as long as these bytes are unchanged.
-                result.close()
-                remove_parse_state(state_path)
-                result.checkpoint = ParseCheckpoint(
-                    offset=scan.line_end,
-                    prefix_sha256=scan.line_end_sha256,
-                    generation=MARKER_GENERATION + stream.private_marker,
-                    dev=scan.dev,
-                    ino=scan.ino,
-                )
-                result.info = PrivateSessionMarker(
-                    path.stem, source, stream.private_marker
-                )
-                return result
-            if spool.persistent:
-                stream.settle()
-                generation = secrets.token_hex(16)
-                spool.set_meta(
-                    "stream",
-                    json.dumps(
-                        {
-                            "version": PARSE_STATE_VERSION,
-                            "source": source,
-                            "generation": generation,
-                            "offset": scan.line_end,
-                            "state": stream.state(),
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
-                spool.commit()
-                result.checkpoint = ParseCheckpoint(
-                    offset=scan.line_end,
-                    prefix_sha256=scan.line_end_sha256,
-                    generation=generation,
-                    dev=scan.dev,
-                    ino=scan.ino,
-                )
-                spool.begin()
-            if scan.size > scan.line_end:
-                tail_stats = JsonlLoadStats()
-                with open_text_range(handle, scan.line_end, scan.size) as text:
-                    for record in _iter_jsonl(text, stats=tail_stats):
-                        stream.feed(record)
-                if tail_stats.io_errors:
-                    result.close()
-                    return result
-        result.info = stream.finish(path)
-        if isinstance(result.info, PrivateSessionMarker) and state_path is not None:
-            # The marker is only in the unterminated tail: keep nothing.
-            result.close()
-            remove_parse_state(state_path)
-            result.checkpoint = None
-    except BaseException:
-        result.close()
-        raise
-    return result
-
-
-def find_private_marker(path: Path) -> str | None:
-    """The first privacy marker in a transcript, exactly as a parse finds it.
-
-    Both streams check every valid record with _private_marker and keep the
-    first hit, so this returns the marker a full parse of ``path`` would.
-    Raises OSError when the file could not be read to the end without a
-    marker, so "no marker" is never concluded from a partial read.
-    """
-    stats = JsonlLoadStats()
-    for record in _iter_jsonl(path, stats=stats, report_malformed=False):
-        marker = _private_marker((record,))
-        if marker:
-            return marker
-    if stats.io_errors:
-        raise OSError(errno.EIO, "transcript could not be read for a marker", str(path))
-    return None
 
 
 def file_hash(path: Path) -> str:

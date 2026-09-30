@@ -2,6 +2,7 @@
 
 import ipaddress
 import json
+import math
 import os
 import socket
 from datetime import UTC
@@ -659,6 +660,31 @@ def show_command(session_id, backend, db, db_url, limit, json_output):
         raise click.ClickException(str(exc))
 
 
+class _BudgetSeconds(click.ParamType):
+    """Seconds as a non-negative number, or none/off/unlimited for no budget."""
+
+    name = "seconds"
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, (int, float)):
+            number = float(value)
+        else:
+            text = str(value).strip().lower()
+            if text in {"none", "off", "unlimited"}:
+                return 0.0
+            try:
+                number = float(text)
+            except ValueError:
+                self.fail(f"{value!r} is not a number of seconds or 'off'", param, ctx)
+        if math.isnan(number) or number < 0:
+            self.fail("the budget must be a non-negative number", param, ctx)
+        # An infinite budget is no budget.
+        return 0.0 if math.isinf(number) else number
+
+
+_BUDGET = _BudgetSeconds()
+
+
 @cli.command()
 @click.option(
     "--shared",
@@ -705,6 +731,40 @@ def show_command(session_id, backend, db, db_url, limit, json_output):
 )
 @click.option("--username", default=None, help="Override system username")
 @click.option("--machine", default=None, help="Override machine/hostname")
+@click.option(
+    "--budget",
+    "budget_seconds",
+    type=_BUDGET,
+    envvar="LOGPILE_SYNC_BUDGET_SECONDS",
+    default="900",
+    show_default=True,
+    help="Wall-clock budget in seconds for the local sync (0, none, off or "
+    "unlimited for no budget). A sync that runs out stops at a session "
+    "boundary; the next run resumes.",
+)
+@click.option(
+    "--min-free-gib",
+    type=click.FloatRange(min=0),
+    envvar="LOGPILE_SYNC_MIN_FREE_GIB",
+    default=40.0,
+    show_default=True,
+    help="Defer (or stop) the local sync below this much free disk.",
+)
+@click.option(
+    "--min-free-gib-with-snapshot",
+    type=click.FloatRange(min=0),
+    envvar="LOGPILE_SYNC_MIN_FREE_GIB_WITH_SNAPSHOT",
+    default=60.0,
+    show_default=True,
+    help="Floor while a Time Machine local snapshot exists (macOS).",
+)
+@click.option(
+    "--disk-guard/--no-disk-guard",
+    envvar="LOGPILE_SYNC_DISK_GUARD",
+    default=True,
+    show_default=True,
+    help="Check free disk before and during the local sync.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Print each file processed")
 def sync(
     shared,
@@ -719,14 +779,28 @@ def sync(
     index_text,
     username,
     machine,
+    budget_seconds,
+    min_free_gib,
+    min_free_gib_with_snapshot,
+    disk_guard,
     verbose,
 ):
     """Index local sessions, upload raw logs to cloud storage, or both."""
     if backend in {"local", "both"}:
-        from .sync import SyncLockError, SyncStatus, sync_sessions
+        from dataclasses import replace
+
+        from .diskguard import DiskGuardPolicy
+        from .sync import SyncLimits, SyncLockError, SyncStatus, sync_sessions
 
         username = _resolve_sync_username(db, username)
         machine = machine or socket.gethostname()
+        limits = replace(
+            SyncLimits.from_env(),
+            budget_seconds=budget_seconds or None,
+            disk=DiskGuardPolicy.from_gib(
+                min_free_gib, min_free_gib_with_snapshot, enabled=disk_guard
+            ),
+        )
         click.echo(f"Syncing local sessions for {username}@{machine}…")
         try:
             local_result = sync_sessions(
@@ -736,14 +810,25 @@ def sync(
                 machine=machine,
                 home=Path.home(),
                 verbose=verbose,
+                limits=limits,
             )
         except SyncLockError as exc:
             raise click.ClickException(str(exc)) from exc
-        if local_result.status == SyncStatus.LOCK_CONTENDED:
+        if local_result.status in {
+            SyncStatus.LOCK_CONTENDED,
+            SyncStatus.DISK_DEFERRED,
+        }:
+            # EX_TEMPFAIL: nothing ran; try again later.
             raise click.exceptions.Exit(75)
         new, updated, skipped = local_result
+        partial = (
+            f" (stopped early: {local_result.reason})"
+            if local_result.status == SyncStatus.PARTIAL
+            else ""
+        )
         click.echo(
-            f"Local done: {new} new, {updated} updated, {skipped} unchanged/skipped"
+            f"Local done: {new} new, {updated} updated, "
+            f"{skipped} unchanged/skipped{partial}"
         )
 
     if backend in {"cloud", "both"}:

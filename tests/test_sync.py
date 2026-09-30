@@ -1813,9 +1813,12 @@ class SyncTests(unittest.TestCase):
             )
 
             with open_sqlite(db_path) as conn:
+                # A legacy row: written before structure_version, with its
+                # structure never computed.
                 conn.execute("DELETE FROM session_paths WHERE session_id = 'session-1'")
                 conn.execute(
-                    "UPDATE sessions SET workspace_root = NULL WHERE session_id = 'session-1'"
+                    "UPDATE sessions SET workspace_root = NULL, structure_version = 0 "
+                    "WHERE session_id = 'session-1'"
                 )
                 conn.commit()
 
@@ -2886,9 +2889,15 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
 
             sync_sessions(shared, db_path, "alice", "m1", home)
 
-            with mock.patch(
-                "logpile.sync.file_hash",
-                side_effect=AssertionError("file_hash called on unchanged files"),
+            with (
+                mock.patch(
+                    "logpile.sync.file_hash",
+                    side_effect=AssertionError("file_hash called on unchanged files"),
+                ),
+                mock.patch(
+                    "logpile.sync.scan_transcript",
+                    side_effect=AssertionError("unchanged files must not be read"),
+                ),
             ):
                 new, updated, skipped = sync_sessions(
                     shared, db_path, "alice", "m1", home
@@ -2968,18 +2977,20 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             home = root / "home"
             live = self._write_codex_session(home, session_id="rollout-race")
             archived = home / ".codex" / "archived_sessions" / live.name
-            original_hash = _sync_module.file_hash
+            original_scan = _sync_module.scan_transcript
             rotated = False
 
-            def rotate_before_hash(path: Path) -> str:
+            def rotate_before_hash(path: Path, **kwargs):
                 nonlocal rotated
                 if path == live and not rotated:
                     rotated = True
                     archived.parent.mkdir(parents=True, exist_ok=True)
                     live.replace(archived)
-                return original_hash(path)
+                return original_scan(path, **kwargs)
 
-            with mock.patch("logpile.sync.file_hash", side_effect=rotate_before_hash):
+            with mock.patch(
+                "logpile.sync.scan_transcript", side_effect=rotate_before_hash
+            ):
                 result = sync_sessions(
                     root / "shared", root / "logpile.db", "alice", "m1", home
                 )
@@ -2999,19 +3010,19 @@ class SyncCoverageAndFastPathTests(unittest.TestCase):
             home = root / "home"
             live = self._write_codex_session(home, session_id="rollout-parse-race")
             archived = home / ".codex" / "archived_sessions" / live.name
-            original_parse = _sync_module.parse_codex_session
+            original_parse = _sync_module.parse_transcript
             rotated = False
 
-            def rotate_before_parse(path: Path):
+            def rotate_before_parse(source: str, path: Path, *args, **kwargs):
                 nonlocal rotated
                 if path == live and not rotated:
                     rotated = True
                     archived.parent.mkdir(parents=True, exist_ok=True)
                     live.replace(archived)
-                return original_parse(path)
+                return original_parse(source, path, *args, **kwargs)
 
             with mock.patch(
-                "logpile.sync.parse_codex_session", side_effect=rotate_before_parse
+                "logpile.sync.parse_transcript", side_effect=rotate_before_parse
             ):
                 result = sync_sessions(
                     root / "shared", root / "logpile.db", "alice", "m1", home

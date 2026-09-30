@@ -3,15 +3,21 @@
 import errno
 import fcntl
 import fnmatch
+import hashlib
+import json
+import math
 import os
 import re
 import secrets
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -25,15 +31,21 @@ from .db import (
     apply_message_claims,
     defer_storage_transition,
     defer_storage_transitions,
+    delete_transcript_checkpoint,
+    drain_native_refresh,
     ensure_user,
     get_db,
     get_meta,
+    get_transcript_checkpoint,
     get_user_by_identifier,
     init_db,
     insert_session_daily_usage,
     insert_session_paths,
     insert_tool_calls,
+    iter_transcript_checkpoints,
     normalize_username,
+    put_transcript_checkpoint,
+    queue_native_refresh,
     refresh_native_usage,
     refresh_session_publication_metadata,
     resolve_session_visibility,
@@ -42,19 +54,24 @@ from .db import (
     upsert_session,
 )
 from .discovery import claude_projects_root, codex_session_roots, discover_transcripts
+from .diskguard import DiskGuardPolicy, check_disk_space, list_local_snapshots
 from .objectives import SESSION_OBJECTIVE_VERSION, derive_session_objective
 from .origins import SESSION_ORIGIN_VERSION, derive_session_origin
 from .parsers import (
     PrivateSessionMarker,
     file_hash,
+    find_private_marker,
     parse_claudecode_session,
     parse_codex_session,
+    parse_transcript,
+    remove_parse_state,
 )
 from .search import (
     SearchTranscriptReadError,
     backfill_search_index,
-    replace_session_search_index,
+    update_session_search_index,
 )
+from .transcript_io import TranscriptScan, scan_transcript
 
 SESSION_ACTIVITY_VERSION = 1
 SESSION_NARRATIVE_VERSION = 1
@@ -75,17 +92,39 @@ SESSION_IDENTITY_VERSION = 1
 # the v9 fix covered Claude isMeta records only, so the ~12.6k polluted
 # codex titles survived the v9 reparse.
 SESSION_TOKEN_VERSION = 10
+# Stamped on a row whenever a full parse recomputes its structural fields
+# (workspace/worktree/repo, activity, narrative, origin, session paths). The
+# legacy "structure missing" heuristics below cannot tell a never-computed
+# field from a legitimately empty one (a session run from "/" has no repo
+# name; tool calls without file arguments leave no path rows), so a stamped
+# row is settled even when those fields are empty.
+SESSION_STRUCTURE_VERSION = 1
+
+# Default wall-clock budget for one sync. A budget-limited sync commits what
+# it finished and the next run resumes; see SyncLimits.
+DEFAULT_SYNC_BUDGET_SECONDS = 900.0
+# Transcripts at least this large that were modified within the idle window
+# keep a resumable parse state, so an append is parsed from where the last
+# sync stopped instead of from byte 0. Smaller or idle transcripts reparse.
+DEFAULT_PARSE_STATE_MIN_BYTES = 1024 * 1024
+DEFAULT_PARSE_STATE_MAX_IDLE_SECONDS = 3 * 24 * 3600.0
 
 
 class SyncStatus(str, Enum):
     COMPLETED = "completed"
     LOCK_CONTENDED = "lock_contended"
+    # Nothing was written: the free-space guard deferred the whole run.
+    DISK_DEFERRED = "disk_deferred"
+    # The run stopped early (budget, free space, or a termination signal)
+    # after committing finished sessions; the next run resumes.
+    PARTIAL = "partial"
 
 
 class SyncResult(tuple):
     """Tuple-compatible sync counts with a machine-readable completion status."""
 
     status = SyncStatus.COMPLETED
+    reason: str | None = None
 
     def __new__(cls, new: int, updated: int, skipped: int):
         return super().__new__(cls, (new, updated, skipped))
@@ -105,6 +144,213 @@ class SyncResult(tuple):
 
 class SyncLockContended(SyncResult):
     status = SyncStatus.LOCK_CONTENDED
+
+
+class SyncDiskDeferred(SyncResult):
+    status = SyncStatus.DISK_DEFERRED
+
+    def __new__(cls, reason: str):
+        result = super().__new__(cls, 0, 0, 0)
+        result.reason = reason
+        return result
+
+
+class SyncPartial(SyncResult):
+    status = SyncStatus.PARTIAL
+
+    def __new__(cls, new: int, updated: int, skipped: int, reason: str):
+        result = super().__new__(cls, new, updated, skipped)
+        result.reason = reason
+        return result
+
+
+def _env_float(environ, name: str, default: float | None) -> float | None:
+    raw = (environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"none", "off", "unlimited"}:
+        return None
+    value = float(raw)
+    if math.isnan(value) or value < 0:
+        raise ValueError(f"{name} must be a non-negative number")
+    return None if math.isinf(value) else value
+
+
+@dataclass(frozen=True)
+class SyncLimits:
+    """Bounds on one sync run.
+
+    ``budget_seconds`` is a wall-clock budget (None or 0 means unlimited).
+    When it runs out, the sync stops at the next session boundary, runs
+    this run's native refreshes, gives each end-of-run backfill its one
+    bounded step, commits, and reports a partial result. When the disk
+    guard trips or SIGTERM arrives it stops the same way but skips the
+    backfills, whose work stays queued for the next run.
+    """
+
+    budget_seconds: float | None = DEFAULT_SYNC_BUDGET_SECONDS
+    disk: DiskGuardPolicy = field(default_factory=DiskGuardPolicy)
+    disk_recheck_seconds: float = 30.0
+    snapshot_recheck_seconds: float = 300.0
+    parse_state_min_bytes: int = DEFAULT_PARSE_STATE_MIN_BYTES
+    parse_state_max_idle_seconds: float = DEFAULT_PARSE_STATE_MAX_IDLE_SECONDS
+
+    @classmethod
+    def unlimited(cls) -> "SyncLimits":
+        return cls(budget_seconds=None, disk=DiskGuardPolicy.disabled())
+
+    @classmethod
+    def from_env(cls, environ=None) -> "SyncLimits":
+        """Defaults, overridable with LOGPILE_SYNC_* environment variables.
+
+        LOGPILE_SYNC_BUDGET_SECONDS (0, "none" or "off" for no budget),
+        LOGPILE_SYNC_MIN_FREE_GIB, LOGPILE_SYNC_MIN_FREE_GIB_WITH_SNAPSHOT,
+        LOGPILE_SYNC_DISK_GUARD ("0"/"off" disables the guard), and
+        LOGPILE_PARSE_STATE_MIN_BYTES.
+        """
+        environ = os.environ if environ is None else environ
+        budget = _env_float(
+            environ, "LOGPILE_SYNC_BUDGET_SECONDS", DEFAULT_SYNC_BUDGET_SECONDS
+        )
+        guard_flag = (environ.get("LOGPILE_SYNC_DISK_GUARD") or "").strip().lower()
+        disk = DiskGuardPolicy.from_gib(
+            _env_float(environ, "LOGPILE_SYNC_MIN_FREE_GIB", 40.0) or 0.0,
+            _env_float(environ, "LOGPILE_SYNC_MIN_FREE_GIB_WITH_SNAPSHOT", 60.0) or 0.0,
+            enabled=guard_flag not in {"0", "off", "false", "no"},
+        )
+        min_state_bytes = _env_float(
+            environ, "LOGPILE_PARSE_STATE_MIN_BYTES", DEFAULT_PARSE_STATE_MIN_BYTES
+        )
+        return cls(
+            budget_seconds=budget or None,
+            disk=disk,
+            parse_state_min_bytes=int(
+                DEFAULT_PARSE_STATE_MIN_BYTES
+                if min_state_bytes is None
+                else min_state_bytes
+            ),
+        )
+
+
+class _SyncControl:
+    """Decides, at safe points, whether a sync should stop early."""
+
+    def __init__(
+        self,
+        limits: SyncLimits,
+        guarded_paths: list[Path],
+        *,
+        clock=time.monotonic,
+    ) -> None:
+        self.limits = limits
+        self._paths = guarded_paths
+        self._clock = clock
+        self.started = clock()
+        budget = limits.budget_seconds
+        self.deadline = self.started + budget if budget else None
+        self.stop_reason: str | None = None
+        self.signal_name: str | None = None
+        self._hard_stop = False
+        self.progress = 0
+        self._next_disk_check = self.started + limits.disk_recheck_seconds
+        self._next_snapshot_check = self.started + limits.snapshot_recheck_seconds
+        self._snapshots: tuple[str, ...] | None = None
+
+    def note_progress(self) -> None:
+        self.progress += 1
+
+    def check_disk(self) -> str | None:
+        """Full disk check (forks tmutil once); returns a deferral reason."""
+        if not self.limits.disk.enabled:
+            return None
+        self._snapshots = list_local_snapshots()
+        decision = check_disk_space(
+            self._paths,
+            self.limits.disk,
+            snapshots=self._snapshots,
+            snapshots_known=True,
+        )
+        return None if decision.ok else decision.reason
+
+    def stop_requested(self) -> bool:
+        """A reason to stop now, whatever this run has finished: a
+        termination signal or free space below the floor (not the budget).
+
+        End-of-run backfills take this as ``should_stop`` and the budget as
+        their ``deadline``, so a signal or low disk skips them outright while
+        a spent budget still lets them make their bounded progress."""
+        if self._hard_stop:
+            return True
+        if self.signal_name is not None:
+            self.stop_reason = f"received {self.signal_name}"
+            self._hard_stop = True
+            return True
+        now = self._clock()
+        if self.limits.disk.enabled and now >= self._next_disk_check:
+            self._next_disk_check = now + self.limits.disk_recheck_seconds
+            if now >= self._next_snapshot_check:
+                # A snapshot taken mid-run raises the floor from then on.
+                self._next_snapshot_check = now + self.limits.snapshot_recheck_seconds
+                self._snapshots = list_local_snapshots()
+            decision = check_disk_space(
+                self._paths,
+                self.limits.disk,
+                snapshots=self._snapshots,
+                snapshots_known=True,
+            )
+            if not decision.ok:
+                self.stop_reason = decision.reason
+                self._hard_stop = True
+                return True
+        return False
+
+    def should_stop(self) -> bool:
+        """Whether to stop before the next session (or backfilled row)."""
+        if self.stop_reason is not None or self.stop_requested():
+            return True
+        # Every run finishes at least one session before the budget can stop
+        # it, so a budget shorter than one session still converges.
+        if (
+            self.deadline is not None
+            and self._clock() >= self.deadline
+            and self.progress
+        ):
+            self.stop_reason = (
+                f"wall-clock budget of {self.limits.budget_seconds:.0f}s exhausted"
+            )
+            return True
+        return False
+
+
+@contextmanager
+def _graceful_termination(control: _SyncControl) -> Iterator[None]:
+    """Turn the first SIGTERM into a cooperative stop at the next safe point.
+
+    A launchd or supervisor SIGTERM would otherwise kill the process without
+    rolling back uncommitted storage moves. The handler never raises (an
+    exception at an arbitrary bytecode could land between a commit and its
+    storage finalization); it restores the previous disposition, so a second
+    SIGTERM terminates the process as it would have without this handler.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def handle(signum, _frame) -> None:
+        control.signal_name = signal.Signals(signum).name
+        # getsignal() returns None for a handler installed outside Python.
+        signal.signal(
+            signal.SIGTERM, previous if previous is not None else signal.SIG_DFL
+        )
+
+    signal.signal(signal.SIGTERM, handle)
+    try:
+        yield
+    finally:
+        signal.signal(
+            signal.SIGTERM, previous if previous is not None else signal.SIG_DFL
+        )
 
 
 class SyncLockError(RuntimeError):
@@ -529,13 +775,14 @@ def _discard_temporary(path: Path) -> None:
         pass
 
 
-def _finalize_clone(src: Path, tmp: Path) -> bool:
+def _finalize_clone(src: Path, tmp: Path) -> tuple[int, int] | None:
     """Make a fresh clone private, regular, and durable before it is published.
 
     Clears the BSD flags the clone copied from its source, except
     UF_COMPRESSED, so the result matches the flag-free byte copy.  Returns
-    False, and the caller discards the clone and byte-copies instead, when the
-    clone carries a flag only the superuser can clear or an extended ACL.  A
+    None, and the caller discards the clone and byte-copies instead, when the
+    clone carries a flag only the superuser can clear or an extended ACL, and
+    otherwise returns the (st_dev, st_ino) it verified.  A
     clone never copies the source's ACL (CLONE_ACL is not passed), but
     clonefile(2) applies the destination directory's inheritable ACEs; the
     byte copy then receives the same inherited ACEs, so the fallback keeps
@@ -566,7 +813,7 @@ def _finalize_clone(src: Path, tmp: Path) -> bool:
             raise StorageSafetyError(f"Refusing replaced clone of {src}: {tmp}")
         file_flags = getattr(opened, "st_flags", 0)
         if file_flags & ~_UF_SETTABLE:
-            return False
+            return None
         if file_flags & ~_KEPT_CLONE_FLAGS:
             # Through the verified descriptor, never the path.
             apfs.set_file_flags(fd, file_flags & _KEPT_CLONE_FLAGS)
@@ -574,14 +821,42 @@ def _finalize_clone(src: Path, tmp: Path) -> bool:
                 raise StorageSafetyError(f"Could not clear clone flags on {tmp}")
         os.fchmod(fd, 0o600)
         if apfs.has_extended_acl(fd):
-            return False
+            return None
         os.fsync(fd)
     finally:
         os.close(fd)
-    return True
+    return (opened.st_dev, opened.st_ino)
 
 
-def _clone_to_temporary_sibling(src: Path, dst: Path) -> Path | None:
+def _truncate_clone(tmp: Path, size: int, identity: tuple[int, int]) -> None:
+    """Cut a fresh staging clone back to the bytes sync hashed.
+
+    A live agent appends every few seconds, so the source can grow between
+    hashing and cloning; without this the verification hash never matches a
+    busy transcript. Truncating the private staging clone releases only its
+    tail blocks. The clone's times are restored so it keeps its source's
+    modified time, like an untruncated clone.
+    """
+    flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(tmp, flags)
+    try:
+        info = os.fstat(fd)
+        # Only the exact file _finalize_clone verified may be truncated.
+        if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != identity:
+            raise StorageSafetyError(f"Refusing to truncate replaced clone: {tmp}")
+        if info.st_size > size:
+            os.ftruncate(fd, size)
+            os.utime(fd, ns=(info.st_atime_ns, info.st_mtime_ns))
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _clone_to_temporary_sibling(
+    src: Path, dst: Path, *, size_limit: int | None = None
+) -> Path | None:
     """Clone src into a new 0600 regular file beside dst, or return None.
 
     None means cloning does not apply here and the caller should byte-copy:
@@ -632,9 +907,12 @@ def _clone_to_temporary_sibling(src: Path, dst: Path) -> Path | None:
         raise StorageSafetyError(f"Could not reserve a clone name beside {dst}")
 
     try:
-        if not _finalize_clone(src, tmp):
+        identity = _finalize_clone(src, tmp)
+        if identity is None:
             _discard_temporary(tmp)
             return None
+        if size_limit is not None:
+            _truncate_clone(tmp, size_limit, identity)
     except BaseException:
         _discard_temporary(tmp)
         raise
@@ -647,13 +925,15 @@ def _secure_copy_file(
     *,
     private_root: Path | None = None,
     shared_root: Path | None = None,
+    size_limit: int | None = None,
 ) -> None:
     """Copy src to a 0600 staging file and atomically replace lexical dst.
 
     On APFS the staging file is a copy-on-write clone: an independent file
     that shares data blocks with src until either side changes, so the copy
     survives the source being appended or deleted.  Volumes or platforms that
-    cannot clone fall back to the byte copy below.
+    cannot clone fall back to the byte copy below.  ``size_limit`` copies
+    only the first bytes of a source that may still be growing.
     """
     if private_root is not None and shared_root is not None:
         raise ValueError("A copy destination cannot have two managed roots")
@@ -663,7 +943,7 @@ def _secure_copy_file(
         _secure_shared_mkdir(dst.parent, shared_root)
     else:
         _secure_mkdir(dst.parent)
-    clone = _clone_to_temporary_sibling(src, dst)
+    clone = _clone_to_temporary_sibling(src, dst, size_limit=size_limit)
     if clone is not None:
         try:
             os.replace(clone, dst)
@@ -679,7 +959,16 @@ def _secure_copy_file(
         os.fchmod(fd, 0o600)
         with src.open("rb") as source_file, os.fdopen(fd, "wb") as target_file:
             fd = -1
-            shutil.copyfileobj(source_file, target_file)
+            if size_limit is None:
+                shutil.copyfileobj(source_file, target_file)
+            else:
+                remaining = size_limit
+                while remaining > 0:
+                    chunk = source_file.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    target_file.write(chunk)
+                    remaining -= len(chunk)
             target_file.flush()
             os.fsync(target_file.fileno())
         os.chmod(tmp, 0o600)
@@ -844,6 +1133,7 @@ def _prepare_private_storage(
     project: str,
     filename: str,
     existing_shared_path: str | None,
+    size_limit: int | None = None,
 ) -> PrivateStorageTransition:
     """Prepare a reversible move from shared storage into private storage."""
     shared_dir = _lexical_path(shared_dir)
@@ -888,7 +1178,9 @@ def _prepare_private_storage(
                 os.replace(archive, archive_backup)
                 transition.rollback_moves.append((archive_backup, archive))
                 transition.commit_unlinks.append(archive_backup)
-            _secure_copy_file(src, archive, private_root=private_root)
+            _secure_copy_file(
+                src, archive, private_root=private_root, size_limit=size_limit
+            )
             transition.rollback_unlinks.append(archive)
             transition.changed = True
 
@@ -933,6 +1225,7 @@ def prepare_private_session_storage(
     row,
     *,
     shared_dir: Path,
+    size_limit: int | None = None,
 ) -> PrivateStorageTransition:
     src = Path(row["source_path"])
     shared_path = row["shared_path"] or ""
@@ -945,6 +1238,7 @@ def prepare_private_session_storage(
         project=row["project"] or "unknown",
         filename=filename,
         existing_shared_path=shared_path or None,
+        size_limit=size_limit,
     )
 
 
@@ -957,8 +1251,13 @@ def _prepare_shared_storage(
     project: str,
     filename: str,
     existing_shared_path: str | None,
+    expected: tuple[int, str] | None = None,
 ) -> PrivateStorageTransition:
-    """Prepare a reversible materialization into the lexical shared tree."""
+    """Prepare a reversible materialization into the lexical shared tree.
+
+    ``expected`` is the (size, sha256) sync hashed: the copy takes exactly
+    that many bytes, and an existing copy already holding them is kept.
+    """
     shared_dir = _lexical_path(shared_dir)
     _secure_shared_mkdir(shared_dir, shared_dir)
     desired = _desired_shared_path(shared_dir, username, source, project, filename)
@@ -1005,11 +1304,19 @@ def _prepare_shared_storage(
     )
     try:
         same_lexical_path = _lexical_path(copy_src) == _lexical_path(desired)
-        identical = (
-            not same_lexical_path
-            and _harden_managed_artifact(desired, shared_dir)
-            and file_hash(desired) == file_hash(copy_src)
-        )
+        if expected is not None and copy_src == src:
+            identical = (
+                not same_lexical_path
+                and _harden_managed_artifact(desired, shared_dir)
+                and desired.stat().st_size == expected[0]
+                and file_hash(desired) == expected[1]
+            )
+        else:
+            identical = (
+                not same_lexical_path
+                and _harden_managed_artifact(desired, shared_dir)
+                and file_hash(desired) == file_hash(copy_src)
+            )
         if same_lexical_path and not _harden_managed_artifact(desired, shared_dir):
             raise StorageSafetyError(
                 f"Managed shared transcript is not a regular file: {desired}"
@@ -1022,7 +1329,14 @@ def _prepare_shared_storage(
                 os.replace(desired, backup)
                 transition.rollback_moves.append((backup, desired))
                 transition.commit_unlinks.append(backup)
-            _secure_copy_file(copy_src, desired, shared_root=shared_dir)
+            _secure_copy_file(
+                copy_src,
+                desired,
+                shared_root=shared_dir,
+                size_limit=expected[0]
+                if expected is not None and copy_src == src
+                else None,
+            )
             transition.rollback_unlinks.append(desired)
             transition.changed = True
 
@@ -1107,6 +1421,7 @@ def _prepare_sync_shared_copy(
     filename: str,
     visibility: str,
     existing_shared_path: str | None = None,
+    expected: tuple[int, str] | None = None,
 ) -> PrivateStorageTransition:
     if visibility == "private":
         return _prepare_private_storage(
@@ -1117,6 +1432,7 @@ def _prepare_sync_shared_copy(
             project=project,
             filename=filename,
             existing_shared_path=existing_shared_path,
+            size_limit=expected[0] if expected is not None else None,
         )
     return _prepare_shared_storage(
         src=src,
@@ -1126,6 +1442,7 @@ def _prepare_sync_shared_copy(
         project=project,
         filename=filename,
         existing_shared_path=existing_shared_path,
+        expected=expected,
     )
 
 
@@ -1140,6 +1457,7 @@ def _sync_shared_copy(
     filename: str,
     visibility: str,
     expected_sha256: str,
+    expected_size: int | None = None,
     existing_shared_path: str | None = None,
 ) -> tuple[str, bool]:
     transition = _prepare_sync_shared_copy(
@@ -1151,6 +1469,9 @@ def _sync_shared_copy(
         filename=filename,
         visibility=visibility,
         existing_shared_path=existing_shared_path,
+        expected=(expected_size, expected_sha256)
+        if expected_size is not None
+        else None,
     )
     copied_path = transition.archive_path
     managed_root = (
@@ -1864,7 +2185,9 @@ def _compute_duration(t1: str, t2: str) -> float | None:
         return None
 
 
-def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[str]]:
+def _backfill_tokens_from_shared(
+    conn, verbose: bool = False, control: _SyncControl | None = None
+) -> tuple[int, set[str]]:
     """Re-parse stale sessions whose source is gone but shared copy survives.
 
     Claude Code rotates transcripts after ~30 days and Codex sessions can be
@@ -1894,6 +2217,8 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
     backfilled = 0
     affected: set[str] = set()
     for row in rows:
+        if control is not None and control.should_stop():
+            break
         if Path(row["source_path"]).exists():
             continue  # live files belong to the main scan loops
         shared_file = Path(row["shared_path"])
@@ -1989,6 +2314,8 @@ def _backfill_tokens_from_shared(conn, verbose: bool = False) -> tuple[int, set[
                 conn, row["session_id"], info.message_usage
             )
         backfilled += 1
+        if control is not None:
+            control.note_progress()
         if backfilled % 200 == 0:
             conn.commit()
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -2009,22 +2336,36 @@ def _resolve_canonical_parents(conn) -> None:
     even when no canonical parent exists; ``parent_session_id`` is NULL unless
     it joins an actual same-user, same-source row and never points to itself.
     """
+    # Guarded: an UPDATE that rewrites an indexed column with its current
+    # value still rewrites the index entry, so only changed rows are touched.
     conn.execute(
         """
-        UPDATE sessions AS child
-        SET parent_session_id = (
-            SELECT parent.session_id
-            FROM sessions AS parent
-            WHERE parent.username = child.username
-              AND parent.source = child.source
-              AND parent.thread_id = child.parent_thread_id
-              AND (child.thread_id IS NULL OR parent.thread_id != child.thread_id)
-              AND parent.session_id != child.session_id
-            ORDER BY COALESCE(parent.first_timestamp, ''), parent.session_id
-            LIMIT 1
+        WITH resolved AS (
+            SELECT
+                child.session_id AS session_id,
+                (
+                    SELECT parent.session_id
+                    FROM sessions AS parent
+                    WHERE parent.username = child.username
+                      AND parent.source = child.source
+                      AND parent.thread_id = child.parent_thread_id
+                      AND (
+                          child.thread_id IS NULL
+                          OR parent.thread_id != child.thread_id
+                      )
+                      AND parent.session_id != child.session_id
+                    ORDER BY COALESCE(parent.first_timestamp, ''), parent.session_id
+                    LIMIT 1
+                ) AS parent_session_id
+            FROM sessions AS child
+            WHERE child.parent_thread_id IS NOT NULL
+              AND child.parent_thread_id != ''
         )
-        WHERE child.parent_thread_id IS NOT NULL
-          AND child.parent_thread_id != ''
+        UPDATE sessions
+        SET parent_session_id = resolved.parent_session_id
+        FROM resolved
+        WHERE sessions.session_id = resolved.session_id
+          AND sessions.parent_session_id IS NOT resolved.parent_session_id
         """
     )
     # A current Codex row without raw parent evidence is a root. Older raw UUID
@@ -2035,6 +2376,7 @@ def _resolve_canonical_parents(conn) -> None:
         SET parent_session_id = NULL
         WHERE source = 'codex'
           AND (parent_thread_id IS NULL OR parent_thread_id = '')
+          AND parent_session_id IS NOT NULL
         """
     )
     # Claude parents are already canonical session ids, but validate them with
@@ -2080,7 +2422,9 @@ def _tighten_private_marker(
 ) -> None:
     storage_row = dict(existing_row)
     storage_row["source_path"] = str(jsonl_path)
-    transition = prepare_private_session_storage(storage_row, shared_dir=shared_dir)
+    transition = prepare_private_session_storage(
+        storage_row, shared_dir=shared_dir, size_limit=file_stat.st_size
+    )
     try:
         if (
             not _harden_managed_artifact(
@@ -2142,6 +2486,358 @@ def _tighten_private_marker(
         raise
 
 
+_STRUCTURE_VERSION_COLUMNS = (
+    ("activity_version", SESSION_ACTIVITY_VERSION),
+    ("narrative_version", SESSION_NARRATIVE_VERSION),
+    ("objective_version", SESSION_OBJECTIVE_VERSION),
+    ("origin_version", SESSION_ORIGIN_VERSION),
+    ("token_version", SESSION_TOKEN_VERSION),
+    ("identity_version", SESSION_IDENTITY_VERSION),
+)
+
+
+class _CopyMarkerCache:
+    """Which privacy marker, if any, each duplicate transcript copy holds.
+
+    Keyed by path and remembered with the copy's (dev, ino, size, mtime), so
+    a copy is only read again after it changes. Stored as a small 0600 JSON
+    file beside the parse states; losing it only costs a rescan.
+    """
+
+    def __init__(self, state_dir: Path) -> None:
+        self.path = state_dir / "copy-markers.json"
+        try:
+            self.entries = json.loads(self.path.read_text())
+            if not isinstance(self.entries, dict):
+                self.entries = {}
+        except (OSError, ValueError):
+            self.entries = {}
+        self.dirty = False
+
+    def marker(self, path: Path) -> str | None:
+        info = path.stat()
+        identity = [info.st_dev, info.st_ino, info.st_size, info.st_mtime]
+        cached = self.entries.get(str(path))
+        if isinstance(cached, list) and len(cached) == 5 and cached[:4] == identity:
+            return cached[4]
+        marker = find_private_marker(path)
+        self.entries[str(path)] = [*identity, marker]
+        self.dirty = True
+        return marker
+
+    def save(self, keep: set[str]) -> None:
+        stale = set(self.entries) - keep
+        for key in stale:
+            del self.entries[key]
+        if not (self.dirty or stale):
+            return
+        tmp = self.path.with_name(f".{self.path.name}.{secrets.token_hex(4)}.tmp")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                json.dump(self.entries, handle)
+            os.replace(tmp, self.path)
+        except OSError:
+            # Only a cache: a later sync rescans what it cannot remember.
+            tmp.unlink(missing_ok=True)
+
+
+def _canonical_claude_copies(
+    paths: list[Path], patterns: list[str], markers: _CopyMarkerCache
+) -> dict[str, Path | None]:
+    """For session ids with several transcript files, the one copy to sync.
+
+    One session id can have a transcript under more than one project
+    directory. Rows are keyed by session id, so syncing every copy made the
+    row flip between them, and every copy was reparsed and every derived row
+    rewritten on every run. A copy carrying a privacy marker wins, so the
+    session stays private even when a newer copy lacks the marker (and that
+    newer copy's content is then never indexed); otherwise the most recently
+    modified copy wins. Ties go to the last path in sorted order, the copy
+    whose row used to survive a run. When any copy cannot be read, the id
+    maps to None and no copy is synced this run: without every copy's
+    marker, sync cannot tell whether the session opted out.
+    """
+    by_stem: dict[str, list[Path]] = {}
+    for path in paths:
+        if should_ignore(path, patterns) or _is_claude_workflow_journal(path):
+            continue
+        by_stem.setdefault(path.stem, []).append(path)
+
+    chosen: dict[str, Path | None] = {}
+    for stem, copies in by_stem.items():
+        if len(copies) < 2:
+            continue
+        try:
+            ranked = [
+                (markers.marker(path) is not None, path.stat().st_mtime, str(path))
+                for path in copies
+            ]
+        except OSError as exc:
+            print(
+                f"Warning: skipped session {stem} this sync: a copy could not be "
+                f"read to check for a privacy marker ({exc}).",
+                file=sys.stderr,
+            )
+            chosen[stem] = None
+            continue
+        chosen[stem] = Path(max(ranked)[2])
+    markers.save(
+        {str(path) for copies in by_stem.values() if len(copies) > 1 for path in copies}
+    )
+    return chosen
+
+
+def _needs_structure_backfill(existing_row) -> bool:
+    """Whether an existing row must be reparsed even if its file is unchanged."""
+    if not existing_row:
+        return False
+    # A marker-private session keeps the stats it had before the marker; a
+    # reparse returns the marker again, so only a content change (the normal
+    # change check) is worth a reparse.
+    if existing_row["visibility_source"] == "marker":
+        return False
+    if any(
+        (existing_row[column] or 0) < version
+        for column, version in _STRUCTURE_VERSION_COLUMNS
+    ):
+        return True
+    if (existing_row["structure_version"] or 0) >= SESSION_STRUCTURE_VERSION:
+        return False
+    # Legacy rows written before structure_version: empty structural fields
+    # meant "never computed".
+    return (
+        (existing_row["workspace_root"] or "") == ""
+        or (existing_row["worktree_root"] or "") == ""
+        or (existing_row["repo_name"] or "") == ""
+        or (existing_row["session_status"] or "") == ""
+        or (existing_row["session_summary"] or "") == ""
+        or (existing_row["session_origin"] or "") == ""
+        or (
+            (existing_row["tool_call_count"] or 0) > 0
+            and not existing_row["path_count"]
+        )
+    )
+
+
+def _stamp_structure(conn, session_id: str) -> None:
+    conn.execute(
+        "UPDATE sessions SET structure_version = ? "
+        "WHERE session_id = ? AND structure_version IS NOT ?",
+        (SESSION_STRUCTURE_VERSION, session_id, SESSION_STRUCTURE_VERSION),
+    )
+
+
+def _stamp_settled_structure(conn) -> None:
+    """Settle legacy rows whose only 'missing' structure is legitimately empty.
+
+    A row at every current parser version was written by one full parse that
+    set its workspace, repo and path rows together, so an empty repo name
+    (cwd "/") or zero path rows (tool calls without file arguments) is that
+    parse's answer, not a gap. Before structure_version existed, those rows
+    failed the legacy heuristics on every sync and were reparsed forever.
+    Runs once per structure version.
+    """
+    marker = str(SESSION_STRUCTURE_VERSION)
+    if get_meta(conn, "structure_version_settled") == marker:
+        return
+    current = " AND ".join(
+        f"COALESCE({column}, 0) >= {int(version)}"
+        for column, version in _STRUCTURE_VERSION_COLUMNS
+    )
+    conn.execute(
+        f"""
+        UPDATE sessions
+        SET structure_version = ?
+        WHERE COALESCE(structure_version, 0) < ?
+          AND {current}
+          AND COALESCE(workspace_root, '') != ''
+          AND COALESCE(worktree_root, '') != ''
+          AND COALESCE(session_status, '') != ''
+          AND COALESCE(session_summary, '') != ''
+          AND COALESCE(session_origin, '') != ''
+          AND (
+              COALESCE(repo_name, '') = ''
+              OR (
+                  COALESCE(tool_call_count, 0) > 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM session_paths sp
+                      WHERE sp.session_id = sessions.session_id
+                  )
+              )
+          )
+        """,
+        (SESSION_STRUCTURE_VERSION, SESSION_STRUCTURE_VERSION),
+    )
+    set_meta(conn, "structure_version_settled", marker)
+
+
+@dataclass(frozen=True)
+class _ScanStat:
+    """The size/mtime a scan observed, in os.stat_result's attribute names."""
+
+    st_size: int
+    st_mtime: float
+
+
+@dataclass(frozen=True)
+class _SyncTranscript:
+    scan: TranscriptScan
+    stat: _ScanStat
+    checkpoint: object | None  # parsers.ParseCheckpoint
+    state_file: str | None
+
+
+def parse_state_dir(db_path: Path) -> Path:
+    """Directory holding resumable parse states, beside the database."""
+    return Path(f"{db_path}.parse-state")
+
+
+def _parse_state_name(jsonl_path: Path) -> str:
+    digest = hashlib.sha256(str(jsonl_path).encode("utf-8", "surrogateescape"))
+    return f"{digest.hexdigest()[:32]}.sqlite"
+
+
+def _scan_for_sync(
+    conn, jsonl_path: Path, session_id: str, *, resume: bool
+) -> _SyncTranscript:
+    entry = get_transcript_checkpoint(conn, str(jsonl_path)) if resume else None
+    checkpoint, state_file = entry if entry else (None, None)
+    search_row = conn.execute(
+        "SELECT transcript_offset FROM session_search_state WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    scan = scan_transcript(
+        jsonl_path,
+        prefix_offsets=[
+            checkpoint.offset if checkpoint is not None else None,
+            search_row[0] if search_row is not None else None,
+        ],
+    )
+    return _SyncTranscript(
+        scan=scan,
+        stat=_ScanStat(st_size=scan.size, st_mtime=scan.mtime),
+        checkpoint=checkpoint,
+        state_file=state_file,
+    )
+
+
+def _keeps_parse_state(scan: TranscriptScan, limits: SyncLimits) -> bool:
+    """Only large, recently written transcripts are worth a resumable state."""
+    return (
+        scan.size >= limits.parse_state_min_bytes
+        and time.time() - scan.mtime <= limits.parse_state_max_idle_seconds
+    )
+
+
+def _parse_for_sync(
+    source: str,
+    jsonl_path: Path,
+    transcript: _SyncTranscript,
+    state_dir: Path,
+    limits: SyncLimits,
+):
+    state_path = None
+    if _keeps_parse_state(transcript.scan, limits):
+        state_path = state_dir / _parse_state_name(jsonl_path)
+    elif transcript.state_file:
+        remove_parse_state(state_dir / transcript.state_file)
+    if state_path is None:
+        return parse_transcript(source, jsonl_path, transcript.scan)
+    try:
+        return parse_transcript(
+            source,
+            jsonl_path,
+            transcript.scan,
+            state_path=state_path,
+            checkpoint=transcript.checkpoint,
+        )
+    except sqlite3.Error as exc:
+        remove_parse_state(state_path)
+        if (getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF == sqlite3.SQLITE_FULL:
+            raise OSError(errno.ENOSPC, f"parse state: {exc}") from exc
+        # A damaged state file only costs the resume: parse from byte 0.
+        return parse_transcript(source, jsonl_path, transcript.scan)
+
+
+def _record_parse_checkpoint(
+    conn,
+    *,
+    jsonl_path: Path,
+    session_id: str,
+    source: str,
+    transcript: _SyncTranscript,
+    parsed,
+    now: str,
+) -> None:
+    """Point the database at the parse state this sync committed, if any.
+
+    Written in the same transaction as the session's rows. A state file that
+    ran ahead of a rolled-back transaction carries a generation the row does
+    not name, so the next sync reparses from byte 0 instead of resuming.
+    """
+    if parsed.checkpoint is None:
+        if transcript.checkpoint is not None:
+            delete_transcript_checkpoint(conn, str(jsonl_path))
+        return
+    put_transcript_checkpoint(
+        conn,
+        source_path=str(jsonl_path),
+        session_id=session_id,
+        source=source,
+        checkpoint=parsed.checkpoint,
+        state_file=_parse_state_name(jsonl_path),
+        file_mtime=transcript.scan.mtime,
+        now=now,
+    )
+
+
+class _ParseSlot:
+    """Holds the one open parse whose lazy sequences sync is still reading."""
+
+    def __init__(self) -> None:
+        self._parsed = None
+
+    def hold(self, parsed) -> None:
+        self.release()
+        self._parsed = parsed
+
+    def release(self) -> None:
+        if self._parsed is not None:
+            parsed, self._parsed = self._parsed, None
+            parsed.close()
+
+
+def _collect_parse_states(conn, state_dir: Path, limits: SyncLimits) -> None:
+    """Drop parse states for idle transcripts and files no row points at."""
+    keep: set[str] = set()
+    stale: list[tuple[str, str]] = []
+    now = time.time()
+    for source_path, state_file, file_mtime in iter_transcript_checkpoints(conn):
+        if (
+            file_mtime is None
+            or now - file_mtime > limits.parse_state_max_idle_seconds
+            or not Path(source_path).exists()
+        ):
+            stale.append((source_path, state_file))
+        else:
+            keep.add(state_file)
+    for source_path, state_file in stale:
+        delete_transcript_checkpoint(conn, source_path)
+    conn.commit()
+    for source_path, state_file in stale:
+        remove_parse_state(state_dir / state_file)
+    try:
+        entries = list(state_dir.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        name = entry.name
+        base = name.removesuffix("-journal")
+        if base.endswith(".sqlite") and base not in keep:
+            remove_parse_state(state_dir / base)
+
+
 def sync_sessions(
     shared_dir: Path,
     db_path: Path,
@@ -2149,6 +2845,7 @@ def sync_sessions(
     machine: str,
     home: Path,
     verbose: bool = False,
+    limits: SyncLimits | None = None,
 ) -> SyncResult:
     """
     Discover, parse, and copy sessions.
@@ -2157,14 +2854,29 @@ def sync_sessions(
     Holds an exclusive lock for the duration: a concurrent sync (e.g. the
     usage-tracker launchd job overlapping a manual run) returns a typed
     lock-contended result instead of interleaving copies onto shared files.
+
+    ``limits`` (default: SyncLimits.from_env()) bounds the run: a sync that
+    would start on a volume below the free-space floor returns
+    SyncDiskDeferred without writing anything, and one that runs out of
+    budget, falls below the floor, or receives SIGTERM stops at a session
+    boundary and returns SyncPartial.
     """
+    limits = SyncLimits.from_env() if limits is None else limits
     with sync_lock(db_path) as acquired:
         if not acquired:
             # Always audible: a silent (0, 0, 0) reads as "synced, all quiet"
             # to humans and scripts checking the summary line.
             print("Skipped: another logpile sync holds the lock.", file=sys.stderr)
             return SyncLockContended(0, 0, 0)
-        return _sync_sessions(shared_dir, db_path, username, machine, home, verbose)
+        control = _SyncControl(limits, [Path(db_path), Path(shared_dir)])
+        deferral = control.check_disk()
+        if deferral is not None:
+            print(f"Deferred: {deferral}; sync did not start.", file=sys.stderr)
+            return SyncDiskDeferred(deferral)
+        with _graceful_termination(control):
+            return _sync_sessions(
+                shared_dir, db_path, username, machine, home, verbose, control
+            )
 
 
 def sync_lock_path(db_path: Path) -> Path:
@@ -2226,9 +2938,11 @@ def _sync_sessions(
     username: str,
     machine: str,
     home: Path,
-    verbose: bool = False,
+    verbose: bool,
+    control: _SyncControl,
 ) -> SyncResult:
     """Locked body of sync_sessions."""
+    limits = control.limits
     init_db(db_path)
     _secure_shared_mkdir(shared_dir, shared_dir)
     patterns = load_ignore_patterns(home)
@@ -2247,6 +2961,8 @@ def _sync_sessions(
         default_visibility = (
             user_row["default_session_visibility"] if user_row else "unlisted"
         )
+        # Before loading rows, so this run already treats them as settled.
+        _stamp_settled_structure(conn)
         existing = {
             row["session_id"]: row
             for row in conn.execute(
@@ -2277,6 +2993,7 @@ def _sync_sessions(
                     project,
                     file_size,
                     file_mtime,
+                    structure_version,
                     EXISTS (
                         SELECT 1 FROM sync_copy_retries scr
                         WHERE scr.source_path = sessions.source_path
@@ -2302,24 +3019,31 @@ def _sync_sessions(
         repo_metadata_cache: dict[str, dict[str, str | int | None]] = {}
         # Sessions whose native_* aggregates must be recomputed before this
         # sync finishes: everything (re)parsed plus previous owners of stolen
-        # claims. If an earlier sync died before its refresh (flag not reset
-        # to "0"), recompute everything to heal whatever it left behind.
+        # claims. Each is also queued durably (native_refresh_queue) in the
+        # same transaction as the claim change that owes it, so a sync killed
+        # before its refresh leaves exactly those sessions for the next run.
         affected_native: set[str] = set()
-        force_full_refresh = get_meta(conn, "native_refresh_pending") != "0"
-        set_meta(conn, "native_refresh_pending", "1")
         # Search replacement commits in bounded batches during a full corpus
         # backfill. Persist the owed-refresh bit first so an interruption can
         # resume from durable per-session state on an otherwise unchanged
-        # next sync, mirroring native_refresh_pending recovery.
+        # next sync.
         set_meta(conn, "search_refresh_pending", "1")
         conn.commit()
+        state_dir = parse_state_dir(db_path)
+        _secure_mkdir(state_dir)
+        parse_slot = _ParseSlot()
 
-        def refresh_session_search(session_id: str, path: Path) -> None:
+        def refresh_session_search(
+            session_id: str, path: Path, scan: TranscriptScan
+        ) -> None:
             try:
-                replace_session_search_index(
+                # The archival copy holds exactly the scanned bytes, so the
+                # index appends only what this sync added (see search.py).
+                update_session_search_index(
                     conn,
                     session_id,
                     transcript_path=path,
+                    scan=scan,
                     shared_dir=shared_dir,
                 )
             except SearchTranscriptReadError as exc:
@@ -2332,741 +3056,825 @@ def _sync_sessions(
         def flush_if_needed() -> None:
             nonlocal processed_count
             processed_count += 1
+            control.note_progress()
             if processed_count % 50 == 0:
                 conn.commit()
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
-        # ── Claude Code sessions ───────────────────────────────────────────────
-        claude_root = claude_projects_root(home)
-        if claude_root.exists():
-            for jsonl_path in sorted(claude_root.rglob("*.jsonl")):
-                if should_ignore(jsonl_path, patterns):
-                    skipped_count += 1
-                    continue
+        def run_claude_pass() -> None:
+            nonlocal new_count, updated_count, skipped_count, affected_native
+            # ── Claude Code sessions ───────────────────────────────────────────────
+            claude_root = claude_projects_root(home)
+            if claude_root.exists():
+                claude_paths = sorted(claude_root.rglob("*.jsonl"))
+                canonical = _canonical_claude_copies(
+                    claude_paths, patterns, _CopyMarkerCache(state_dir)
+                )
+                for jsonl_path in claude_paths:
+                    parse_slot.release()
+                    if control.should_stop():
+                        return
+                    if should_ignore(jsonl_path, patterns):
+                        skipped_count += 1
+                        continue
 
-                session_id = jsonl_path.stem
-                existing_row = existing.get(session_id)
-                if _is_claude_workflow_journal(jsonl_path):
-                    # Remove the one legacy stem-keyed progress row when this
-                    # exact journal created it. Full agent transcripts remain
-                    # indexed under agent-{agentId}; other journals with the
-                    # same filename cannot accidentally delete that row.
-                    if existing_row and existing_row["source_path"] == str(jsonl_path):
-                        claim_keys = [
-                            row[0]
-                            for row in conn.execute(
-                                "SELECT claim_key FROM message_claims "
-                                "WHERE session_id = ?",
-                                (session_id,),
-                            )
-                        ]
-                        for chunk in (
-                            claim_keys[start : start + 500]
-                            for start in range(0, len(claim_keys), 500)
+                    session_id = jsonl_path.stem
+                    existing_row = existing.get(session_id)
+                    if _is_claude_workflow_journal(jsonl_path):
+                        # Remove the one legacy stem-keyed progress row when this
+                        # exact journal created it. Full agent transcripts remain
+                        # indexed under agent-{agentId}; other journals with the
+                        # same filename cannot accidentally delete that row.
+                        if existing_row and existing_row["source_path"] == str(
+                            jsonl_path
                         ):
-                            placeholders = ",".join("?" * len(chunk))
-                            affected_native.update(
+                            claim_keys = [
                                 row[0]
                                 for row in conn.execute(
-                                    f"SELECT DISTINCT session_id FROM message_claims "
-                                    f"WHERE claim_key IN ({placeholders})",
-                                    chunk,
+                                    "SELECT claim_key FROM message_claims "
+                                    "WHERE session_id = ?",
+                                    (session_id,),
                                 )
-                            )
-                        for table in (
-                            "message_claims",
-                            "tool_calls",
-                            "session_paths",
-                            "session_daily_usage",
-                        ):
+                            ]
+                            for chunk in (
+                                claim_keys[start : start + 500]
+                                for start in range(0, len(claim_keys), 500)
+                            ):
+                                placeholders = ",".join("?" * len(chunk))
+                                affected_native.update(
+                                    row[0]
+                                    for row in conn.execute(
+                                        f"SELECT DISTINCT session_id FROM message_claims "
+                                        f"WHERE claim_key IN ({placeholders})",
+                                        chunk,
+                                    )
+                                )
+                            for table in (
+                                "message_claims",
+                                "tool_calls",
+                                "session_paths",
+                                "session_daily_usage",
+                            ):
+                                conn.execute(
+                                    f"DELETE FROM {table} WHERE session_id = ?",
+                                    (session_id,),
+                                )
                             conn.execute(
-                                f"DELETE FROM {table} WHERE session_id = ?",
+                                "DELETE FROM sessions WHERE session_id = ?",
                                 (session_id,),
                             )
-                        conn.execute(
-                            "DELETE FROM sessions WHERE session_id = ?",
-                            (session_id,),
-                        )
-                        updated_count += 1
-                        flush_if_needed()
-                    else:
+                            updated_count += 1
+                            flush_if_needed()
+                        else:
+                            skipped_count += 1
+                        continue
+                    if canonical.get(session_id, jsonl_path) != jsonl_path:
+                        # Another copy of this session id is the one synced.
                         skipped_count += 1
-                    continue
-                needs_structure_backfill = bool(
-                    existing_row
-                    and (
-                        (existing_row["workspace_root"] or "") == ""
-                        or (existing_row["worktree_root"] or "") == ""
-                        or (existing_row["repo_name"] or "") == ""
-                        or (existing_row["activity_version"] or 0)
-                        < SESSION_ACTIVITY_VERSION
-                        or (existing_row["narrative_version"] or 0)
-                        < SESSION_NARRATIVE_VERSION
-                        or (existing_row["session_status"] or "") == ""
-                        or (existing_row["session_summary"] or "") == ""
-                        or (existing_row["objective_version"] or 0)
-                        < SESSION_OBJECTIVE_VERSION
-                        or (existing_row["origin_version"] or 0)
-                        < SESSION_ORIGIN_VERSION
-                        or (existing_row["token_version"] or 0) < SESSION_TOKEN_VERSION
-                        or (existing_row["identity_version"] or 0)
-                        < SESSION_IDENTITY_VERSION
-                        or (existing_row["session_origin"] or "") == ""
-                        or (
-                            (existing_row["tool_call_count"] or 0) > 0
-                            and not existing_row["path_count"]
+                        continue
+                    needs_structure_backfill = _needs_structure_backfill(existing_row)
+
+                    if (
+                        existing_row
+                        and not needs_structure_backfill
+                        and _unchanged_on_disk(
+                            existing_row,
+                            jsonl_path,
+                            shared_dir,
+                            preflight_source=preflight_source_hashes.get(
+                                str(jsonl_path)
+                            ),
                         )
-                    )
-                )
+                    ):
+                        skipped_count += 1
+                        continue
 
-                if (
-                    existing_row
-                    and not needs_structure_backfill
-                    and _unchanged_on_disk(
-                        existing_row,
-                        jsonl_path,
-                        shared_dir,
-                        preflight_source=preflight_source_hashes.get(str(jsonl_path)),
-                    )
-                ):
-                    skipped_count += 1
-                    continue
-
-                try:
-                    # stat BEFORE hashing: a write landing mid-hash then makes
-                    # the stored size/mtime stale, forcing a re-parse next
-                    # sync instead of silently skipping the newer content.
-                    file_stat = jsonl_path.stat()
-                    fhash = file_hash(jsonl_path)
-                except OSError as exc:
-                    if exc.errno == errno.ENOSPC:
-                        raise
-                    _report_rotation_skip(jsonl_path, exc, verbose)
-                    skipped_count += 1
-                    continue
-
-                if (
-                    existing_row
-                    and existing_row["file_hash"] == fhash
-                    and not needs_structure_backfill
-                ):
                     try:
-                        shared_path, storage_changed = _sync_shared_copy(
-                            conn=conn,
-                            src=jsonl_path,
-                            shared_dir=shared_dir,
-                            username=canonical_username,
-                            source=existing_row["source"],
-                            project=existing_row["project"]
-                            or project_from_claude_path(jsonl_path),
-                            filename=jsonl_path.name,
-                            visibility=existing_row["visibility"],
-                            expected_sha256=fhash,
-                            existing_shared_path=existing_row["shared_path"],
+                        # One read hashes exactly the bytes present at open time
+                        # (fstat size), plus the prefixes a resumed parse and a
+                        # resumed search index must verify. Later appends make
+                        # the stored size/mtime stale and are picked up next sync.
+                        transcript = _scan_for_sync(
+                            conn,
+                            jsonl_path,
+                            session_id,
+                            resume=not needs_structure_backfill,
                         )
                     except OSError as exc:
-                        _record_copy_retry(
-                            conn,
-                            source_path=jsonl_path,
-                            session_id=session_id,
-                            expected_sha256=fhash,
-                            file_stat=file_stat,
-                            error=exc,
-                        )
-                        conn.commit()
+                        if exc.errno == errno.ENOSPC:
+                            raise
                         _report_rotation_skip(jsonl_path, exc, verbose)
                         skipped_count += 1
                         continue
-                    _clear_copy_retry(conn, jsonl_path, session_id)
-                    row_moved = (
-                        existing_row["source_path"] != str(jsonl_path)
-                        or existing_row["file_size"] != file_stat.st_size
-                        or existing_row["file_mtime"] is None
-                        or abs(existing_row["file_mtime"] - file_stat.st_mtime) > 1e-6
-                    )
-                    if (
-                        storage_changed
-                        or row_moved
-                        or shared_path != (existing_row["shared_path"] or "")
-                    ):
-                        conn.execute(
-                            """
-                            UPDATE sessions
-                            SET shared_path = ?, source_path = ?, file_size = ?,
-                                file_mtime = ?, synced_at = ?
-                            WHERE session_id = ?
-                            """,
-                            (
-                                shared_path,
-                                str(jsonl_path),
-                                file_stat.st_size,
-                                file_stat.st_mtime,
-                                now,
-                                session_id,
-                            ),
-                        )
-                        flush_if_needed()
-                        updated_count += 1
-                    else:
-                        skipped_count += 1
-                    continue
 
-                try:
-                    info = parse_claudecode_session(jsonl_path)
-                except OSError as exc:
-                    if exc.errno == errno.ENOSPC:
-                        raise
-                    _report_rotation_skip(jsonl_path, exc, verbose)
-                    skipped_count += 1
-                    continue
-                if info is None:
-                    skipped_count += 1
-                    continue
-                if isinstance(info, PrivateSessionMarker):
-                    if existing_row:
+                    scan = transcript.scan
+                    fhash = scan.sha256
+                    file_stat = transcript.stat
+                    if (
+                        existing_row
+                        and existing_row["file_hash"] == fhash
+                        and not needs_structure_backfill
+                    ):
                         try:
-                            _tighten_private_marker(
-                                conn,
-                                existing_row=existing_row,
-                                jsonl_path=jsonl_path,
+                            shared_path, storage_changed = _sync_shared_copy(
+                                conn=conn,
+                                src=jsonl_path,
                                 shared_dir=shared_dir,
-                                marker=info,
-                                fhash=fhash,
-                                file_stat=file_stat,
-                                now=now,
+                                username=canonical_username,
+                                source=existing_row["source"],
+                                project=existing_row["project"]
+                                or project_from_claude_path(jsonl_path),
+                                filename=jsonl_path.name,
+                                visibility=existing_row["visibility"],
+                                expected_sha256=fhash,
+                                expected_size=scan.size,
+                                existing_shared_path=existing_row["shared_path"],
                             )
                         except OSError as exc:
-                            if exc.errno == errno.ENOSPC:
-                                raise
+                            _record_copy_retry(
+                                conn,
+                                source_path=jsonl_path,
+                                session_id=session_id,
+                                expected_sha256=fhash,
+                                file_stat=file_stat,
+                                error=exc,
+                            )
+                            conn.commit()
                             _report_rotation_skip(jsonl_path, exc, verbose)
                             skipped_count += 1
                             continue
-                        flush_if_needed()
-                        updated_count += 1
-                    else:
-                        skipped_count += 1
-                    continue
+                        _clear_copy_retry(conn, jsonl_path, session_id)
+                        row_moved = (
+                            existing_row["source_path"] != str(jsonl_path)
+                            or existing_row["file_size"] != file_stat.st_size
+                            or existing_row["file_mtime"] is None
+                            or abs(existing_row["file_mtime"] - file_stat.st_mtime)
+                            > 1e-6
+                        )
+                        if (
+                            storage_changed
+                            or row_moved
+                            or shared_path != (existing_row["shared_path"] or "")
+                        ):
+                            conn.execute(
+                                """
+                                UPDATE sessions
+                                SET shared_path = ?, source_path = ?, file_size = ?,
+                                    file_mtime = ?, synced_at = ?
+                                WHERE session_id = ?
+                                """,
+                                (
+                                    shared_path,
+                                    str(jsonl_path),
+                                    file_stat.st_size,
+                                    file_stat.st_mtime,
+                                    now,
+                                    session_id,
+                                ),
+                            )
+                            flush_if_needed()
+                            updated_count += 1
+                        else:
+                            skipped_count += 1
+                        continue
 
-                project = project_from_claude_path(jsonl_path)
-                workspace_root = _normalize_workspace_root(
-                    info.workspace_root
-                    or (info.project if info.project != "unknown" else None)
-                )
-                repo_metadata = _resolve_repo_metadata(
-                    workspace_root, repo_metadata_cache
-                )
-                session_paths = _annotate_session_paths(
-                    info.session_paths,
-                    repo_root=repo_metadata["repo_root"],
-                    worktree_root=repo_metadata["worktree_root"],
-                    workspace_root=workspace_root,
-                )
-                activity = _derive_session_activity(info.tool_calls, session_paths)
-                narrative = _derive_session_narrative(
-                    source="claudecode",
-                    project=project,
-                    repo_name=repo_metadata["repo_name"],
-                    first_user_message=info.first_user_message,
-                    error_count=info.error_count,
-                    activity=activity,
-                    session_paths=session_paths,
-                )
-                origin = derive_session_origin(
-                    source="claudecode",
-                    session_id=info.session_id,
-                    first_user_message=info.first_user_message,
-                    project=project,
-                    workspace_root=workspace_root,
-                    source_path=str(jsonl_path),
-                )
-                objective = derive_session_objective(
-                    narrative["session_goal"],
-                    info.first_user_message,
-                    narrative["session_summary"],
-                )
-                visibility = resolve_session_visibility(
-                    conn,
-                    username=canonical_username,
-                    source="claudecode",
-                    default_visibility=default_visibility,
-                    session_data={
-                        "project": project,
-                        "source_path": str(jsonl_path),
-                        "first_user_message": info.first_user_message,
-                        "model": info.model,
-                        "machine": machine,
-                        "username": canonical_username,
-                    },
-                )
-                storage_visibility = _effective_storage_visibility(
-                    existing_row, visibility
-                )
-                try:
-                    shared_path, _ = _sync_shared_copy(
-                        conn=conn,
-                        src=jsonl_path,
-                        shared_dir=shared_dir,
-                        username=canonical_username,
+                    try:
+                        parsed = _parse_for_sync(
+                            "claudecode", jsonl_path, transcript, state_dir, limits
+                        )
+                    except OSError as exc:
+                        if exc.errno == errno.ENOSPC:
+                            raise
+                        _report_rotation_skip(jsonl_path, exc, verbose)
+                        skipped_count += 1
+                        continue
+                    parse_slot.hold(parsed)
+                    info = parsed.info
+                    if info is None:
+                        skipped_count += 1
+                        continue
+                    if isinstance(info, PrivateSessionMarker):
+                        _record_parse_checkpoint(
+                            conn,
+                            jsonl_path=jsonl_path,
+                            session_id=session_id,
+                            source="claudecode",
+                            transcript=transcript,
+                            parsed=parsed,
+                            now=now,
+                        )
+                        if existing_row:
+                            try:
+                                _tighten_private_marker(
+                                    conn,
+                                    existing_row=existing_row,
+                                    jsonl_path=jsonl_path,
+                                    shared_dir=shared_dir,
+                                    marker=info,
+                                    fhash=fhash,
+                                    file_stat=file_stat,
+                                    now=now,
+                                )
+                            except OSError as exc:
+                                if exc.errno == errno.ENOSPC:
+                                    raise
+                                _report_rotation_skip(jsonl_path, exc, verbose)
+                                skipped_count += 1
+                                continue
+                            flush_if_needed()
+                            updated_count += 1
+                        else:
+                            skipped_count += 1
+                        continue
+
+                    project = project_from_claude_path(jsonl_path)
+                    workspace_root = _normalize_workspace_root(
+                        info.workspace_root
+                        or (info.project if info.project != "unknown" else None)
+                    )
+                    repo_metadata = _resolve_repo_metadata(
+                        workspace_root, repo_metadata_cache
+                    )
+                    session_paths = _annotate_session_paths(
+                        info.session_paths,
+                        repo_root=repo_metadata["repo_root"],
+                        worktree_root=repo_metadata["worktree_root"],
+                        workspace_root=workspace_root,
+                    )
+                    activity = _derive_session_activity(info.tool_calls, session_paths)
+                    narrative = _derive_session_narrative(
                         source="claudecode",
                         project=project,
-                        filename=jsonl_path.name,
-                        visibility=storage_visibility,
-                        expected_sha256=fhash,
-                        existing_shared_path=existing_row["shared_path"]
-                        if existing_row
-                        else None,
+                        repo_name=repo_metadata["repo_name"],
+                        first_user_message=info.first_user_message,
+                        error_count=info.error_count,
+                        activity=activity,
+                        session_paths=session_paths,
                     )
-                except OSError as exc:
-                    _record_copy_retry(
-                        conn,
-                        source_path=jsonl_path,
+                    origin = derive_session_origin(
+                        source="claudecode",
                         session_id=info.session_id,
-                        expected_sha256=fhash,
-                        file_stat=file_stat,
-                        error=exc,
+                        first_user_message=info.first_user_message,
+                        project=project,
+                        workspace_root=workspace_root,
+                        source_path=str(jsonl_path),
                     )
-                    conn.commit()
-                    _report_rotation_skip(jsonl_path, exc, verbose)
-                    skipped_count += 1
-                    continue
-                _clear_copy_retry(conn, jsonl_path, info.session_id)
-
-                upsert_session(
-                    conn,
-                    {
-                        "session_id": info.session_id,
-                        "source": "claudecode",
-                        "username": canonical_username,
-                        "machine": machine,
-                        "project": project,
-                        "workspace_root": workspace_root,
-                        "worktree_root": repo_metadata["worktree_root"],
-                        "repo_root": repo_metadata["repo_root"],
-                        "repo_name": repo_metadata["repo_name"],
-                        "git_branch": repo_metadata["git_branch"],
-                        "git_commit": repo_metadata["git_commit"],
-                        "git_dirty": repo_metadata["git_dirty"],
-                        "source_path": str(jsonl_path),
-                        "shared_path": shared_path,
-                        "first_timestamp": info.first_timestamp,
-                        "last_timestamp": info.last_timestamp,
-                        "duration_seconds": _compute_duration(
-                            info.first_timestamp, info.last_timestamp
-                        ),
-                        "user_message_count": info.user_message_count,
-                        "assistant_message_count": info.assistant_message_count,
-                        "tool_call_count": info.tool_call_count,
-                        "error_count": info.error_count,
-                        "total_input_tokens": info.total_input_tokens,
-                        "total_output_tokens": info.total_output_tokens,
-                        "fresh_input_tokens": info.fresh_input_tokens,
-                        "cached_input_tokens": info.cached_input_tokens,
-                        "cache_creation_input_tokens": info.cache_creation_input_tokens,
-                        "cache_creation_5m_input_tokens": info.cache_creation_5m_input_tokens,
-                        "cache_creation_1h_input_tokens": info.cache_creation_1h_input_tokens,
-                        "cache_creation_unknown_input_tokens": info.cache_creation_unknown_input_tokens,
-                        "reasoning_output_tokens": info.reasoning_output_tokens,
-                        "token_version": SESSION_TOKEN_VERSION,
-                        "identity_version": SESSION_IDENTITY_VERSION,
-                        "first_user_message": info.first_user_message,
-                        "parent_session_id": info.parent_session_id,
-                        "thread_id": info.thread_id,
-                        "parent_thread_id": info.parent_thread_id,
-                        "spawn_depth": info.spawn_depth,
-                        "visibility": visibility["visibility"],
-                        "visibility_source": visibility["visibility_source"],
-                        "visibility_rule_id": visibility["visibility_rule_id"],
-                        "visibility_reason": visibility["visibility_reason"],
-                        "is_private": 1 if visibility["visibility"] == "private" else 0,
-                        "file_hash": fhash,
-                        "file_size": file_stat.st_size,
-                        "file_mtime": file_stat.st_mtime,
-                        "synced_at": now,
-                        "model": info.model,
-                        **activity,
-                        **narrative,
-                        **objective,
-                        **origin,
-                    },
-                )
-                insert_tool_calls(conn, info.session_id, info.tool_calls)
-                insert_session_paths(conn, info.session_id, session_paths)
-                insert_session_daily_usage(conn, info.session_id, info.daily_usage)
-                affected_native.add(info.session_id)
-                affected_native |= apply_message_claims(
-                    conn, info.session_id, info.message_usage
-                )
-                refresh_session_search(info.session_id, Path(shared_path))
-                flush_if_needed()
-
-                action = "Updated" if session_id in existing else "Added"
-                if existing_row:
-                    updated_count += 1
-                else:
-                    new_count += 1
-
-                if verbose:
-                    print(f"  {action}: {session_id[:12]}… ({project})")
-
-        # ── Codex sessions ─────────────────────────────────────────────────────
-        seen_codex_stems: set[str] = set()
-        for codex_root in codex_session_roots(home):
-            for jsonl_path in sorted(codex_root.rglob("*.jsonl")):
-                if should_ignore(jsonl_path, patterns):
-                    skipped_count += 1
-                    continue
-
-                session_id = jsonl_path.stem  # full filename stem as unique ID
-                if session_id in seen_codex_stems:
-                    skipped_count += 1
-                    continue
-                seen_codex_stems.add(session_id)
-                existing_row = existing.get(session_id)
-                needs_structure_backfill = bool(
-                    existing_row
-                    and (
-                        (existing_row["workspace_root"] or "") == ""
-                        or (existing_row["worktree_root"] or "") == ""
-                        or (existing_row["repo_name"] or "") == ""
-                        or (existing_row["activity_version"] or 0)
-                        < SESSION_ACTIVITY_VERSION
-                        or (existing_row["narrative_version"] or 0)
-                        < SESSION_NARRATIVE_VERSION
-                        or (existing_row["session_status"] or "") == ""
-                        or (existing_row["session_summary"] or "") == ""
-                        or (existing_row["objective_version"] or 0)
-                        < SESSION_OBJECTIVE_VERSION
-                        or (existing_row["origin_version"] or 0)
-                        < SESSION_ORIGIN_VERSION
-                        or (existing_row["token_version"] or 0) < SESSION_TOKEN_VERSION
-                        or (existing_row["identity_version"] or 0)
-                        < SESSION_IDENTITY_VERSION
-                        or (existing_row["session_origin"] or "") == ""
-                        or (
-                            (existing_row["tool_call_count"] or 0) > 0
-                            and not existing_row["path_count"]
-                        )
+                    objective = derive_session_objective(
+                        narrative["session_goal"],
+                        info.first_user_message,
+                        narrative["session_summary"],
                     )
-                )
-
-                if (
-                    existing_row
-                    and not needs_structure_backfill
-                    and _unchanged_on_disk(
-                        existing_row,
-                        jsonl_path,
-                        shared_dir,
-                        preflight_source=preflight_source_hashes.get(str(jsonl_path)),
+                    visibility = resolve_session_visibility(
+                        conn,
+                        username=canonical_username,
+                        source="claudecode",
+                        default_visibility=default_visibility,
+                        session_data={
+                            "project": project,
+                            "source_path": str(jsonl_path),
+                            "first_user_message": info.first_user_message,
+                            "model": info.model,
+                            "machine": machine,
+                            "username": canonical_username,
+                        },
                     )
-                ):
-                    skipped_count += 1
-                    continue
-
-                try:
-                    # stat BEFORE hashing — see the Claude loop.
-                    file_stat = jsonl_path.stat()
-                    fhash = file_hash(jsonl_path)
-                except OSError as exc:
-                    if exc.errno == errno.ENOSPC:
-                        raise
-                    _report_rotation_skip(jsonl_path, exc, verbose)
-                    seen_codex_stems.discard(session_id)
-                    skipped_count += 1
-                    continue
-
-                if (
-                    existing_row
-                    and existing_row["file_hash"] == fhash
-                    and not needs_structure_backfill
-                ):
+                    storage_visibility = _effective_storage_visibility(
+                        existing_row, visibility
+                    )
                     try:
-                        shared_path, storage_changed = _sync_shared_copy(
+                        shared_path, _ = _sync_shared_copy(
                             conn=conn,
                             src=jsonl_path,
                             shared_dir=shared_dir,
                             username=canonical_username,
-                            source=existing_row["source"],
-                            project=existing_row["project"] or "unknown",
+                            source="claudecode",
+                            project=project,
                             filename=jsonl_path.name,
-                            visibility=existing_row["visibility"],
+                            visibility=storage_visibility,
                             expected_sha256=fhash,
-                            existing_shared_path=existing_row["shared_path"],
+                            expected_size=scan.size,
+                            existing_shared_path=existing_row["shared_path"]
+                            if existing_row
+                            else None,
                         )
                     except OSError as exc:
                         _record_copy_retry(
                             conn,
                             source_path=jsonl_path,
-                            session_id=session_id,
+                            session_id=info.session_id,
                             expected_sha256=fhash,
                             file_stat=file_stat,
                             error=exc,
                         )
                         conn.commit()
                         _report_rotation_skip(jsonl_path, exc, verbose)
+                        skipped_count += 1
+                        continue
+                    _clear_copy_retry(conn, jsonl_path, info.session_id)
+
+                    upsert_session(
+                        conn,
+                        {
+                            "session_id": info.session_id,
+                            "source": "claudecode",
+                            "username": canonical_username,
+                            "machine": machine,
+                            "project": project,
+                            "workspace_root": workspace_root,
+                            "worktree_root": repo_metadata["worktree_root"],
+                            "repo_root": repo_metadata["repo_root"],
+                            "repo_name": repo_metadata["repo_name"],
+                            "git_branch": repo_metadata["git_branch"],
+                            "git_commit": repo_metadata["git_commit"],
+                            "git_dirty": repo_metadata["git_dirty"],
+                            "source_path": str(jsonl_path),
+                            "shared_path": shared_path,
+                            "first_timestamp": info.first_timestamp,
+                            "last_timestamp": info.last_timestamp,
+                            "duration_seconds": _compute_duration(
+                                info.first_timestamp, info.last_timestamp
+                            ),
+                            "user_message_count": info.user_message_count,
+                            "assistant_message_count": info.assistant_message_count,
+                            "tool_call_count": info.tool_call_count,
+                            "error_count": info.error_count,
+                            "total_input_tokens": info.total_input_tokens,
+                            "total_output_tokens": info.total_output_tokens,
+                            "fresh_input_tokens": info.fresh_input_tokens,
+                            "cached_input_tokens": info.cached_input_tokens,
+                            "cache_creation_input_tokens": info.cache_creation_input_tokens,
+                            "cache_creation_5m_input_tokens": info.cache_creation_5m_input_tokens,
+                            "cache_creation_1h_input_tokens": info.cache_creation_1h_input_tokens,
+                            "cache_creation_unknown_input_tokens": info.cache_creation_unknown_input_tokens,
+                            "reasoning_output_tokens": info.reasoning_output_tokens,
+                            "token_version": SESSION_TOKEN_VERSION,
+                            "identity_version": SESSION_IDENTITY_VERSION,
+                            "first_user_message": info.first_user_message,
+                            "parent_session_id": info.parent_session_id,
+                            "thread_id": info.thread_id,
+                            "parent_thread_id": info.parent_thread_id,
+                            "spawn_depth": info.spawn_depth,
+                            "visibility": visibility["visibility"],
+                            "visibility_source": visibility["visibility_source"],
+                            "visibility_rule_id": visibility["visibility_rule_id"],
+                            "visibility_reason": visibility["visibility_reason"],
+                            "is_private": 1
+                            if visibility["visibility"] == "private"
+                            else 0,
+                            "file_hash": fhash,
+                            "file_size": file_stat.st_size,
+                            "file_mtime": file_stat.st_mtime,
+                            "synced_at": now,
+                            "model": info.model,
+                            **activity,
+                            **narrative,
+                            **objective,
+                            **origin,
+                        },
+                    )
+                    insert_tool_calls(conn, info.session_id, info.tool_calls)
+                    insert_session_paths(conn, info.session_id, session_paths)
+                    insert_session_daily_usage(conn, info.session_id, info.daily_usage)
+                    owed_native = {info.session_id} | apply_message_claims(
+                        conn, info.session_id, info.message_usage
+                    )
+                    queue_native_refresh(conn, owed_native)
+                    affected_native |= owed_native
+                    _record_parse_checkpoint(
+                        conn,
+                        jsonl_path=jsonl_path,
+                        session_id=info.session_id,
+                        source="claudecode",
+                        transcript=transcript,
+                        parsed=parsed,
+                        now=now,
+                    )
+                    _stamp_structure(conn, info.session_id)
+                    refresh_session_search(info.session_id, Path(shared_path), scan)
+                    flush_if_needed()
+
+                    action = "Updated" if session_id in existing else "Added"
+                    if existing_row:
+                        updated_count += 1
+                    else:
+                        new_count += 1
+
+                    if verbose:
+                        print(f"  {action}: {session_id[:12]}… ({project})")
+            parse_slot.release()
+
+        def run_codex_pass() -> None:
+            nonlocal new_count, updated_count, skipped_count, affected_native
+            # ── Codex sessions ─────────────────────────────────────────────────────
+            seen_codex_stems: set[str] = set()
+            for codex_root in codex_session_roots(home):
+                for jsonl_path in sorted(codex_root.rglob("*.jsonl")):
+                    parse_slot.release()
+                    if control.should_stop():
+                        return
+                    if should_ignore(jsonl_path, patterns):
+                        skipped_count += 1
+                        continue
+
+                    session_id = jsonl_path.stem  # full filename stem as unique ID
+                    if session_id in seen_codex_stems:
+                        skipped_count += 1
+                        continue
+                    seen_codex_stems.add(session_id)
+                    existing_row = existing.get(session_id)
+                    needs_structure_backfill = _needs_structure_backfill(existing_row)
+
+                    if (
+                        existing_row
+                        and not needs_structure_backfill
+                        and _unchanged_on_disk(
+                            existing_row,
+                            jsonl_path,
+                            shared_dir,
+                            preflight_source=preflight_source_hashes.get(
+                                str(jsonl_path)
+                            ),
+                        )
+                    ):
+                        skipped_count += 1
+                        continue
+
+                    try:
+                        # One consistent scan — see the Claude loop.
+                        transcript = _scan_for_sync(
+                            conn,
+                            jsonl_path,
+                            session_id,
+                            resume=not needs_structure_backfill,
+                        )
+                    except OSError as exc:
+                        if exc.errno == errno.ENOSPC:
+                            raise
+                        _report_rotation_skip(jsonl_path, exc, verbose)
                         seen_codex_stems.discard(session_id)
                         skipped_count += 1
                         continue
-                    _clear_copy_retry(conn, jsonl_path, session_id)
-                    row_moved = (
-                        existing_row["source_path"] != str(jsonl_path)
-                        or existing_row["file_size"] != file_stat.st_size
-                        or existing_row["file_mtime"] is None
-                        or abs(existing_row["file_mtime"] - file_stat.st_mtime) > 1e-6
-                    )
-                    if (
-                        storage_changed
-                        or row_moved
-                        or shared_path != (existing_row["shared_path"] or "")
-                    ):
-                        conn.execute(
-                            """
-                            UPDATE sessions
-                            SET shared_path = ?, source_path = ?, file_size = ?,
-                                file_mtime = ?, synced_at = ?
-                            WHERE session_id = ?
-                            """,
-                            (
-                                shared_path,
-                                str(jsonl_path),
-                                file_stat.st_size,
-                                file_stat.st_mtime,
-                                now,
-                                session_id,
-                            ),
-                        )
-                        flush_if_needed()
-                        updated_count += 1
-                    else:
-                        skipped_count += 1
-                    continue
 
-                try:
-                    info = parse_codex_session(jsonl_path)
-                except OSError as exc:
-                    if exc.errno == errno.ENOSPC:
-                        raise
-                    _report_rotation_skip(jsonl_path, exc, verbose)
-                    seen_codex_stems.discard(session_id)
-                    skipped_count += 1
-                    continue
-                if info is None:
-                    # _load_jsonl deliberately contains read errors and returns
-                    # no records. If Codex archived the rollout between hashing
-                    # and parsing, let the later archived-root pass retry the
-                    # same stem instead of treating the vanished live path as
-                    # the winning copy for this run.
-                    if not jsonl_path.exists():
-                        seen_codex_stems.discard(session_id)
-                    skipped_count += 1
-                    continue
-                if isinstance(info, PrivateSessionMarker):
-                    if existing_row:
+                    scan = transcript.scan
+                    fhash = scan.sha256
+                    file_stat = transcript.stat
+                    if (
+                        existing_row
+                        and existing_row["file_hash"] == fhash
+                        and not needs_structure_backfill
+                    ):
                         try:
-                            _tighten_private_marker(
-                                conn,
-                                existing_row=existing_row,
-                                jsonl_path=jsonl_path,
+                            shared_path, storage_changed = _sync_shared_copy(
+                                conn=conn,
+                                src=jsonl_path,
                                 shared_dir=shared_dir,
-                                marker=info,
-                                fhash=fhash,
-                                file_stat=file_stat,
-                                now=now,
+                                username=canonical_username,
+                                source=existing_row["source"],
+                                project=existing_row["project"] or "unknown",
+                                filename=jsonl_path.name,
+                                visibility=existing_row["visibility"],
+                                expected_sha256=fhash,
+                                expected_size=scan.size,
+                                existing_shared_path=existing_row["shared_path"],
                             )
                         except OSError as exc:
-                            if exc.errno == errno.ENOSPC:
-                                raise
+                            _record_copy_retry(
+                                conn,
+                                source_path=jsonl_path,
+                                session_id=session_id,
+                                expected_sha256=fhash,
+                                file_stat=file_stat,
+                                error=exc,
+                            )
+                            conn.commit()
                             _report_rotation_skip(jsonl_path, exc, verbose)
                             seen_codex_stems.discard(session_id)
                             skipped_count += 1
                             continue
-                        flush_if_needed()
-                        updated_count += 1
-                    else:
-                        skipped_count += 1
-                    continue
+                        _clear_copy_retry(conn, jsonl_path, session_id)
+                        row_moved = (
+                            existing_row["source_path"] != str(jsonl_path)
+                            or existing_row["file_size"] != file_stat.st_size
+                            or existing_row["file_mtime"] is None
+                            or abs(existing_row["file_mtime"] - file_stat.st_mtime)
+                            > 1e-6
+                        )
+                        if (
+                            storage_changed
+                            or row_moved
+                            or shared_path != (existing_row["shared_path"] or "")
+                        ):
+                            conn.execute(
+                                """
+                                UPDATE sessions
+                                SET shared_path = ?, source_path = ?, file_size = ?,
+                                    file_mtime = ?, synced_at = ?
+                                WHERE session_id = ?
+                                """,
+                                (
+                                    shared_path,
+                                    str(jsonl_path),
+                                    file_stat.st_size,
+                                    file_stat.st_mtime,
+                                    now,
+                                    session_id,
+                                ),
+                            )
+                            flush_if_needed()
+                            updated_count += 1
+                        else:
+                            skipped_count += 1
+                        continue
 
-                # Use leaf of cwd as project name
-                project = (
-                    Path(info.project).name if info.project != "unknown" else "unknown"
-                )
-                workspace_root = _normalize_workspace_root(
-                    info.workspace_root
-                    or (info.project if info.project != "unknown" else None)
-                )
-                repo_metadata = _resolve_repo_metadata(
-                    workspace_root, repo_metadata_cache
-                )
-                session_paths = _annotate_session_paths(
-                    info.session_paths,
-                    repo_root=repo_metadata["repo_root"],
-                    worktree_root=repo_metadata["worktree_root"],
-                    workspace_root=workspace_root,
-                )
-                activity = _derive_session_activity(info.tool_calls, session_paths)
-                narrative = _derive_session_narrative(
-                    source="codex",
-                    project=project,
-                    repo_name=repo_metadata["repo_name"],
-                    first_user_message=info.first_user_message,
-                    error_count=info.error_count,
-                    activity=activity,
-                    session_paths=session_paths,
-                )
-                origin = derive_session_origin(
-                    source="codex",
-                    session_id=session_id,
-                    first_user_message=info.first_user_message,
-                    project=project,
-                    workspace_root=workspace_root,
-                    source_path=str(jsonl_path),
-                )
-                objective = derive_session_objective(
-                    narrative["session_goal"],
-                    info.first_user_message,
-                    narrative["session_summary"],
-                )
-                visibility = resolve_session_visibility(
-                    conn,
-                    username=canonical_username,
-                    source="codex",
-                    default_visibility=default_visibility,
-                    session_data={
-                        "project": project,
-                        "source_path": str(jsonl_path),
-                        "first_user_message": info.first_user_message,
-                        "model": info.model,
-                        "machine": machine,
-                        "username": canonical_username,
-                    },
-                )
-                storage_visibility = _effective_storage_visibility(
-                    existing_row, visibility
-                )
-                try:
-                    shared_path, _ = _sync_shared_copy(
-                        conn=conn,
-                        src=jsonl_path,
-                        shared_dir=shared_dir,
-                        username=canonical_username,
+                    try:
+                        parsed = _parse_for_sync(
+                            "codex", jsonl_path, transcript, state_dir, limits
+                        )
+                    except OSError as exc:
+                        if exc.errno == errno.ENOSPC:
+                            raise
+                        _report_rotation_skip(jsonl_path, exc, verbose)
+                        seen_codex_stems.discard(session_id)
+                        skipped_count += 1
+                        continue
+                    parse_slot.hold(parsed)
+                    info = parsed.info
+                    if info is None:
+                        # _load_jsonl deliberately contains read errors and returns
+                        # no records. If Codex archived the rollout between hashing
+                        # and parsing, let the later archived-root pass retry the
+                        # same stem instead of treating the vanished live path as
+                        # the winning copy for this run.
+                        if not jsonl_path.exists():
+                            seen_codex_stems.discard(session_id)
+                        skipped_count += 1
+                        continue
+                    if isinstance(info, PrivateSessionMarker):
+                        _record_parse_checkpoint(
+                            conn,
+                            jsonl_path=jsonl_path,
+                            session_id=session_id,
+                            source="codex",
+                            transcript=transcript,
+                            parsed=parsed,
+                            now=now,
+                        )
+                        if existing_row:
+                            try:
+                                _tighten_private_marker(
+                                    conn,
+                                    existing_row=existing_row,
+                                    jsonl_path=jsonl_path,
+                                    shared_dir=shared_dir,
+                                    marker=info,
+                                    fhash=fhash,
+                                    file_stat=file_stat,
+                                    now=now,
+                                )
+                            except OSError as exc:
+                                if exc.errno == errno.ENOSPC:
+                                    raise
+                                _report_rotation_skip(jsonl_path, exc, verbose)
+                                seen_codex_stems.discard(session_id)
+                                skipped_count += 1
+                                continue
+                            flush_if_needed()
+                            updated_count += 1
+                        else:
+                            skipped_count += 1
+                        continue
+
+                    # Use leaf of cwd as project name
+                    project = (
+                        Path(info.project).name
+                        if info.project != "unknown"
+                        else "unknown"
+                    )
+                    workspace_root = _normalize_workspace_root(
+                        info.workspace_root
+                        or (info.project if info.project != "unknown" else None)
+                    )
+                    repo_metadata = _resolve_repo_metadata(
+                        workspace_root, repo_metadata_cache
+                    )
+                    session_paths = _annotate_session_paths(
+                        info.session_paths,
+                        repo_root=repo_metadata["repo_root"],
+                        worktree_root=repo_metadata["worktree_root"],
+                        workspace_root=workspace_root,
+                    )
+                    activity = _derive_session_activity(info.tool_calls, session_paths)
+                    narrative = _derive_session_narrative(
                         source="codex",
                         project=project,
-                        filename=jsonl_path.name,
-                        visibility=storage_visibility,
-                        expected_sha256=fhash,
-                        existing_shared_path=existing_row["shared_path"]
-                        if existing_row
-                        else None,
+                        repo_name=repo_metadata["repo_name"],
+                        first_user_message=info.first_user_message,
+                        error_count=info.error_count,
+                        activity=activity,
+                        session_paths=session_paths,
                     )
-                except OSError as exc:
-                    _record_copy_retry(
-                        conn,
-                        source_path=jsonl_path,
+                    origin = derive_session_origin(
+                        source="codex",
                         session_id=session_id,
-                        expected_sha256=fhash,
-                        file_stat=file_stat,
-                        error=exc,
+                        first_user_message=info.first_user_message,
+                        project=project,
+                        workspace_root=workspace_root,
+                        source_path=str(jsonl_path),
                     )
-                    conn.commit()
-                    _report_rotation_skip(jsonl_path, exc, verbose)
-                    seen_codex_stems.discard(session_id)
-                    skipped_count += 1
-                    continue
-                _clear_copy_retry(conn, jsonl_path, session_id)
+                    objective = derive_session_objective(
+                        narrative["session_goal"],
+                        info.first_user_message,
+                        narrative["session_summary"],
+                    )
+                    visibility = resolve_session_visibility(
+                        conn,
+                        username=canonical_username,
+                        source="codex",
+                        default_visibility=default_visibility,
+                        session_data={
+                            "project": project,
+                            "source_path": str(jsonl_path),
+                            "first_user_message": info.first_user_message,
+                            "model": info.model,
+                            "machine": machine,
+                            "username": canonical_username,
+                        },
+                    )
+                    storage_visibility = _effective_storage_visibility(
+                        existing_row, visibility
+                    )
+                    try:
+                        shared_path, _ = _sync_shared_copy(
+                            conn=conn,
+                            src=jsonl_path,
+                            shared_dir=shared_dir,
+                            username=canonical_username,
+                            source="codex",
+                            project=project,
+                            filename=jsonl_path.name,
+                            visibility=storage_visibility,
+                            expected_sha256=fhash,
+                            expected_size=scan.size,
+                            existing_shared_path=existing_row["shared_path"]
+                            if existing_row
+                            else None,
+                        )
+                    except OSError as exc:
+                        _record_copy_retry(
+                            conn,
+                            source_path=jsonl_path,
+                            session_id=session_id,
+                            expected_sha256=fhash,
+                            file_stat=file_stat,
+                            error=exc,
+                        )
+                        conn.commit()
+                        _report_rotation_skip(jsonl_path, exc, verbose)
+                        seen_codex_stems.discard(session_id)
+                        skipped_count += 1
+                        continue
+                    _clear_copy_retry(conn, jsonl_path, session_id)
 
-                # Use file_stem as session_id (unique per file)
-                upsert_session(
-                    conn,
-                    {
-                        "session_id": session_id,
-                        "source": "codex",
-                        "username": canonical_username,
-                        "machine": machine,
-                        "project": project,
-                        "workspace_root": workspace_root,
-                        "worktree_root": repo_metadata["worktree_root"],
-                        "repo_root": repo_metadata["repo_root"],
-                        "repo_name": repo_metadata["repo_name"],
-                        "git_branch": repo_metadata["git_branch"],
-                        "git_commit": repo_metadata["git_commit"],
-                        "git_dirty": repo_metadata["git_dirty"],
-                        "source_path": str(jsonl_path),
-                        "shared_path": shared_path,
-                        "first_timestamp": info.first_timestamp,
-                        "last_timestamp": info.last_timestamp,
-                        "duration_seconds": None,
-                        "user_message_count": info.user_message_count,
-                        "assistant_message_count": info.assistant_message_count,
-                        "tool_call_count": info.tool_call_count,
-                        "error_count": info.error_count,
-                        "total_input_tokens": info.total_input_tokens,
-                        "total_output_tokens": info.total_output_tokens,
-                        "fresh_input_tokens": info.fresh_input_tokens,
-                        "cached_input_tokens": info.cached_input_tokens,
-                        "cache_creation_input_tokens": info.cache_creation_input_tokens,
-                        "cache_creation_5m_input_tokens": info.cache_creation_5m_input_tokens,
-                        "cache_creation_1h_input_tokens": info.cache_creation_1h_input_tokens,
-                        "cache_creation_unknown_input_tokens": info.cache_creation_unknown_input_tokens,
-                        "reasoning_output_tokens": info.reasoning_output_tokens,
-                        "token_version": SESSION_TOKEN_VERSION,
-                        "identity_version": SESSION_IDENTITY_VERSION,
-                        "first_user_message": info.first_user_message,
-                        # Codex metadata carries a raw thread UUID here; the exact
-                        # rollout-key parent is resolved after the complete scan.
-                        "parent_session_id": None,
-                        "thread_id": info.thread_id,
-                        "parent_thread_id": info.parent_thread_id,
-                        "spawn_depth": info.spawn_depth,
-                        "visibility": visibility["visibility"],
-                        "visibility_source": visibility["visibility_source"],
-                        "visibility_rule_id": visibility["visibility_rule_id"],
-                        "visibility_reason": visibility["visibility_reason"],
-                        "is_private": 1 if visibility["visibility"] == "private" else 0,
-                        "file_hash": fhash,
-                        "file_size": file_stat.st_size,
-                        "file_mtime": file_stat.st_mtime,
-                        "synced_at": now,
-                        "model": info.model,
-                        **activity,
-                        **narrative,
-                        **objective,
-                        **origin,
-                    },
-                )
-                insert_tool_calls(conn, session_id, info.tool_calls)
-                insert_session_paths(conn, session_id, session_paths)
-                insert_session_daily_usage(conn, session_id, info.daily_usage)
-                affected_native.add(session_id)
-                refresh_session_search(session_id, Path(shared_path))
-                flush_if_needed()
+                    # Use file_stem as session_id (unique per file)
+                    upsert_session(
+                        conn,
+                        {
+                            "session_id": session_id,
+                            "source": "codex",
+                            "username": canonical_username,
+                            "machine": machine,
+                            "project": project,
+                            "workspace_root": workspace_root,
+                            "worktree_root": repo_metadata["worktree_root"],
+                            "repo_root": repo_metadata["repo_root"],
+                            "repo_name": repo_metadata["repo_name"],
+                            "git_branch": repo_metadata["git_branch"],
+                            "git_commit": repo_metadata["git_commit"],
+                            "git_dirty": repo_metadata["git_dirty"],
+                            "source_path": str(jsonl_path),
+                            "shared_path": shared_path,
+                            "first_timestamp": info.first_timestamp,
+                            "last_timestamp": info.last_timestamp,
+                            "duration_seconds": None,
+                            "user_message_count": info.user_message_count,
+                            "assistant_message_count": info.assistant_message_count,
+                            "tool_call_count": info.tool_call_count,
+                            "error_count": info.error_count,
+                            "total_input_tokens": info.total_input_tokens,
+                            "total_output_tokens": info.total_output_tokens,
+                            "fresh_input_tokens": info.fresh_input_tokens,
+                            "cached_input_tokens": info.cached_input_tokens,
+                            "cache_creation_input_tokens": info.cache_creation_input_tokens,
+                            "cache_creation_5m_input_tokens": info.cache_creation_5m_input_tokens,
+                            "cache_creation_1h_input_tokens": info.cache_creation_1h_input_tokens,
+                            "cache_creation_unknown_input_tokens": info.cache_creation_unknown_input_tokens,
+                            "reasoning_output_tokens": info.reasoning_output_tokens,
+                            "token_version": SESSION_TOKEN_VERSION,
+                            "identity_version": SESSION_IDENTITY_VERSION,
+                            "first_user_message": info.first_user_message,
+                            # Codex metadata carries a raw thread UUID here; the exact
+                            # rollout-key parent is resolved after the complete scan.
+                            "parent_session_id": None,
+                            "thread_id": info.thread_id,
+                            "parent_thread_id": info.parent_thread_id,
+                            "spawn_depth": info.spawn_depth,
+                            "visibility": visibility["visibility"],
+                            "visibility_source": visibility["visibility_source"],
+                            "visibility_rule_id": visibility["visibility_rule_id"],
+                            "visibility_reason": visibility["visibility_reason"],
+                            "is_private": 1
+                            if visibility["visibility"] == "private"
+                            else 0,
+                            "file_hash": fhash,
+                            "file_size": file_stat.st_size,
+                            "file_mtime": file_stat.st_mtime,
+                            "synced_at": now,
+                            "model": info.model,
+                            **activity,
+                            **narrative,
+                            **objective,
+                            **origin,
+                        },
+                    )
+                    insert_tool_calls(conn, session_id, info.tool_calls)
+                    insert_session_paths(conn, session_id, session_paths)
+                    insert_session_daily_usage(conn, session_id, info.daily_usage)
+                    queue_native_refresh(conn, [session_id])
+                    affected_native.add(session_id)
+                    _record_parse_checkpoint(
+                        conn,
+                        jsonl_path=jsonl_path,
+                        session_id=session_id,
+                        source="codex",
+                        transcript=transcript,
+                        parsed=parsed,
+                        now=now,
+                    )
+                    _stamp_structure(conn, session_id)
+                    refresh_session_search(session_id, Path(shared_path), scan)
+                    flush_if_needed()
 
-                action = "Updated" if session_id in existing else "Added"
-                if existing_row:
-                    updated_count += 1
-                else:
-                    new_count += 1
+                    action = "Updated" if session_id in existing else "Added"
+                    if existing_row:
+                        updated_count += 1
+                    else:
+                        new_count += 1
 
-                if verbose:
-                    short = session_id[-20:] if len(session_id) > 20 else session_id
-                    print(f"  {action}: …{short} ({project})")
+                    if verbose:
+                        short = session_id[-20:] if len(session_id) > 20 else session_id
+                        print(f"  {action}: …{short} ({project})")
+            parse_slot.release()
+
+        # Each pass stops at a session boundary when the budget, the disk
+        # guard or SIGTERM says so. Sessions it finished are committed and
+        # unchanged next time, so the next run moves past them; after a pass
+        # is cut short, the next run starts with the other pass so neither
+        # source can starve the other while a backlog drains.
+        passes = {"claudecode": run_claude_pass, "codex": run_codex_pass}
+        order = ["claudecode", "codex"]
+        if get_meta(conn, "sync_first_pass") == "codex":
+            order.reverse()
+        interrupted_pass = None
+        try:
+            for pass_name in order:
+                passes[pass_name]()
+                if control.stop_reason is not None:
+                    interrupted_pass = pass_name
+                    break
+        finally:
+            parse_slot.release()
+        next_first = "codex" if interrupted_pass == "claudecode" else "claudecode"
+        if (get_meta(conn, "sync_first_pass") or "claudecode") != next_first:
+            set_meta(conn, "sync_first_pass", next_first)
 
         backfilled, backfill_affected = _backfill_tokens_from_shared(
-            conn, verbose=verbose
+            conn, verbose=verbose, control=control
         )
         updated_count += backfilled
         affected_native |= backfill_affected
+        queue_native_refresh(conn, backfill_affected)
 
         _resolve_canonical_parents(conn)
-        refresh_native_usage(conn, None if force_full_refresh else affected_native)
-        set_meta(conn, "native_refresh_pending", "0")
+        # This run's own refreshes are proportional to the work it did, so
+        # they always run: stats read right after a partial sync are current
+        # for every session it touched.
+        refresh_native_usage(conn, affected_native)
 
-        # Run committing search batches only after all ordinary sync work and
-        # native refresh have succeeded. This preserves the existing promise
-        # that a late sync failure rolls back uncommitted visibility/storage
-        # transitions instead of letting the backfill commit them early.
+        # Run committing batches only after all ordinary sync work and this
+        # run's native refresh have succeeded. This preserves the existing
+        # promise that a late sync failure rolls back uncommitted
+        # visibility/storage transitions instead of letting a backfill commit
+        # them early. Refreshes owed by earlier, interrupted runs drain here
+        # within the budget.
+        native_backlog = drain_native_refresh(
+            conn, deadline=control.deadline, should_stop=control.stop_requested
+        )
         search_backfill = backfill_search_index(
             conn,
             shared_dir=shared_dir,
             verbose=verbose,
+            deadline=control.deadline,
+            should_stop=control.stop_requested,
         )
         if search_backfill.indexed or search_backfill.missing or search_backfill.errors:
             gib = search_backfill.indexed_bytes / (1024**3)
@@ -3077,7 +3885,11 @@ def _sync_sessions(
                 f"{search_backfill.missing} missing, {search_backfill.errors} error(s).",
                 file=sys.stderr,
             )
-        if search_backfill.missing or search_backfill.errors:
+        if (
+            search_backfill.missing
+            or search_backfill.errors
+            or search_backfill.deferred
+        ):
             set_meta(conn, "search_refresh_pending", "1")
         else:
             set_meta(conn, "search_index_version", str(SEARCH_INDEX_VERSION))
@@ -3089,5 +3901,23 @@ def _sync_sessions(
         )
         set_meta(conn, "search_backfill_last_sessions", str(search_backfill.indexed))
         set_meta(conn, "search_backfill_last_bytes", str(search_backfill.indexed_bytes))
+        conn.commit()
+        _collect_parse_states(conn, state_dir, control.limits)
 
+    stop_reason = control.stop_reason
+    if stop_reason is None and (native_backlog or search_backfill.deferred):
+        stop_reason = "wall-clock budget exhausted during end-of-run passes"
+    if stop_reason is not None:
+        deferred = []
+        if native_backlog:
+            deferred.append(f"{native_backlog} native refresh(es)")
+        if search_backfill.deferred:
+            deferred.append(f"{search_backfill.deferred} search index session(s)")
+        suffix = f"; deferred {', '.join(deferred)}" if deferred else ""
+        print(
+            f"Stopped early: {stop_reason}{suffix}. "
+            "Finished sessions are committed; the next sync resumes.",
+            file=sys.stderr,
+        )
+        return SyncPartial(new_count, updated_count, skipped_count, stop_reason)
     return SyncResult(new_count, updated_count, skipped_count)

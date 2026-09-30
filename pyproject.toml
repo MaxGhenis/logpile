@@ -21,6 +21,7 @@ cloud = [
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6",
     "pytest>=9.0",
     "ruff==0.16.0",
 ]

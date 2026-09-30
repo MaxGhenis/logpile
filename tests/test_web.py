@@ -306,11 +306,19 @@ class WebAppTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        # Fixed dates make the commit SHA deterministic. A random SHA can hold
+        # ten consecutive digits, which the publish scanner's phone rule
+        # flags, so an unpinned commit made this suite flaky.
         subprocess.run(
             ["git", "-C", str(repo), "commit", "-m", "init"],
             check=True,
             capture_output=True,
             text=True,
+            env={
+                **os.environ,
+                "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z",
+                "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
+            },
         )
         branch = subprocess.run(
             ["git", "-C", str(repo), "branch", "--show-current"],
