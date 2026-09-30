@@ -2156,6 +2156,9 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     )
     _ensure_column(conn, "sessions", "file_size", "INTEGER")
     _ensure_column(conn, "sessions", "file_mtime", "REAL")
+    # Set by sync when a full parse recomputes a row's structural fields; see
+    # sync.SESSION_STRUCTURE_VERSION.
+    _ensure_column(conn, "sessions", "structure_version", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(
         conn,
         "session_daily_usage",
