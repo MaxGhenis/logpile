@@ -2721,6 +2721,9 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SESSION_TRIGGERS)
     _replace_drifted_schema_objects(conn, "trigger")
     _ensure_column(conn, "session_search_state", "artifact_hash", "TEXT")
+    from .search import ensure_search_checkpoint_columns  # search imports db
+
+    ensure_search_checkpoint_columns(conn)
     set_meta(conn, "search_fts_generation", str(SEARCH_INDEX_VERSION))
     search_version = get_meta(conn, "search_index_version")
     if reset_search_storage or search_version != str(SEARCH_INDEX_VERSION):
