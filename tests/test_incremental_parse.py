@@ -46,7 +46,8 @@ TEXT = st.sampled_from(
         "why is it slow?",
         "  ",
         "<system-reminder>x</system-reminder> real ask",
-        "run logpile:private please",
+        # An inline privacy marker, spelled so this file does not contain it.
+        "run " + "logpile" + ":private please",
         "ok",
         "é unicode ✓",
     ]

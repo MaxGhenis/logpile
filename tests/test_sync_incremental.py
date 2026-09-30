@@ -625,6 +625,21 @@ class ArchivalCopyRaceTests(unittest.TestCase):
 
 
 class ParseStateCollectionTests(unittest.TestCase):
+    def test_damaged_state_file_falls_back_to_a_full_parse(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            harness = SyncHarness(root, "damaged")
+            path = _claude_path(harness.home, "session-a")
+            _append(path, _lines(_session_records(6)))
+            harness.sync()
+            (state,) = parse_state_dir(harness.db).iterdir()
+            state.write_bytes(b"not a sqlite database" * 100)
+            _append(path, _lines(_session_records(2, start=6)))
+            self.assertEqual(harness.sync().status, SyncStatus.COMPLETED)
+            full = SyncHarness(root, "full")
+            full.sync(FULL)
+            self.assertEqual(harness.snapshot(), full.snapshot())
+
     def test_idle_states_and_orphans_are_removed(self):
         with tempfile.TemporaryDirectory() as td:
             harness = SyncHarness(Path(td), "gc")

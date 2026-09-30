@@ -86,13 +86,67 @@ Indexes your local session JSONL files into SQLite by default. Use `--backend cl
 
 ```
 Options:
-  --shared PATH     Shared directory    [default: ~/logpile/shared]
-  --db PATH         SQLite database     [default: ~/logpile/logpile.db]
-  --backend MODE    local | cloud | both [default: local]
-  --username TEXT   Override system username
-  --machine TEXT    Override hostname
-  -v, --verbose     Print each file processed
+  --shared PATH                 Shared directory    [default: ~/logpile/shared]
+  --db PATH                     SQLite database     [default: ~/logpile/logpile.db]
+  --backend MODE                local | cloud | both [default: local]
+  --username TEXT               Override system username
+  --machine TEXT                Override hostname
+  --budget SECONDS              Wall-clock budget, 0 = unlimited [default: 900]
+  --min-free-gib N              Free-space floor               [default: 40]
+  --min-free-gib-with-snapshot N
+                                Floor while a Time Machine local snapshot
+                                exists                          [default: 60]
+  --disk-guard/--no-disk-guard  Check free space before and during sync
+  -v, --verbose                 Print each file processed
 ```
+
+The budget and disk options also read `LOGPILE_SYNC_BUDGET_SECONDS`,
+`LOGPILE_SYNC_MIN_FREE_GIB`, `LOGPILE_SYNC_MIN_FREE_GIB_WITH_SNAPSHOT` and
+`LOGPILE_SYNC_DISK_GUARD`.
+
+#### Incremental, bounded sync
+
+Agent transcripts are append-only while their session runs, so a sync only
+does work proportional to what was appended:
+
+- **One read per changed transcript.** A single pass hashes exactly the bytes
+  present when the file was opened (the session's `file_hash`) and, in the
+  same pass, the prefixes a resumed parse or search index must verify.
+- **Resumable parse states.** Transcripts of at least 1 MiB written in the
+  last three days keep their parser state in `logpile.db.parse-state/`
+  (one 0600 SQLite file each, deleted once the transcript goes idle). The next
+  sync resumes after the last complete line it parsed, but only when the file
+  is the same inode and the bytes before that point hash exactly as before;
+  anything else reparses from byte 0. An unterminated last line is counted
+  (as a full parse would) but never committed to the state, so completing it
+  later is not double counted. `transcript_checkpoints` names the exact state
+  commit, so a state that ran ahead of a rolled-back transaction is discarded.
+- **Write-minimal rows.** Tool calls, session paths, daily usage and message
+  claims are diffed against what the database already holds; unchanged rows,
+  and their index entries, are not rewritten. Search documents for bytes
+  already indexed stay in place and only the appended records are added.
+- **Settled rows stay settled.** A session run from `/` has no repository
+  name, and tool calls without file arguments leave no path rows. Those used
+  to look like "never computed" and were reparsed on every sync; rows now
+  carry `structure_version`, and a stamped row is only reparsed when its
+  bytes or a parser version change.
+- **Exact archival copies.** The shared copy is cut to the bytes that were
+  hashed, so a transcript that grows between hashing and copying no longer
+  fails verification on every sync.
+- **Wall-clock budget.** When the budget runs out, sync stops at the next
+  session boundary, finishes this run's native refreshes, commits, and exits
+  with `Local done: … (stopped early: …)`. Sessions it finished are unchanged
+  next time, so the next run moves on; every run finishes at least one
+  session, and after a cut-short pass the next run starts with the other
+  source. Refreshes owed by an interrupted run wait in `native_refresh_queue`.
+- **Disk guard.** Sync does not start (exit status 75) when the database or
+  shared volume has less than 40 GiB free, or less than 60 GiB while a Time
+  Machine local snapshot exists, and it stops early if a running sync crosses
+  the floor. On APFS every rewritten page is copy-on-write and a local
+  snapshot keeps the old block, so page churn costs real space until the
+  snapshot expires.
+- **SIGTERM** stops at the next session boundary the same way; a second
+  SIGTERM rolls back like Ctrl-C.
 
 Scans `~/.claude/projects/**/*.jsonl` plus every Codex rollout root —
 `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.codex-2/sessions`,

@@ -186,6 +186,7 @@ class SyncLimits:
     budget_seconds: float | None = DEFAULT_SYNC_BUDGET_SECONDS
     disk: DiskGuardPolicy = field(default_factory=DiskGuardPolicy)
     disk_recheck_seconds: float = 30.0
+    snapshot_recheck_seconds: float = 300.0
     parse_state_min_bytes: int = DEFAULT_PARSE_STATE_MIN_BYTES
     parse_state_max_idle_seconds: float = DEFAULT_PARSE_STATE_MAX_IDLE_SECONDS
 
@@ -246,6 +247,7 @@ class _SyncControl:
         self.signal_name: str | None = None
         self.progress = 0
         self._next_disk_check = self.started + limits.disk_recheck_seconds
+        self._next_snapshot_check = self.started + limits.snapshot_recheck_seconds
         self._snapshots: tuple[str, ...] | None = None
 
     def note_progress(self) -> None:
@@ -280,6 +282,10 @@ class _SyncControl:
             return True
         if self.limits.disk.enabled and now >= self._next_disk_check:
             self._next_disk_check = now + self.limits.disk_recheck_seconds
+            if now >= self._next_snapshot_check:
+                # A snapshot taken mid-run raises the floor from then on.
+                self._next_snapshot_check = now + self.limits.snapshot_recheck_seconds
+                self._snapshots = list_local_snapshots()
             decision = check_disk_space(
                 self._paths,
                 self.limits.disk,
@@ -2609,13 +2615,22 @@ def _parse_for_sync(
         state_path = state_dir / _parse_state_name(jsonl_path)
     elif transcript.state_file:
         remove_parse_state(state_dir / transcript.state_file)
-    return parse_transcript(
-        source,
-        jsonl_path,
-        transcript.scan,
-        state_path=state_path,
-        checkpoint=transcript.checkpoint if state_path is not None else None,
-    )
+    if state_path is None:
+        return parse_transcript(source, jsonl_path, transcript.scan)
+    try:
+        return parse_transcript(
+            source,
+            jsonl_path,
+            transcript.scan,
+            state_path=state_path,
+            checkpoint=transcript.checkpoint,
+        )
+    except sqlite3.Error as exc:
+        remove_parse_state(state_path)
+        if (getattr(exc, "sqlite_errorcode", 0) or 0) & 0xFF == sqlite3.SQLITE_FULL:
+            raise OSError(errno.ENOSPC, f"parse state: {exc}") from exc
+        # A damaged state file only costs the resume: parse from byte 0.
+        return parse_transcript(source, jsonl_path, transcript.scan)
 
 
 def _record_parse_checkpoint(
