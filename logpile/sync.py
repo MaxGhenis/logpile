@@ -2532,24 +2532,31 @@ class _CopyMarkerCache:
         if not (self.dirty or stale):
             return
         tmp = self.path.with_name(f".{self.path.name}.{secrets.token_hex(4)}.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            json.dump(self.entries, handle)
-        os.replace(tmp, self.path)
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                json.dump(self.entries, handle)
+            os.replace(tmp, self.path)
+        except OSError:
+            # Only a cache: a later sync rescans what it cannot remember.
+            tmp.unlink(missing_ok=True)
 
 
 def _canonical_claude_copies(
     paths: list[Path], patterns: list[str], markers: _CopyMarkerCache
-) -> dict[str, Path]:
+) -> dict[str, Path | None]:
     """For session ids with several transcript files, the one copy to sync.
 
     One session id can have a transcript under more than one project
     directory. Rows are keyed by session id, so syncing every copy made the
     row flip between them, and every copy was reparsed and every derived row
     rewritten on every run. A copy carrying a privacy marker wins, so the
-    session stays private even when a newer copy lacks the marker; otherwise
-    the most recently modified copy wins. Ties go to the last path in sorted
-    order, the copy whose row used to survive a run.
+    session stays private even when a newer copy lacks the marker (and that
+    newer copy's content is then never indexed); otherwise the most recently
+    modified copy wins. Ties go to the last path in sorted order, the copy
+    whose row used to survive a run. When any copy cannot be read, the id
+    maps to None and no copy is synced this run: without every copy's
+    marker, sync cannot tell whether the session opted out.
     """
     by_stem: dict[str, list[Path]] = {}
     for path in paths:
@@ -2557,21 +2564,19 @@ def _canonical_claude_copies(
             continue
         by_stem.setdefault(path.stem, []).append(path)
 
-    def preference(path: Path) -> tuple[bool, float, str]:
+    chosen: dict[str, Path | None] = {}
+    for stem, copies in by_stem.items():
+        if len(copies) < 2:
+            continue
         try:
-            return (
-                markers.marker(path) is not None,
-                path.stat().st_mtime,
-                str(path),
-            )
+            ranked = [
+                (markers.marker(path) is not None, path.stat().st_mtime, str(path))
+                for path in copies
+            ]
         except OSError:
-            return (False, float("-inf"), str(path))
-
-    chosen = {
-        stem: max(copies, key=preference)
-        for stem, copies in by_stem.items()
-        if len(copies) > 1
-    }
+            chosen[stem] = None
+            continue
+        chosen[stem] = Path(max(ranked)[2])
     markers.save(
         {str(path) for copies in by_stem.values() if len(copies) > 1 for path in copies}
     )

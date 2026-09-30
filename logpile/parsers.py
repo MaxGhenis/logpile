@@ -3129,11 +3129,16 @@ def find_private_marker(path: Path) -> str | None:
 
     Both streams check every valid record with _private_marker and keep the
     first hit, so this returns the marker a full parse of ``path`` would.
+    Raises OSError when the file could not be read to the end without a
+    marker, so "no marker" is never concluded from a partial read.
     """
-    for record in _iter_jsonl(path, report_malformed=False):
+    stats = JsonlLoadStats()
+    for record in _iter_jsonl(path, stats=stats, report_malformed=False):
         marker = _private_marker((record,))
         if marker:
             return marker
+    if stats.io_errors:
+        raise OSError(errno.EIO, "transcript could not be read for a marker", str(path))
     return None
 
 

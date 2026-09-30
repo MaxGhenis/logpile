@@ -617,6 +617,37 @@ class DuplicateCopyMarkerTests(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(visibility, "private")
             self.assertEqual(source_path, str(marked))
+            # The newer copy published by the first sync left the shared tree.
+            self.assertEqual(list(harness.shared.rglob("*.jsonl")), [])
+
+    def test_a_copy_that_cannot_be_read_is_not_cached_as_unmarked(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = SyncHarness(Path(td), "dups")
+            marked, _ = self._copies(harness)
+            real = sync_module.find_private_marker
+            failures = []
+
+            def fail_once(path):
+                if path == marked and not failures:
+                    failures.append(path)
+                    raise OSError(5, "EIO")
+                return real(path)
+
+            with mock.patch.object(
+                sync_module, "find_private_marker", side_effect=fail_once
+            ):
+                harness.sync()
+            # Unknown marker status: no copy was synced or published.
+            self.assertFalse(
+                harness.shared.exists() and any(harness.shared.rglob("*.jsonl"))
+            )
+            # The failed scan was not remembered: the next sync reads it and
+            # the marked copy wins, keeping the never-seen session out.
+            harness.sync()
+            with closing(sqlite3.connect(harness.db)) as conn:
+                rows = conn.execute("SELECT visibility FROM sessions").fetchall()
+            self.assertEqual(rows, [])
+            self.assertFalse(any(harness.shared.rglob("*.jsonl")))
 
     def test_unchanged_copies_are_not_rescanned_for_markers(self):
         with tempfile.TemporaryDirectory() as td:
@@ -821,17 +852,27 @@ class SyncLimitTests(unittest.TestCase):
             )
             ok = DiskGuardDecision(True, harness.db, 100 * GIB, 40 * GIB, 0, "ok")
             low = DiskGuardDecision(False, harness.db, 1 * GIB, 40 * GIB, 0, "low")
-            # Fine at the start and through the (unchanged) passes, low after.
-            decisions = iter([ok, ok, ok, ok])
+            # Fine through the main passes; low once the end-of-run passes start.
+            in_tail = []
+            real_drain = sync_module.drain_native_refresh
+
+            def drain(*args, **kwargs):
+                in_tail.append(True)
+                return real_drain(*args, **kwargs)
+
             with (
                 mock.patch.object(
                     sync_module,
                     "check_disk_space",
-                    side_effect=lambda *a, **k: next(decisions, low),
+                    side_effect=lambda *a, **k: low if in_tail else ok,
                 ),
                 mock.patch.object(sync_module, "list_local_snapshots", return_value=()),
+                mock.patch.object(
+                    sync_module, "drain_native_refresh", side_effect=drain
+                ),
             ):
                 result = harness.sync(guarded)
+            self.assertTrue(in_tail)
             self.assertEqual(result.status, SyncStatus.PARTIAL)
             self.assertEqual(result.reason, "low")
             with closing(sqlite3.connect(harness.db)) as conn:
