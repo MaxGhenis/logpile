@@ -106,8 +106,9 @@ The budget and disk options also read `LOGPILE_SYNC_BUDGET_SECONDS`,
 
 #### Incremental, bounded sync
 
-Agent transcripts are append-only while their session runs, so a sync only
-does work proportional to what was appended:
+Agent transcripts are append-only while their session runs, so parsing,
+search indexing and row writes are proportional to what was appended (hashing
+still reads each changed transcript to prove its prefix is unchanged):
 
 - **One read per changed transcript.** A single pass hashes exactly the bytes
   present when the file was opened (the session's `file_hash`) and, in the
@@ -121,6 +122,8 @@ does work proportional to what was appended:
   (as a full parse would) but never committed to the state, so completing it
   later is not double counted. `transcript_checkpoints` names the exact state
   commit, so a state that ran ahead of a rolled-back transaction is discarded.
+  A session with an inline privacy marker keeps no parse state, only where
+  its marker sits, which is all a full parse would return.
 - **Write-minimal rows.** Tool calls, session paths, daily usage and message
   claims are diffed against what the database already holds; unchanged rows,
   and their index entries, are not rewritten. Search documents for bytes
@@ -145,8 +148,13 @@ does work proportional to what was appended:
   the floor. On APFS every rewritten page is copy-on-write and a local
   snapshot keeps the old block, so page churn costs real space until the
   snapshot expires.
-- **SIGTERM** stops at the next session boundary the same way; a second
-  SIGTERM rolls back like Ctrl-C.
+- **SIGTERM** stops at the next session boundary the same way and skips
+  the end-of-run backfills (their work stays queued); a second SIGTERM
+  terminates the process as it would have without the handler.
+- **One copy per session id.** When the same Claude session id has a
+  transcript under several project directories, only the most recently
+  modified copy is synced, so the session's row no longer flips between
+  copies (reparsing all of them) on every run.
 
 Scans `~/.claude/projects/**/*.jsonl` plus every Codex rollout root —
 `~/.codex/sessions`, `~/.codex/archived_sessions`, `~/.codex-2/sessions`,
