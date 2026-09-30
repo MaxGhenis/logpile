@@ -22,6 +22,7 @@ from logpile.db import (
     get_meta,
     init_db,
     refresh_native_usage,
+    set_meta,
 )
 from logpile.parsers import parse_claudecode_session
 from logpile.sync import SESSION_TOKEN_VERSION, sync_sessions
@@ -745,6 +746,9 @@ class MigrationTests(unittest.TestCase):
                     ) VALUES ('legacy', '2026-03-01', 1234, 56)
                     """
                 )
+                # The mirror is a one-time legacy repair: simulate a database
+                # last migrated before the repair gate existed.
+                set_meta(conn, "data_repair_version", None)
             init_db(db_path)  # re-run migration
             with get_db(db_path) as conn:
                 row = conn.execute(
@@ -767,6 +771,10 @@ class MigrationTests(unittest.TestCase):
                     "INSERT INTO message_claims (claim_key, session_id)"
                     " VALUES ('msg-x:req-x', 'ghost-session')"
                 )
+                # Deleting a session now drops its claims immediately (see
+                # the delete-trigger tests), so a hand-written orphan is only
+                # healed by the one-time scan a pre-gate database still owes.
+                set_meta(conn, "data_repair_version", None)
             init_db(db_path)
             with get_db(db_path) as conn:
                 self.assertEqual(
@@ -774,7 +782,7 @@ class MigrationTests(unittest.TestCase):
                     0,
                 )
 
-    def test_orphan_cleanup_promotes_survivor_and_marks_native_refresh(self) -> None:
+    def test_orphan_cleanup_promotes_survivor_and_queues_native_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "logpile.db"
             init_db(db_path)
@@ -811,9 +819,20 @@ class MigrationTests(unittest.TestCase):
                     ).fetchone()[0],
                     "loser-b",
                 )
-                self.assertEqual(get_meta(conn, "native_refresh_pending"), "1")
+                self.assertEqual(get_meta(conn, "native_refresh_pending"), "0")
+                self.assertEqual(
+                    [
+                        row[0]
+                        for row in conn.execute(
+                            "SELECT session_id FROM native_refresh_queue"
+                        )
+                    ],
+                    ["loser-b"],
+                )
 
-    def test_winner_only_ledger_migrates_to_occurrence_and_marks_refresh(self) -> None:
+    def test_winner_only_ledger_migrates_to_occurrence_and_queues_refresh(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as td:
             db_path = Path(td) / "logpile.db"
             init_db(db_path)
@@ -886,7 +905,17 @@ class MigrationTests(unittest.TestCase):
                     "WHERE claim_key = 'legacy:key'"
                 ).fetchone()[0]
                 self.assertEqual(owner, "legacy-owner")
-                self.assertEqual(get_meta(conn, "native_refresh_pending"), "1")
+                # The legacy flag meant "refresh everything": every session is
+                # queued instead.
+                self.assertEqual(
+                    [
+                        row[0]
+                        for row in conn.execute(
+                            "SELECT session_id FROM native_refresh_queue"
+                        )
+                    ],
+                    ["legacy-owner"],
+                )
                 native_split = conn.execute(
                     """
                     SELECT native_cache_creation_input_tokens,
@@ -915,6 +944,10 @@ class MigrationTests(unittest.TestCase):
                     "parent_thread_id = NULL, identity_version = 0 "
                     "WHERE session_id = 'legacy-codex-child'"
                 )
+                # Only pre-thread-field versions wrote this shape, so its
+                # repair runs once per database: simulate one last migrated
+                # before the repair gate existed.
+                set_meta(conn, "data_repair_version", None)
 
             init_db(db_path)
             with get_db(db_path) as conn:
