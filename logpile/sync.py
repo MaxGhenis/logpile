@@ -2482,6 +2482,34 @@ _STRUCTURE_VERSION_COLUMNS = (
 )
 
 
+def _canonical_claude_copies(paths: list[Path], patterns: list[str]) -> dict[str, Path]:
+    """For session ids with several transcript files, the one copy to sync.
+
+    One session id can have a transcript under more than one project
+    directory. Rows are keyed by session id, so syncing every copy made the
+    row flip between them, and every copy was reparsed and every derived row
+    rewritten on every run. The most recently modified copy wins; ties go to
+    the last path in sorted order, the copy whose row used to survive a run.
+    """
+    by_stem: dict[str, list[Path]] = {}
+    for path in paths:
+        if should_ignore(path, patterns) or _is_claude_workflow_journal(path):
+            continue
+        by_stem.setdefault(path.stem, []).append(path)
+
+    def recency(path: Path) -> tuple[float, str]:
+        try:
+            return (path.stat().st_mtime, str(path))
+        except OSError:
+            return (float("-inf"), str(path))
+
+    return {
+        stem: max(copies, key=recency)
+        for stem, copies in by_stem.items()
+        if len(copies) > 1
+    }
+
+
 def _needs_structure_backfill(existing_row) -> bool:
     """Whether an existing row must be reparsed even if its file is unchanged."""
     if not existing_row:
@@ -2960,7 +2988,9 @@ def _sync_sessions(
             # ── Claude Code sessions ───────────────────────────────────────────────
             claude_root = claude_projects_root(home)
             if claude_root.exists():
-                for jsonl_path in sorted(claude_root.rglob("*.jsonl")):
+                claude_paths = sorted(claude_root.rglob("*.jsonl"))
+                canonical = _canonical_claude_copies(claude_paths, patterns)
+                for jsonl_path in claude_paths:
                     parse_slot.release()
                     if control.should_stop():
                         return
@@ -3017,6 +3047,10 @@ def _sync_sessions(
                             flush_if_needed()
                         else:
                             skipped_count += 1
+                        continue
+                    if canonical.get(session_id, jsonl_path) != jsonl_path:
+                        # Another copy of this session id is the one synced.
+                        skipped_count += 1
                         continue
                     needs_structure_backfill = _needs_structure_backfill(existing_row)
 

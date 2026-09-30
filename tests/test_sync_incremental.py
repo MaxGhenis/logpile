@@ -529,6 +529,41 @@ class SettledStructureTests(unittest.TestCase):
             self.assertIsNone(spy.call_args.kwargs["checkpoint"])
 
 
+class DuplicateSessionCopyTests(unittest.TestCase):
+    def test_copies_of_one_session_id_do_not_flip_the_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = SyncHarness(Path(td), "dups")
+            projects = harness.home / ".claude" / "projects"
+            older = projects / "-Users-alice-demo" / "shared-id.jsonl"
+            newer = projects / "-Users-alice-demo-worktree" / "shared-id.jsonl"
+            _append(older, _lines(_session_records(3)))
+            _append(newer, _lines(_session_records(5, start=50)))
+            os.utime(older, (1_000_000_000, 1_000_000_000))
+            harness.sync()
+            with closing(sqlite3.connect(harness.db)) as conn:
+                (source_path,) = conn.execute(
+                    "SELECT source_path FROM sessions WHERE session_id = 'shared-id'"
+                ).fetchone()
+            self.assertEqual(source_path, str(newer))
+            before = harness.snapshot()
+            with mock.patch.object(
+                sync_module, "parse_transcript", wraps=sync_module.parse_transcript
+            ) as spy:
+                result = harness.sync()
+            spy.assert_not_called()
+            self.assertEqual((result.new, result.updated), (0, 0))
+            self.assertEqual(harness.snapshot(), before)
+
+            # The copy written most recently is the one synced.
+            _append(older, _lines(_session_records(1, start=3)))
+            harness.sync()
+            with closing(sqlite3.connect(harness.db)) as conn:
+                (source_path,) = conn.execute(
+                    "SELECT source_path FROM sessions WHERE session_id = 'shared-id'"
+                ).fetchone()
+            self.assertEqual(source_path, str(older))
+
+
 class SyncLimitTests(unittest.TestCase):
     def _three_sessions(self, harness: SyncHarness) -> None:
         # Distinct message ids, so no claims (and no native refreshes) are shared.
