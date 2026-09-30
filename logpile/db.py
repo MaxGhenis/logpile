@@ -3,14 +3,17 @@
 import os
 import re
 import sqlite3
+import time
 import warnings
-from contextlib import contextmanager
+from collections.abc import Iterable, Iterator
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 
 from .origins import SESSION_ORIGINS
+from .parsers import ParseCheckpoint
 
 SESSION_VISIBILITIES = ("private", "unlisted", "public")
 PROFILE_VISIBILITIES = ("private", "unlisted", "public")
@@ -286,11 +289,36 @@ CREATE TABLE IF NOT EXISTS message_claims (
     PRIMARY KEY (claim_key, session_id)
 ) WITHOUT ROWID;
 
--- Small key/value state for the sync pipeline itself (e.g. whether a
--- native_* refresh is owed after an interrupted sync).
+-- Small key/value state for the sync pipeline itself (e.g. the search index
+-- revision, or which one-time data repairs this database has had).
 CREATE TABLE IF NOT EXISTS logpile_meta (
     key   TEXT PRIMARY KEY,
     value TEXT
+);
+
+-- Sessions whose native_* columns are owed a recompute. The queue is durable,
+-- so work owed by an interrupted sync survives it, and drain_native_refresh
+-- can spread a large backlog across bounded syncs chunk by chunk.
+CREATE TABLE IF NOT EXISTS native_refresh_queue (
+    session_id TEXT PRIMARY KEY
+) WITHOUT ROWID;
+
+-- Where a resumable parse of one transcript stopped. A checkpoint names the
+-- parser state file it belongs to (see parsers.ParseCheckpoint), so the next
+-- sync can fold only the bytes appended since.
+CREATE TABLE IF NOT EXISTS transcript_checkpoints (
+    source_path TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    dev INTEGER NOT NULL,
+    ino INTEGER NOT NULL,
+    parse_offset INTEGER NOT NULL,
+    parse_prefix_sha256 TEXT NOT NULL,
+    parse_generation TEXT NOT NULL,
+    parse_version INTEGER NOT NULL,
+    state_file TEXT NOT NULL,
+    file_mtime REAL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -353,6 +381,7 @@ CREATE INDEX IF NOT EXISTS idx_rules_username               ON session_visibilit
 CREATE INDEX IF NOT EXISTS idx_rules_priority               ON session_visibility_rules(username, enabled, priority, id);
 CREATE INDEX IF NOT EXISTS idx_publication_reviews_session  ON publication_reviews(session_id, reviewed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_visibility_transitions_session ON visibility_transitions(session_id, transitioned_at DESC);
+CREATE INDEX IF NOT EXISTS idx_transcript_checkpoints_session ON transcript_checkpoints(session_id);
 """
 
 VIEWS = """
@@ -603,6 +632,98 @@ BEGIN
     WHERE session_id = new.session_id;
 END;
 """
+
+# Rows derived from a session leave with it. Deleting a session's claims can
+# promote another claimant of the same message to owner, so every other
+# claimant of those keys is queued for a native refresh. The CROSS JOIN pins
+# the join order: this session's keys come from its (session_id, day) index,
+# and each key's claimants from the (claim_key, session_id) primary key.
+SESSION_TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS sessions_message_claims_cleanup
+AFTER DELETE ON sessions BEGIN
+    INSERT OR IGNORE INTO native_refresh_queue (session_id)
+    SELECT DISTINCT other.session_id
+    FROM message_claims AS mine
+    CROSS JOIN message_claims AS other ON other.claim_key = mine.claim_key
+    WHERE mine.session_id = old.session_id
+      AND other.session_id != old.session_id;
+    DELETE FROM message_claims WHERE session_id = old.session_id;
+    DELETE FROM native_refresh_queue WHERE session_id = old.session_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS sessions_transcript_checkpoints_cleanup
+AFTER DELETE ON sessions BEGIN
+    DELETE FROM transcript_checkpoints WHERE session_id = old.session_id;
+END;
+"""
+
+# Views and triggers whose definitions migrate_db replaces when they drift.
+# Each is compared against its canonical sqlite_master text and rewritten only
+# when that text differs: a DROP + CREATE writes schema pages to the WAL and
+# bumps PRAGMA schema_version even when the definition is identical.
+_MANAGED_TRIGGERS = (
+    "sessions_search_stale",
+    "sessions_message_claims_cleanup",
+    "sessions_transcript_checkpoints_cleanup",
+)
+
+# One-time repairs of rows written by older Logpile versions. Current writers
+# never produce the states these heal, so they run once per database (and
+# again whenever a migration changes the schema), not on every sync. Bump the
+# version when a new repair is added so it reaches databases that already
+# recorded the old one.
+DATA_REPAIR_VERSION = 1
+_DATA_REPAIR_META_KEY = "data_repair_version"
+
+# Superseded by native_refresh_queue. drain_native_refresh adopts a pending
+# value left by an older sync (see _adopt_legacy_native_refresh_flag).
+_LEGACY_NATIVE_REFRESH_FLAG = "native_refresh_pending"
+
+_canonical_schema_sql: dict[str, tuple[str, str]] | None = None
+
+
+def _canonical_managed_schema() -> dict[str, tuple[str, str]]:
+    """Return {name: (type, sql)} as sqlite_master stores each managed object.
+
+    SQLite normalizes the stored CREATE text (it drops IF NOT EXISTS, for
+    example), so the reference text comes from creating the objects in a
+    scratch in-memory database rather than from the source strings.
+    """
+    global _canonical_schema_sql
+    if _canonical_schema_sql is None:
+        reference = sqlite3.connect(":memory:")
+        try:
+            reference.executescript(SCHEMA)
+            reference.executescript(SEARCH_SCHEMA)
+            reference.executescript(VIEWS)
+            reference.executescript(SESSION_TRIGGERS)
+            placeholders = ", ".join("?" for _ in _MANAGED_TRIGGERS)
+            _canonical_schema_sql = {
+                name: (kind, sql)
+                for kind, name, sql in reference.execute(
+                    "SELECT type, name, sql FROM sqlite_master "
+                    f"WHERE type = 'view' OR (type = 'trigger' AND name IN ({placeholders}))",
+                    _MANAGED_TRIGGERS,
+                )
+            }
+        finally:
+            reference.close()
+    return _canonical_schema_sql
+
+
+def _replace_drifted_schema_objects(conn: sqlite3.Connection, kind: str) -> None:
+    """Recreate managed views or triggers whose stored SQL is not canonical."""
+    stored = {
+        row[0]: row[1]
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = ?", (kind,)
+        )
+    }
+    for name, (object_kind, sql) in _canonical_managed_schema().items():
+        if object_kind != kind or stored.get(name) == sql:
+            continue
+        conn.execute(f"DROP {kind.upper()} IF EXISTS {_quote_identifier(name)}")
+        conn.execute(sql)
 
 
 def _now_iso() -> str:
@@ -1895,13 +2016,18 @@ def _migrate_message_claim_occurrences(conn: sqlite3.Connection) -> None:
 
     The legacy winner is retained as an occurrence. A token-version resync
     subsequently repopulates unchanged losing claimants from available source
-    or shared transcripts. Marking the native refresh pending preserves the
-    interrupted-sync recovery contract across this schema transition.
+    or shared transcripts. Queueing every session for a native refresh
+    preserves the interrupted-sync recovery contract across this schema
+    transition.
     """
     columns = _table_columns(conn, "message_claims")
     if "owner_session_id" in columns and "session_id" not in columns:
         conn.execute("DROP VIEW IF EXISTS message_claim_owners")
         conn.execute("DROP INDEX IF EXISTS idx_message_claims_owner_day")
+        # The delete trigger names message_claims.session_id, which the
+        # legacy table lacks, and SQLite rejects the RENAME below while any
+        # trigger body fails to resolve. migrate_db recreates it at the end.
+        conn.execute("DROP TRIGGER IF EXISTS sessions_message_claims_cleanup")
         conn.execute("ALTER TABLE message_claims RENAME TO message_claims__winners")
         conn.execute(
             """
@@ -1960,8 +2086,8 @@ def _migrate_message_claim_occurrences(conn: sqlite3.Connection) -> None:
         )
         conn.execute("DROP TABLE message_claims__winners")
         conn.execute(
-            "INSERT OR REPLACE INTO logpile_meta (key, value) "
-            "VALUES ('native_refresh_pending', '1')"
+            "INSERT OR IGNORE INTO native_refresh_queue (session_id) "
+            "SELECT session_id FROM sessions"
         )
     else:
         _ensure_column(
@@ -1971,22 +2097,173 @@ def _migrate_message_claim_occurrences(conn: sqlite3.Connection) -> None:
             "INTEGER NOT NULL DEFAULT 0",
         )
 
-    changes_before_cleanup = conn.total_changes
-    conn.execute(
-        "DELETE FROM message_claims "
-        "WHERE session_id NOT IN (SELECT session_id FROM sessions)"
-    )
-    if conn.total_changes != changes_before_cleanup:
+
+def _drop_orphan_message_claims(conn: sqlite3.Connection) -> None:
+    """Remove claims whose session row is gone and queue what that can move.
+
+    message_claim_owners joins sessions, so an orphan never owned a message
+    and deleting it changes no owner. The live claimants of the same keys are
+    queued anyway: they are the sessions whose native_* went stale when the
+    orphan's session was deleted without a refresh. The sessions delete
+    trigger now does this at delete time, so only rows written before that
+    trigger existed (or by hand) can still be orphaned.
+    """
+    orphan_ids = [
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT session_id FROM message_claims "
+            "WHERE session_id NOT IN (SELECT session_id FROM sessions)"
+        )
+    ]
+    for chunk in _chunked(orphan_ids):
+        placeholders = ",".join("?" for _ in chunk)
         conn.execute(
-            "INSERT OR REPLACE INTO logpile_meta (key, value) "
-            "VALUES ('native_refresh_pending', '1')"
+            f"""
+            INSERT OR IGNORE INTO native_refresh_queue (session_id)
+            SELECT DISTINCT other.session_id
+            FROM message_claims AS mine
+            CROSS JOIN message_claims AS other ON other.claim_key = mine.claim_key
+            WHERE mine.session_id IN ({placeholders})
+              AND other.session_id IN (SELECT session_id FROM sessions)
+            """,
+            chunk,
+        )
+        conn.execute(
+            f"DELETE FROM message_claims WHERE session_id IN ({placeholders})",
+            chunk,
         )
 
 
-def migrate_db(conn: sqlite3.Connection) -> None:
-    conn.create_function(
-        "normalize_username_py", 1, lambda value: normalize_username(value or "")
+def _repair_legacy_rows(conn: sqlite3.Connection) -> None:
+    """Heal row states that only older Logpile versions wrote.
+
+    Each statement is guarded by its own WHERE clause, so on a database that
+    needs nothing they read without writing; the version gate in migrate_db
+    keeps them from rereading every table on every sync.
+    """
+    # Before explicit raw thread fields existed, Codex stored the thread UUID
+    # in parent_session_id. Preserve that only lineage evidence when it is not
+    # already an exact canonical session key; the sync resolver will either
+    # map it after identity backfill or leave canonical parent_session_id NULL.
+    conn.execute(
+        """
+        UPDATE sessions AS child
+        SET parent_thread_id = child.parent_session_id
+        WHERE child.source = 'codex'
+          AND child.parent_thread_id IS NULL
+          AND child.parent_session_id IS NOT NULL
+          AND child.parent_session_id != ''
+          AND NOT EXISTS (
+              SELECT 1 FROM sessions AS parent
+              WHERE parent.session_id = child.parent_session_id
+          )
+        """
     )
+    _drop_orphan_message_claims(conn)
+    for table in ("sessions", "session_daily_usage", "message_claims"):
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET cache_creation_unknown_input_tokens = CASE
+                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
+                         <= cache_creation_input_tokens
+                    THEN cache_creation_input_tokens
+                         - cache_creation_5m_input_tokens
+                         - cache_creation_1h_input_tokens
+                    ELSE cache_creation_input_tokens
+                END,
+                cache_creation_5m_input_tokens = CASE
+                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
+                         <= cache_creation_input_tokens
+                    THEN cache_creation_5m_input_tokens ELSE 0
+                END,
+                cache_creation_1h_input_tokens = CASE
+                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
+                         <= cache_creation_input_tokens
+                    THEN cache_creation_1h_input_tokens ELSE 0
+                END
+            WHERE cache_creation_5m_input_tokens
+                + cache_creation_1h_input_tokens
+                + cache_creation_unknown_input_tokens
+                != cache_creation_input_tokens
+            """
+        )
+    for table in ("sessions", "session_daily_usage"):
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET native_cache_creation_unknown_input_tokens = CASE
+                    WHEN native_cache_creation_5m_input_tokens
+                       + native_cache_creation_1h_input_tokens
+                         <= native_cache_creation_input_tokens
+                    THEN native_cache_creation_input_tokens
+                       - native_cache_creation_5m_input_tokens
+                       - native_cache_creation_1h_input_tokens
+                    ELSE native_cache_creation_input_tokens
+                END,
+                native_cache_creation_5m_input_tokens = CASE
+                    WHEN native_cache_creation_5m_input_tokens
+                       + native_cache_creation_1h_input_tokens
+                         <= native_cache_creation_input_tokens
+                    THEN native_cache_creation_5m_input_tokens ELSE 0
+                END,
+                native_cache_creation_1h_input_tokens = CASE
+                    WHEN native_cache_creation_5m_input_tokens
+                       + native_cache_creation_1h_input_tokens
+                         <= native_cache_creation_input_tokens
+                    THEN native_cache_creation_1h_input_tokens ELSE 0
+                END
+            WHERE native_cache_creation_5m_input_tokens
+                + native_cache_creation_1h_input_tokens
+                + native_cache_creation_unknown_input_tokens
+                != native_cache_creation_input_tokens
+            """
+        )
+    # Give pre-claims rows sane native values immediately (mirror transcript
+    # totals) so aggregate readers never see zeros between the column
+    # migration and the first full re-parse.
+    _refresh_native_mirror(conn)
+
+
+def _guarded_update(
+    conn: sqlite3.Connection,
+    table: str,
+    assignments: dict[str, str],
+    params: dict[str, object] | None = None,
+) -> None:
+    """UPDATE only the rows where some assignment would change a value.
+
+    Each expression is evaluated against the pre-update row in both SET and
+    WHERE, so a row is written exactly when at least one of its assigned
+    columns would change. An UPDATE that rewrites an indexed column with its
+    current value still rewrites that index entry, so the guard is what
+    makes a repeated migration read-only.
+    """
+    set_sql = ",\n            ".join(
+        f"{column} = {expression}" for column, expression in assignments.items()
+    )
+    where_sql = "\n           OR ".join(
+        f"({expression}) IS NOT {column}" for column, expression in assignments.items()
+    )
+    conn.execute(
+        f"UPDATE {table}\n        SET {set_sql}\n        WHERE {where_sql}",
+        params or {},
+    )
+
+
+def _schema_version(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("PRAGMA schema_version").fetchone()[0])
+
+
+def migrate_db(conn: sqlite3.Connection) -> None:
+    """Bring any Logpile database to the current schema.
+
+    Every sync runs this, so on a database that is already current it must
+    not write: each data repair either only matches rows that need it or is
+    gated on a logpile_meta version key, and views and triggers are replaced
+    only when their stored definition differs.
+    """
+    schema_version_at_start = _schema_version(conn)
     search_index_existed = bool(
         conn.execute(
             "SELECT 1 FROM sqlite_master "
@@ -2136,24 +2413,6 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         "TEXT NOT NULL DEFAULT 'unreviewed'",
     )
     _ensure_column(conn, "publication_reviews", "reviewed_metadata_sha256", "TEXT")
-    # Before explicit raw thread fields existed, Codex stored the thread UUID
-    # in parent_session_id. Preserve that only lineage evidence when it is not
-    # already an exact canonical session key; the sync resolver will either
-    # map it after identity backfill or leave canonical parent_session_id NULL.
-    conn.execute(
-        """
-        UPDATE sessions AS child
-        SET parent_thread_id = child.parent_session_id
-        WHERE child.source = 'codex'
-          AND child.parent_thread_id IS NULL
-          AND child.parent_session_id IS NOT NULL
-          AND child.parent_session_id != ''
-          AND NOT EXISTS (
-              SELECT 1 FROM sessions AS parent
-              WHERE parent.session_id = child.parent_session_id
-          )
-        """
-    )
     _ensure_column(conn, "sessions", "file_size", "INTEGER")
     _ensure_column(conn, "sessions", "file_mtime", "REAL")
     # Set by sync when a full parse recomputes a row's structural fields; see
@@ -2174,164 +2433,87 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             conn, "session_daily_usage", native_column, "INTEGER NOT NULL DEFAULT 0"
         )
     _migrate_message_claim_occurrences(conn)
-    for table in ("sessions", "session_daily_usage", "message_claims"):
-        conn.execute(
-            f"""
-            UPDATE {table}
-            SET cache_creation_unknown_input_tokens = CASE
-                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
-                         <= cache_creation_input_tokens
-                    THEN cache_creation_input_tokens
-                         - cache_creation_5m_input_tokens
-                         - cache_creation_1h_input_tokens
-                    ELSE cache_creation_input_tokens
-                END,
-                cache_creation_5m_input_tokens = CASE
-                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
-                         <= cache_creation_input_tokens
-                    THEN cache_creation_5m_input_tokens ELSE 0
-                END,
-                cache_creation_1h_input_tokens = CASE
-                    WHEN cache_creation_5m_input_tokens + cache_creation_1h_input_tokens
-                         <= cache_creation_input_tokens
-                    THEN cache_creation_1h_input_tokens ELSE 0
-                END
-            WHERE cache_creation_5m_input_tokens
-                + cache_creation_1h_input_tokens
-                + cache_creation_unknown_input_tokens
-                != cache_creation_input_tokens
-            """
-        )
-    for table in ("sessions", "session_daily_usage"):
-        conn.execute(
-            f"""
-            UPDATE {table}
-            SET native_cache_creation_unknown_input_tokens = CASE
-                    WHEN native_cache_creation_5m_input_tokens
-                       + native_cache_creation_1h_input_tokens
-                         <= native_cache_creation_input_tokens
-                    THEN native_cache_creation_input_tokens
-                       - native_cache_creation_5m_input_tokens
-                       - native_cache_creation_1h_input_tokens
-                    ELSE native_cache_creation_input_tokens
-                END,
-                native_cache_creation_5m_input_tokens = CASE
-                    WHEN native_cache_creation_5m_input_tokens
-                       + native_cache_creation_1h_input_tokens
-                         <= native_cache_creation_input_tokens
-                    THEN native_cache_creation_5m_input_tokens ELSE 0
-                END,
-                native_cache_creation_1h_input_tokens = CASE
-                    WHEN native_cache_creation_5m_input_tokens
-                       + native_cache_creation_1h_input_tokens
-                         <= native_cache_creation_input_tokens
-                    THEN native_cache_creation_1h_input_tokens ELSE 0
-                END
-            WHERE native_cache_creation_5m_input_tokens
-                + native_cache_creation_1h_input_tokens
-                + native_cache_creation_unknown_input_tokens
-                != native_cache_creation_input_tokens
-            """
-        )
-    # Give pre-claims rows sane native values immediately (mirror transcript
-    # totals) so aggregate readers never see zeros between the column
-    # migration and the first full re-parse.
-    _refresh_native_mirror(conn)
-    conn.execute(
-        """
-        UPDATE sessions
-        SET workspace_root = CASE
+    # A migration that just changed the schema is upgrading an older database,
+    # so it gets every repair again, exactly as its first run always did.
+    if (
+        get_meta(conn, _DATA_REPAIR_META_KEY) != str(DATA_REPAIR_VERSION)
+        or _schema_version(conn) != schema_version_at_start
+    ):
+        _repair_legacy_rows(conn)
+        set_meta(conn, _DATA_REPAIR_META_KEY, str(DATA_REPAIR_VERSION))
+    _guarded_update(
+        conn,
+        "sessions",
+        {
+            "workspace_root": """CASE
             WHEN workspace_root IS NOT NULL AND workspace_root != '' THEN workspace_root
             WHEN project LIKE '/%' OR project LIKE '~/%' THEN project
             ELSE workspace_root
-        END
-        """
+        END"""
+        },
     )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET worktree_root = CASE
+    _guarded_update(
+        conn,
+        "sessions",
+        {
+            "worktree_root": """CASE
             WHEN worktree_root IS NOT NULL AND worktree_root != '' THEN worktree_root
             WHEN workspace_root IS NOT NULL AND workspace_root != '' THEN workspace_root
             ELSE worktree_root
-        END
-        """
+        END"""
+        },
     )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET git_dirty = CASE
-            WHEN git_dirty IS NULL THEN 0
-            ELSE git_dirty
-        END
-        """
-    )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET activity_version = CASE
-            WHEN activity_version IS NULL THEN 0
-            ELSE activity_version
-        END
-        """
-    )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET narrative_version = CASE
-            WHEN narrative_version IS NULL THEN 0
-            ELSE narrative_version
-        END
-        """
-    )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET objective_version = CASE
-            WHEN objective_version IS NULL THEN 0
-            ELSE objective_version
-        END
-        """
-    )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET origin_version = CASE
-            WHEN origin_version IS NULL THEN 0
-            ELSE origin_version
-        END
-        """
-    )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET session_status = CASE
+    # Each of these expressions reads only its own column, so one guarded
+    # statement (one pass over sessions) has the effect of running them one
+    # at a time.
+    _guarded_update(
+        conn,
+        "sessions",
+        {
+            **{
+                column: f"COALESCE({column}, 0)"
+                for column in (
+                    "git_dirty",
+                    "activity_version",
+                    "narrative_version",
+                    "objective_version",
+                    "origin_version",
+                )
+            },
+            "session_status": """CASE
             WHEN session_status IN ('exploration', 'success', 'partial', 'failed')
             THEN session_status
             ELSE 'exploration'
-        END
-        """
-    )
-    conn.execute(
-        f"""
-        UPDATE sessions
-        SET session_origin = CASE
+        END""",
+            "session_origin": f"""CASE
             WHEN session_origin IN ({", ".join(repr(origin) for origin in SESSION_ORIGINS)})
             THEN session_origin
             ELSE 'human_direct'
-        END
-        """
+        END""",
+        },
     )
     # Repair legacy flags and invalid stored values through the same guarded
     # API as live commands. This keeps even migration-time tightening audited.
+    # The WHERE clause selects a superset of the rows the loop body repairs
+    # (every row whose stored pair is not already canonical), so the loop no
+    # longer reads every session into Python on every migration.
     for visibility_row in conn.execute(
-        "SELECT session_id, visibility, is_private FROM sessions ORDER BY session_id"
+        """
+        SELECT session_id, visibility, is_private
+        FROM sessions
+        WHERE visibility IS NULL
+           OR visibility NOT IN ('private', 'unlisted', 'public')
+           OR COALESCE(is_private, 0)
+              != CASE WHEN visibility = 'private' THEN 1 ELSE 0 END
+        ORDER BY session_id
+        """
     ).fetchall():
-        raw_visibility = visibility_row["visibility"]
+        raw_visibility = visibility_row[1]
+        is_private = visibility_row[2]
         normalized_visibility = (
             str(raw_visibility).strip().lower() if raw_visibility is not None else ""
         )
-        if visibility_row["is_private"] == 1:
+        if is_private == 1:
             desired_visibility = "private"
         elif normalized_visibility in SESSION_VISIBILITIES:
             desired_visibility = normalized_visibility
@@ -2340,61 +2522,69 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         expected_private = 1 if desired_visibility == "private" else 0
         if (
             raw_visibility != desired_visibility
-            or (visibility_row["is_private"] or 0) != expected_private
+            or (is_private or 0) != expected_private
         ):
             transition_session_visibility(
                 conn,
-                visibility_row["session_id"],
+                visibility_row[0],
                 desired_visibility,
                 shared_dir=None,
                 transition_source="migration",
                 reason="legacy visibility normalized closed",
                 manage_storage=False,
             )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET visibility_source = CASE
+    _guarded_update(
+        conn,
+        "sessions",
+        {
+            "visibility_source": """CASE
                 WHEN visibility_source IN ('manual', 'rule', 'default', 'marker', 'drift', 'migration')
                 THEN visibility_source
                 WHEN visibility IN ('private', 'unlisted') OR is_private = 1 THEN 'manual'
                 ELSE 'default'
-            END,
-            visibility_rule_id = CASE
+            END""",
+            "visibility_rule_id": """CASE
                 WHEN visibility_source = 'rule' THEN visibility_rule_id
                 ELSE NULL
-            END,
-            visibility_reason = CASE
+            END""",
+            "visibility_reason": """CASE
                 WHEN visibility_reason IS NOT NULL AND visibility_reason != '' THEN visibility_reason
                 WHEN visibility IN ('private', 'unlisted') OR is_private = 1 THEN 'legacy manual'
                 ELSE 'legacy default'
-            END
-        """
+            END""",
+        },
     )
-    conn.execute(
-        """
-        UPDATE users
-        SET display_name = COALESCE(NULLIF(display_name, ''), username),
-            profile_visibility = CASE
+    _guarded_update(
+        conn,
+        "users",
+        {
+            "display_name": "COALESCE(NULLIF(display_name, ''), username)",
+            "profile_visibility": """CASE
                 WHEN profile_visibility IN ('private', 'unlisted', 'public') THEN profile_visibility
                 ELSE 'private'
-            END,
-            default_session_visibility = CASE
+            END""",
+            "default_session_visibility": """CASE
                 WHEN default_session_visibility IN ('private', 'unlisted', 'public')
                 THEN default_session_visibility
                 ELSE 'unlisted'
-            END,
-            created_at = COALESCE(NULLIF(created_at, ''), ?),
-            updated_at = COALESCE(NULLIF(updated_at, ''), ?)
-        """,
-        (_now_iso(), _now_iso()),
+            END""",
+            "created_at": "COALESCE(NULLIF(created_at, ''), :created_at)",
+            "updated_at": "COALESCE(NULLIF(updated_at, ''), :updated_at)",
+        },
+        {"created_at": _now_iso(), "updated_at": _now_iso()},
     )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET username = normalize_username_py(username)
-        """
-    )
+    # Only a handful of distinct usernames exist, and idx_sessions_username
+    # lists them without reading session rows; rows are rewritten only for a
+    # spelling that normalization would change.
+    for (raw_username,) in conn.execute(
+        "SELECT DISTINCT username FROM sessions"
+    ).fetchall():
+        normalized_username = normalize_username(raw_username or "")
+        if normalized_username != raw_username:
+            conn.execute(
+                "UPDATE sessions SET username = ? WHERE username IS ?",
+                (normalized_username, raw_username),
+            )
     for session_id in legacy_missing_visibility_ids:
         transition_session_visibility(
             conn,
@@ -2405,10 +2595,11 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             reason="legacy schema lacked an explicit visibility value",
             manage_storage=False,
         )
-    conn.execute(
-        """
-        UPDATE sessions
-        SET publication_state = CASE
+    _guarded_update(
+        conn,
+        "sessions",
+        {
+            "publication_state": """CASE
             WHEN reviewed_sha256 IS NOT NULL
              AND reviewed_artifact_path IS NOT NULL
              AND file_hash IS NOT NULL
@@ -2421,8 +2612,8 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             THEN 'source_drift'
             WHEN visibility = 'private' THEN 'revoked'
             ELSE 'unreviewed'
-        END
-        """
+        END"""
+        },
     )
     # Legacy public rows have no enforceable review record.  Migrate them
     # closed to local/link-only unlisted through the same audited guard used
@@ -2440,8 +2631,13 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     ).fetchall():
         current_metadata_sha256 = publication_metadata_sha256(public_row)
         conn.execute(
-            "UPDATE sessions SET publication_metadata_sha256 = ? WHERE session_id = ?",
-            (current_metadata_sha256, public_row["session_id"]),
+            "UPDATE sessions SET publication_metadata_sha256 = ? "
+            "WHERE session_id = ? AND publication_metadata_sha256 IS NOT ?",
+            (
+                current_metadata_sha256,
+                public_row["session_id"],
+                current_metadata_sha256,
+            ),
         )
     legacy_public_ids = [
         row[0]
@@ -2492,13 +2688,10 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             (session_id,),
         )
     conn.executescript(INDEXES)
-    conn.executescript(VIEWS)
+    _replace_drifted_schema_objects(conn, "view")
     # Create search triggers only after the optional legacy identity rebuild,
     # which can replace the sessions table and drop table-bound triggers.
-    search_generation_row = conn.execute(
-        "SELECT value FROM logpile_meta WHERE key = 'search_fts_generation'"
-    ).fetchone()
-    search_generation = search_generation_row[0] if search_generation_row else None
+    search_generation = get_meta(conn, "search_fts_generation")
     reset_search_storage = not search_index_existed or search_generation != str(
         SEARCH_INDEX_VERSION
     )
@@ -2509,14 +2702,8 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         # beside an empty FTS term index. Canonical search data is derived, so
         # discard it and let the bounded sync backfill rebuild session by
         # session rather than running one uninterruptible whole-index rebuild.
-        conn.execute(
-            "INSERT OR REPLACE INTO logpile_meta (key, value) VALUES (?, ?)",
-            ("search_fts_generation", f"rebuilding:{SEARCH_INDEX_VERSION}"),
-        )
-        conn.execute(
-            "INSERT OR REPLACE INTO logpile_meta (key, value) "
-            "VALUES ('search_refresh_pending', '1')"
-        )
+        set_meta(conn, "search_fts_generation", f"rebuilding:{SEARCH_INDEX_VERSION}")
+        set_meta(conn, "search_refresh_pending", "1")
         conn.commit()
         conn.executescript(
             """
@@ -2530,22 +2717,14 @@ def migrate_db(conn: sqlite3.Connection) -> None:
             DROP TABLE IF EXISTS session_search_state;
             """
         )
-    conn.execute("DROP TRIGGER IF EXISTS sessions_search_stale")
     conn.executescript(SEARCH_SCHEMA)
+    conn.executescript(SESSION_TRIGGERS)
+    _replace_drifted_schema_objects(conn, "trigger")
     _ensure_column(conn, "session_search_state", "artifact_hash", "TEXT")
-    conn.execute(
-        "INSERT OR REPLACE INTO logpile_meta (key, value) VALUES (?, ?)",
-        ("search_fts_generation", str(SEARCH_INDEX_VERSION)),
-    )
-    search_version_row = conn.execute(
-        "SELECT value FROM logpile_meta WHERE key = 'search_index_version'"
-    ).fetchone()
-    search_version = search_version_row[0] if search_version_row else None
+    set_meta(conn, "search_fts_generation", str(SEARCH_INDEX_VERSION))
+    search_version = get_meta(conn, "search_index_version")
     if reset_search_storage or search_version != str(SEARCH_INDEX_VERSION):
-        conn.execute(
-            "INSERT OR REPLACE INTO logpile_meta (key, value) "
-            "VALUES ('search_refresh_pending', '1')"
-        )
+        set_meta(conn, "search_refresh_pending", "1")
 
 
 class _StorageTransactionConnection(sqlite3.Connection):
@@ -3013,7 +3192,46 @@ def upsert_session(conn, data: dict):
             warnings.warn(result.warning, RuntimeWarning, stacklevel=2)
 
 
+# Columns of session_daily_usage derived from the transcript (everything
+# except the key and the native_* columns refresh_native_usage owns).
+_DAILY_VALUE_COLUMNS = (
+    "total_input_tokens",
+    "total_output_tokens",
+    "fresh_input_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_creation_5m_input_tokens",
+    "cache_creation_1h_input_tokens",
+    "cache_creation_unknown_input_tokens",
+    "reasoning_output_tokens",
+    "user_message_count",
+    "assistant_message_count",
+    "tool_call_count",
+    "approximated",
+)
+_INSERT_DAILY_SQL = f"""
+    INSERT INTO session_daily_usage (session_id, day, {", ".join(_DAILY_VALUE_COLUMNS)})
+    VALUES (?, ?, {", ".join("?" for _ in _DAILY_VALUE_COLUMNS)})
+"""
+
+
+def _daily_values(day) -> tuple:
+    """The stored transcript-derived values of one DailyUsage slice."""
+    return (
+        *(getattr(day, column) for column in _DAILY_VALUE_COLUMNS[:-1]),
+        1 if day.approximated else 0,
+    )
+
+
 def insert_session_daily_usage(conn, session_id: str, daily_usage: list):
+    """Make the session's day rows match ``daily_usage``, writing only changes.
+
+    The end state equals deleting every row and inserting ``daily_usage``,
+    except that native_* on surviving rows keeps its value until the next
+    refresh_native_usage for the session: a day whose transcript columns are
+    unchanged is not written, a changed day is updated in place, and a day
+    that vanished is deleted.
+    """
     daily_usage = list(daily_usage)
     session_row = conn.execute(
         """
@@ -3066,43 +3284,54 @@ def insert_session_daily_usage(conn, session_id: str, daily_usage: list):
                 f"cache-creation daily split does not reconcile for {session_id} "
                 f"on {day.day}: {split} != {cache_creation}"
             )
-    conn.execute("DELETE FROM session_daily_usage WHERE session_id = ?", (session_id,))
-    if not daily_usage:
+    desired = {day.day: _daily_values(day) for day in daily_usage}
+    if len(desired) != len(daily_usage):
+        # Two slices for one day violate the (session_id, day) key. Take the
+        # original delete-and-insert path so the same IntegrityError surfaces.
+        conn.execute(
+            "DELETE FROM session_daily_usage WHERE session_id = ?", (session_id,)
+        )
+        conn.executemany(
+            _INSERT_DAILY_SQL,
+            [(session_id, day.day, *_daily_values(day)) for day in daily_usage],
+        )
         return
-    conn.executemany(
-        """
-        INSERT INTO session_daily_usage (
-            session_id, day,
-            total_input_tokens, total_output_tokens,
-            fresh_input_tokens, cached_input_tokens,
-            cache_creation_input_tokens, cache_creation_5m_input_tokens,
-            cache_creation_1h_input_tokens,
-            cache_creation_unknown_input_tokens, reasoning_output_tokens,
-            user_message_count, assistant_message_count, tool_call_count,
-            approximated
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                session_id,
-                d.day,
-                d.total_input_tokens,
-                d.total_output_tokens,
-                d.fresh_input_tokens,
-                d.cached_input_tokens,
-                d.cache_creation_input_tokens,
-                d.cache_creation_5m_input_tokens,
-                d.cache_creation_1h_input_tokens,
-                d.cache_creation_unknown_input_tokens,
-                d.reasoning_output_tokens,
-                d.user_message_count,
-                d.assistant_message_count,
-                d.tool_call_count,
-                1 if d.approximated else 0,
-            )
-            for d in daily_usage
-        ],
-    )
+    # native_* is left alone: sync recomputes it with refresh_native_usage for
+    # every session it writes, and that recomputes every native column of
+    # every day row of the session from claims or transcript totals.
+    stored = {
+        row[0]: tuple(row[1:])
+        for row in conn.execute(
+            f"SELECT day, {', '.join(_DAILY_VALUE_COLUMNS)} "
+            "FROM session_daily_usage WHERE session_id = ?",
+            (session_id,),
+        )
+    }
+    vanished = [(session_id, day) for day in stored if day not in desired]
+    if vanished:
+        conn.executemany(
+            "DELETE FROM session_daily_usage WHERE session_id = ? AND day = ?",
+            vanished,
+        )
+    changed = [
+        (*values, session_id, day)
+        for day, values in desired.items()
+        if day in stored and stored[day] != values
+    ]
+    if changed:
+        assignments = ", ".join(f"{column} = ?" for column in _DAILY_VALUE_COLUMNS)
+        conn.executemany(
+            f"UPDATE session_daily_usage SET {assignments} "
+            "WHERE session_id = ? AND day = ?",
+            changed,
+        )
+    added = [
+        (session_id, day, *values)
+        for day, values in desired.items()
+        if day not in stored
+    ]
+    if added:
+        conn.executemany(_INSERT_DAILY_SQL, added)
 
 
 def _chunked(values: list, size: int = 500):
@@ -3121,6 +3350,29 @@ def _session_rank(last_timestamp, first_timestamp, session_id) -> tuple[str, str
     return (last_timestamp or "~", first_timestamp or "~", session_id)
 
 
+# Every session holding a claim on a touched key. Driving the join from the
+# small temp table turns each key into a (claim_key, session_id) primary-key
+# range search; left to itself, SQLite (no sqlite_stat1) scanned the whole
+# claims index once per call instead.
+_TOUCHED_CLAIMANTS_SQL = """
+    SELECT DISTINCT claims.session_id
+    FROM _logpile_touched_message_claims AS touched
+    CROSS JOIN message_claims AS claims ON claims.claim_key = touched.claim_key
+"""
+
+_CLAIM_VALUE_COLUMNS = (
+    "day",
+    "model",
+    "fresh_input_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_creation_5m_input_tokens",
+    "cache_creation_1h_input_tokens",
+    "cache_creation_unknown_input_tokens",
+    "output_tokens",
+)
+
+
 def apply_message_claims(conn, session_id: str, message_usage) -> set[str]:
     """Replace one session's occurrences and return every possibly stale owner.
 
@@ -3129,6 +3381,9 @@ def apply_message_claims(conn, session_id: str, message_usage) -> set[str]:
     drops a winning key or changes a session rank immediately promotes an
     unchanged loser. Returning every claimant for touched keys makes the
     scoped native refresh correct before and after any such ownership change.
+
+    Only claim rows whose values change are written: an identical occurrence
+    is neither updated nor deleted and reinserted.
     """
     # Stage the current iterable in SQLite rather than converting it to a
     # list/set. Claude's parser deliberately returns a disk-backed reusable
@@ -3238,24 +3493,22 @@ def apply_message_claims(conn, session_id: str, message_usage) -> set[str]:
     ):
         return set()
 
+    # Claimants are read once, before this session's rows change. The only
+    # rows written below belong to session_id, which is already in the set,
+    # so a second read afterwards (as this code once did) finds nobody new:
+    # another session claims a touched key after the write exactly when it
+    # did before.
     affected: set[str] = {session_id}
-
-    def add_current_claimants() -> None:
-        affected.update(
-            row[0]
-            for row in conn.execute(
-                """
-                SELECT DISTINCT claims.session_id
-                FROM message_claims AS claims
-                JOIN _logpile_touched_message_claims AS touched
-                  ON touched.claim_key = claims.claim_key
-                """
-            )
-        )
-
-    add_current_claimants()
+    affected.update(row[0] for row in conn.execute(_TOUCHED_CLAIMANTS_SQL))
+    update_set = ",\n            ".join(
+        f"{column} = excluded.{column}" for column in _CLAIM_VALUE_COLUMNS
+    )
+    changed = "\n           OR ".join(
+        f"message_claims.{column} IS NOT excluded.{column}"
+        for column in _CLAIM_VALUE_COLUMNS
+    )
     conn.execute(
-        """
+        f"""
         INSERT INTO message_claims (
             claim_key, session_id, day, model,
             fresh_input_tokens, cached_input_tokens,
@@ -3271,18 +3524,8 @@ def apply_message_claims(conn, session_id: str, message_usage) -> set[str]:
         FROM _logpile_current_message_claims
         WHERE 1
         ON CONFLICT(claim_key, session_id) DO UPDATE SET
-            day = excluded.day,
-            model = excluded.model,
-            fresh_input_tokens = excluded.fresh_input_tokens,
-            cached_input_tokens = excluded.cached_input_tokens,
-            cache_creation_input_tokens = excluded.cache_creation_input_tokens,
-            cache_creation_5m_input_tokens =
-                excluded.cache_creation_5m_input_tokens,
-            cache_creation_1h_input_tokens =
-                excluded.cache_creation_1h_input_tokens,
-            cache_creation_unknown_input_tokens =
-                excluded.cache_creation_unknown_input_tokens,
-            output_tokens = excluded.output_tokens
+            {update_set}
+        WHERE {changed}
         """,
         (session_id,),
     )
@@ -3297,7 +3540,6 @@ def apply_message_claims(conn, session_id: str, message_usage) -> set[str]:
         """,
         (session_id,),
     )
-    add_current_claimants()
     return affected
 
 
@@ -3391,6 +3633,8 @@ def refresh_native_usage(conn, session_ids=None) -> None:
 
     Restricted to session_ids when given (the set whose claims or transcript
     columns changed this sync); None recomputes everything. Idempotent.
+    A refreshed session no longer owes anything, so its native_refresh_queue
+    entry is removed in the same transaction (every entry, for None).
     """
     if session_ids is not None and not session_ids:
         return
@@ -3401,138 +3645,543 @@ def refresh_native_usage(conn, session_ids=None) -> None:
     for chunk in chunks:
         _refresh_native_mirror(conn, chunk)
         _refresh_native_claims(conn, chunk)
+        if chunk is None:
+            conn.execute("DELETE FROM native_refresh_queue")
+        else:
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                f"DELETE FROM native_refresh_queue WHERE session_id IN ({placeholders})",
+                sorted(chunk),
+            )
+
+
+def queue_native_refresh(conn, session_ids: Iterable[str]) -> None:
+    """Durably record that these sessions' native_* columns must be recomputed.
+
+    The entries commit with the caller's transaction and stay until
+    refresh_native_usage (or drain_native_refresh) recomputes the session or
+    the session row is deleted.
+    """
+    if isinstance(session_ids, str):
+        raise TypeError("queue_native_refresh takes an iterable of session ids")
+    conn.executemany(
+        "INSERT OR IGNORE INTO native_refresh_queue (session_id) VALUES (?)",
+        ((session_id,) for session_id in session_ids),
+    )
+
+
+def _adopt_legacy_native_refresh_flag(conn) -> None:
+    """Turn an older sync's pending full-refresh flag into queue entries.
+
+    Before native_refresh_queue, a sync set native_refresh_pending='1' when it
+    started and '0' once its refresh finished, so anything but '0' means a
+    sync died and every session's native_* is suspect. Enqueue them all once
+    and clear the flag; a flag that stays '0' asks for nothing.
+    """
+    if get_meta(conn, _LEGACY_NATIVE_REFRESH_FLAG) in (None, "0"):
+        return
+    conn.execute(
+        "INSERT OR IGNORE INTO native_refresh_queue (session_id) "
+        "SELECT session_id FROM sessions"
+    )
+    set_meta(conn, _LEGACY_NATIVE_REFRESH_FLAG, "0")
+
+
+def drain_native_refresh(
+    conn, *, deadline: float | None = None, chunk_size: int = 500
+) -> int:
+    """Refresh queued sessions chunk by chunk; return how many remain queued.
+
+    Each chunk is recomputed with refresh_native_usage, which also removes the
+    chunk's queue entries, and then committed, so an interrupted drain keeps
+    every finished chunk. The commit also commits whatever the caller had
+    pending on ``conn``. ``deadline`` is a time.monotonic() value; the drain
+    checks it before each chunk and stops once it is reached.
+    """
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be at least 1")
+    _adopt_legacy_native_refresh_flag(conn)
+    while deadline is None or time.monotonic() < deadline:
+        chunk = [
+            row[0]
+            for row in conn.execute(
+                "SELECT session_id FROM native_refresh_queue ORDER BY session_id LIMIT ?",
+                (chunk_size,),
+            )
+        ]
+        if not chunk:
+            break
+        refresh_native_usage(conn, chunk)
+        conn.commit()
+    return int(conn.execute("SELECT COUNT(*) FROM native_refresh_queue").fetchone()[0])
 
 
 def get_meta(conn, key: str) -> str | None:
     row = conn.execute(
         "SELECT value FROM logpile_meta WHERE key = ?", (key,)
     ).fetchone()
-    return row["value"] if row else None
+    return row[0] if row else None
 
 
 def set_meta(conn, key: str, value: str | None) -> None:
+    """Store a meta value, writing nothing when it is already stored."""
     if value is None:
         conn.execute("DELETE FROM logpile_meta WHERE key = ?", (key,))
     else:
         conn.execute(
-            "INSERT OR REPLACE INTO logpile_meta (key, value) VALUES (?, ?)",
+            """
+            INSERT INTO logpile_meta (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            WHERE logpile_meta.value IS NOT excluded.value
+            """,
             (key, value),
         )
 
 
+_TOOL_CALL_COLUMNS = ("tool_name", "command", "timestamp", "is_error")
+# Stored rows are compared a page at a time; each page is fetched in full
+# before any write so no cursor is open on tool_calls while it changes.
+_TOOL_CALL_PAGE_ROWS = 1000
+
+
+def _update_changed_columns(
+    conn, table: str, columns: tuple[str, ...], changes: Iterable[tuple]
+) -> None:
+    """Apply (row_id, stored_values, new_values) triples column-minimally.
+
+    Rows are grouped by which columns actually differ and each group is one
+    UPDATE of just those columns, so an unchanged indexed column is never
+    part of the SET list and its index entry is left alone.
+    """
+    groups: dict[tuple[str, ...], list[tuple]] = {}
+    for row_id, stored, new in changes:
+        differing = tuple(
+            index
+            for index, (old_value, new_value) in enumerate(
+                zip(stored, new, strict=True)
+            )
+            if old_value != new_value
+        )
+        if differing:
+            groups.setdefault(tuple(columns[i] for i in differing), []).append(
+                (*(new[i] for i in differing), row_id)
+            )
+    for changed_columns, rows in groups.items():
+        assignments = ", ".join(f"{column} = ?" for column in changed_columns)
+        conn.executemany(f"UPDATE {table} SET {assignments} WHERE id = ?", rows)
+
+
 def insert_tool_calls(conn, session_id: str, tool_calls):
-    conn.execute("DELETE FROM tool_calls WHERE session_id = ?", (session_id,))
+    """Make the session's tool_calls rows, in id order, equal ``tool_calls``.
+
+    Rows are matched by position: a stored row equal to the call at its
+    position keeps its id and is not written, a differing one is updated in
+    place, calls past the stored rows are appended (AUTOINCREMENT ids only
+    grow, so they sort after every kept row), and stored rows past the last
+    call are deleted. ``tool_calls`` is iterated exactly once, so a lazy,
+    disk-backed sequence is streamed rather than loaded.
+    """
+    calls = iter(tool_calls)
+    exhausted = object()
+    last_id = None
+    while True:
+        if last_id is None:
+            page = conn.execute(
+                "SELECT id, tool_name, command, timestamp, is_error FROM tool_calls "
+                "WHERE session_id = ? ORDER BY id LIMIT ?",
+                (session_id, _TOOL_CALL_PAGE_ROWS),
+            ).fetchall()
+        else:
+            page = conn.execute(
+                "SELECT id, tool_name, command, timestamp, is_error FROM tool_calls "
+                "WHERE session_id = ? AND id > ? ORDER BY id LIMIT ?",
+                (session_id, last_id, _TOOL_CALL_PAGE_ROWS),
+            ).fetchall()
+        if not page:
+            break
+        changes: list[tuple] = []
+        for row in page:
+            call = next(calls, exhausted)
+            if call is exhausted:
+                _update_changed_columns(conn, "tool_calls", _TOOL_CALL_COLUMNS, changes)
+                conn.execute(
+                    "DELETE FROM tool_calls WHERE session_id = ? AND id >= ?",
+                    (session_id, row[0]),
+                )
+                return
+            desired = _tool_call_values(call)
+            stored = tuple(row[1:])
+            if stored != desired:
+                changes.append((row[0], stored, desired))
+        _update_changed_columns(conn, "tool_calls", _TOOL_CALL_COLUMNS, changes)
+        last_id = page[-1][0]
     conn.executemany(
         "INSERT INTO tool_calls (session_id, tool_name, command, timestamp, is_error) VALUES (?,?,?,?,?)",
-        (
-            (
-                session_id,
-                tc.tool_name,
-                tc.command,
-                tc.timestamp,
-                1 if tc.is_error else 0,
-            )
-            for tc in tool_calls
-        ),
+        ((session_id, *_tool_call_values(call)) for call in calls),
     )
 
 
+def _tool_call_values(call) -> tuple:
+    return (call.tool_name, call.command, call.timestamp, 1 if call.is_error else 0)
+
+
+# Staging schema for insert_session_paths. ``current`` aggregates the parsed
+# paths exactly as the old per-session temp table did; ``stored`` copies the
+# session's existing rows under the same key, plus their ids. Both live in a
+# private scratch database, not on ``conn``, so diffing writes nothing to the
+# index database (and adds nothing to conn.total_changes) beyond the changes.
+_SESSION_PATH_STAGING_SCHEMA = """
+CREATE TABLE current (
+    normalized_path TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    source TEXT NOT NULL,
+    tool_name_missing INTEGER NOT NULL,
+    tool_name_key TEXT NOT NULL,
+    raw_path TEXT NOT NULL,
+    relative_path TEXT,
+    repo_relative_path TEXT,
+    display_path TEXT NOT NULL,
+    first_timestamp TEXT,
+    last_timestamp TEXT,
+    occurrence_count INTEGER NOT NULL,
+    PRIMARY KEY (
+        normalized_path, operation, source,
+        tool_name_missing, tool_name_key
+    )
+) WITHOUT ROWID;
+
+CREATE TABLE stored (
+    normalized_path TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    source TEXT NOT NULL,
+    tool_name_missing INTEGER NOT NULL,
+    tool_name_key TEXT NOT NULL,
+    id INTEGER NOT NULL,
+    raw_path TEXT NOT NULL,
+    relative_path TEXT,
+    repo_relative_path TEXT,
+    display_path TEXT NOT NULL,
+    first_timestamp TEXT,
+    last_timestamp TEXT,
+    occurrence_count INTEGER NOT NULL,
+    PRIMARY KEY (
+        normalized_path, operation, source,
+        tool_name_missing, tool_name_key, id
+    )
+) WITHOUT ROWID;
+"""
+
+_SESSION_PATH_VALUE_COLUMNS = (
+    "raw_path",
+    "relative_path",
+    "repo_relative_path",
+    "display_path",
+    "first_timestamp",
+    "last_timestamp",
+    "occurrence_count",
+)
+
+_SAME_PATH_KEY = """
+    {a}.normalized_path = {b}.normalized_path
+    AND {a}.operation = {b}.operation
+    AND {a}.source = {b}.source
+    AND {a}.tool_name_missing = {b}.tool_name_missing
+    AND {a}.tool_name_key = {b}.tool_name_key
+"""
+
+# The row that survives for a key is the stored row with the smallest id;
+# any duplicate of a key (which current writers never produce) is deleted.
+_KEPT_STORED_PATH = f"""
+    stored.id = (
+        SELECT MIN(twin.id) FROM stored AS twin
+        WHERE {_SAME_PATH_KEY.format(a="twin", b="stored")}
+    )
+"""
+
+
 def insert_session_paths(conn, session_id: str, session_paths):
-    conn.execute("DELETE FROM session_paths WHERE session_id = ?", (session_id,))
+    """Make the session's session_paths rows match ``session_paths``.
+
+    Paths are aggregated per (normalized_path, operation, source, tool_name):
+    the earliest and latest non-NULL timestamps, the occurrence count, and
+    the raw/relative/repo-relative/display spelling of the first occurrence.
+    The resulting rows equal what deleting and reinserting the aggregate
+    would produce. Only rows whose aggregate changed are written: an
+    unchanged key keeps its row and id, a changed key is updated in place
+    (only its differing columns), a new key is inserted, and a vanished key
+    is deleted. Row ids therefore no longer follow key order; no reader
+    orders session_paths by id.
+    """
     # Aggregate in SQLite so a transcript touching millions of unique paths
     # does not build an equally large Python dictionary (and then a second
     # list for executemany). ``tool_name_missing`` keeps None distinct from
     # the empty string while still giving the WITHOUT ROWID table a fully
-    # non-null primary key equivalent to the old tuple key.
-    conn.execute(
-        """
-        CREATE TEMP TABLE IF NOT EXISTS _logpile_current_session_paths (
-            normalized_path TEXT NOT NULL,
-            operation TEXT NOT NULL,
-            source TEXT NOT NULL,
-            tool_name_missing INTEGER NOT NULL,
-            tool_name_key TEXT NOT NULL,
-            raw_path TEXT NOT NULL,
-            relative_path TEXT,
-            repo_relative_path TEXT,
-            display_path TEXT NOT NULL,
-            first_timestamp TEXT,
-            last_timestamp TEXT,
-            occurrence_count INTEGER NOT NULL,
-            PRIMARY KEY (
+    # non-null primary key equivalent to the old tuple key. An empty
+    # filename opens a private on-disk scratch database that SQLite deletes
+    # on close, so staging spills to disk instead of the heap.
+    with closing(sqlite3.connect("")) as staging:
+        staging.executescript(_SESSION_PATH_STAGING_SCHEMA)
+
+        def staged_rows():
+            for path in session_paths:
+                missing_tool_name = 1 if path.tool_name is None else 0
+                yield (
+                    path.normalized_path,
+                    path.operation,
+                    path.source,
+                    missing_tool_name,
+                    "" if missing_tool_name else path.tool_name,
+                    path.raw_path,
+                    path.relative_path,
+                    getattr(path, "repo_relative_path", None),
+                    path.display_path,
+                    path.timestamp,
+                    path.timestamp,
+                    1,
+                )
+
+        staging.executemany(
+            """
+            INSERT INTO current (
+                normalized_path, operation, source,
+                tool_name_missing, tool_name_key, raw_path,
+                relative_path, repo_relative_path, display_path,
+                first_timestamp, last_timestamp, occurrence_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (
                 normalized_path, operation, source,
                 tool_name_missing, tool_name_key
-            )
-        ) WITHOUT ROWID
-        """
-    )
-    conn.execute("DELETE FROM _logpile_current_session_paths")
+            ) DO UPDATE SET
+                first_timestamp = CASE
+                    WHEN excluded.first_timestamp IS NULL
+                        THEN current.first_timestamp
+                    WHEN current.first_timestamp IS NULL
+                      OR excluded.first_timestamp < current.first_timestamp
+                        THEN excluded.first_timestamp
+                    ELSE current.first_timestamp
+                END,
+                last_timestamp = CASE
+                    WHEN excluded.last_timestamp IS NULL
+                        THEN current.last_timestamp
+                    WHEN current.last_timestamp IS NULL
+                      OR excluded.last_timestamp > current.last_timestamp
+                        THEN excluded.last_timestamp
+                    ELSE current.last_timestamp
+                END,
+                occurrence_count = current.occurrence_count + 1
+            """,
+            staged_rows(),
+        )
+        staging.executemany(
+            """
+            INSERT INTO stored (
+                id, normalized_path, operation, source,
+                tool_name_missing, tool_name_key, raw_path,
+                relative_path, repo_relative_path, display_path,
+                first_timestamp, last_timestamp, occurrence_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            conn.execute(
+                """
+                SELECT id, normalized_path, operation, source,
+                       CASE WHEN tool_name IS NULL THEN 1 ELSE 0 END,
+                       COALESCE(tool_name, ''), raw_path,
+                       relative_path, repo_relative_path, display_path,
+                       first_timestamp, last_timestamp, occurrence_count
+                FROM session_paths WHERE session_id = ?
+                """,
+                (session_id,),
+            ),
+        )
+        conn.executemany(
+            "DELETE FROM session_paths WHERE id = ?",
+            staging.execute(
+                f"""
+                SELECT stored.id FROM stored
+                WHERE NOT ({_KEPT_STORED_PATH})
+                   OR NOT EXISTS (
+                       SELECT 1 FROM current
+                       WHERE {_SAME_PATH_KEY.format(a="current", b="stored")}
+                   )
+                """
+            ),
+        )
+        value_columns = ", ".join(
+            f"current.{column}" for column in _SESSION_PATH_VALUE_COLUMNS
+        )
+        stored_columns = ", ".join(
+            f"stored.{column}" for column in _SESSION_PATH_VALUE_COLUMNS
+        )
+        differs = " OR ".join(
+            f"stored.{column} IS NOT current.{column}"
+            for column in _SESSION_PATH_VALUE_COLUMNS
+        )
+        _update_changed_columns(
+            conn,
+            "session_paths",
+            _SESSION_PATH_VALUE_COLUMNS,
+            (
+                (row[0], row[1 : 1 + width], row[1 + width :])
+                for width in (len(_SESSION_PATH_VALUE_COLUMNS),)
+                for row in staging.execute(
+                    f"""
+                    SELECT stored.id, {stored_columns}, {value_columns}
+                    FROM stored
+                    JOIN current ON {_SAME_PATH_KEY.format(a="current", b="stored")}
+                    WHERE {_KEPT_STORED_PATH} AND ({differs})
+                    """
+                )
+            ),
+        )
+        conn.executemany(
+            """
+            INSERT INTO session_paths (
+                session_id, raw_path, normalized_path, relative_path,
+                repo_relative_path, display_path, operation, source,
+                tool_name, first_timestamp, last_timestamp, occurrence_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (session_id, *row)
+                for row in staging.execute(
+                    f"""
+                    SELECT raw_path, normalized_path, relative_path,
+                           repo_relative_path, display_path, operation, source,
+                           CASE WHEN tool_name_missing = 1 THEN NULL ELSE tool_name_key END,
+                           first_timestamp, last_timestamp, occurrence_count
+                    FROM current
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM stored
+                        WHERE {_SAME_PATH_KEY.format(a="stored", b="current")}
+                    )
+                    ORDER BY normalized_path, operation, source,
+                             tool_name_missing, tool_name_key
+                    """
+                )
+            ),
+        )
 
-    def staged_rows():
-        for path in session_paths:
-            missing_tool_name = 1 if path.tool_name is None else 0
-            yield (
-                path.normalized_path,
-                path.operation,
-                path.source,
-                missing_tool_name,
-                "" if missing_tool_name else path.tool_name,
-                path.raw_path,
-                path.relative_path,
-                getattr(path, "repo_relative_path", None),
-                path.display_path,
-                path.timestamp,
-                path.timestamp,
-                1,
-            )
 
-    conn.executemany(
+def get_transcript_checkpoint(
+    conn, source_path: str
+) -> tuple[ParseCheckpoint, str] | None:
+    """Return the stored (checkpoint, state_file) for a transcript, if any."""
+    row = conn.execute(
         """
-        INSERT INTO _logpile_current_session_paths (
-            normalized_path, operation, source,
-            tool_name_missing, tool_name_key, raw_path,
-            relative_path, repo_relative_path, display_path,
-            first_timestamp, last_timestamp, occurrence_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (
-            normalized_path, operation, source,
-            tool_name_missing, tool_name_key
-        ) DO UPDATE SET
-            first_timestamp = CASE
-                WHEN excluded.first_timestamp IS NULL
-                    THEN _logpile_current_session_paths.first_timestamp
-                WHEN _logpile_current_session_paths.first_timestamp IS NULL
-                  OR excluded.first_timestamp
-                     < _logpile_current_session_paths.first_timestamp
-                    THEN excluded.first_timestamp
-                ELSE _logpile_current_session_paths.first_timestamp
-            END,
-            last_timestamp = CASE
-                WHEN excluded.last_timestamp IS NULL
-                    THEN _logpile_current_session_paths.last_timestamp
-                WHEN _logpile_current_session_paths.last_timestamp IS NULL
-                  OR excluded.last_timestamp
-                     > _logpile_current_session_paths.last_timestamp
-                    THEN excluded.last_timestamp
-                ELSE _logpile_current_session_paths.last_timestamp
-            END,
-            occurrence_count =
-                _logpile_current_session_paths.occurrence_count + 1
+        SELECT parse_offset, parse_prefix_sha256, parse_generation,
+               dev, ino, parse_version, state_file
+        FROM transcript_checkpoints WHERE source_path = ?
         """,
-        staged_rows(),
+        (source_path,),
+    ).fetchone()
+    if row is None:
+        return None
+    checkpoint = ParseCheckpoint(
+        offset=int(row[0]),
+        prefix_sha256=row[1],
+        generation=row[2],
+        dev=int(row[3]),
+        ino=int(row[4]),
+        version=int(row[5]),
     )
+    return checkpoint, row[6]
+
+
+def put_transcript_checkpoint(
+    conn,
+    *,
+    source_path: str,
+    session_id: str,
+    source: str,
+    checkpoint: ParseCheckpoint,
+    state_file: str,
+    file_mtime: float | None,
+    now: str,
+) -> None:
+    """Insert or replace the checkpoint for ``source_path``.
+
+    An identical stored checkpoint (``now`` aside) is left unwritten.
+    """
     conn.execute(
         """
-        INSERT INTO session_paths (
-            session_id, raw_path, normalized_path, relative_path,
-            repo_relative_path, display_path, operation, source,
-            tool_name, first_timestamp, last_timestamp, occurrence_count
-        )
-        SELECT ?, raw_path, normalized_path, relative_path,
-               repo_relative_path, display_path, operation, source,
-               CASE WHEN tool_name_missing = 1 THEN NULL ELSE tool_name_key END,
-               first_timestamp, last_timestamp, occurrence_count
-        FROM _logpile_current_session_paths
+        INSERT INTO transcript_checkpoints (
+            source_path, session_id, source, dev, ino,
+            parse_offset, parse_prefix_sha256, parse_generation,
+            parse_version, state_file, file_mtime, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_path) DO UPDATE SET
+            session_id = excluded.session_id,
+            source = excluded.source,
+            dev = excluded.dev,
+            ino = excluded.ino,
+            parse_offset = excluded.parse_offset,
+            parse_prefix_sha256 = excluded.parse_prefix_sha256,
+            parse_generation = excluded.parse_generation,
+            parse_version = excluded.parse_version,
+            state_file = excluded.state_file,
+            file_mtime = excluded.file_mtime,
+            updated_at = excluded.updated_at
+        WHERE transcript_checkpoints.session_id IS NOT excluded.session_id
+           OR transcript_checkpoints.source IS NOT excluded.source
+           OR transcript_checkpoints.dev IS NOT excluded.dev
+           OR transcript_checkpoints.ino IS NOT excluded.ino
+           OR transcript_checkpoints.parse_offset IS NOT excluded.parse_offset
+           OR transcript_checkpoints.parse_prefix_sha256
+              IS NOT excluded.parse_prefix_sha256
+           OR transcript_checkpoints.parse_generation IS NOT excluded.parse_generation
+           OR transcript_checkpoints.parse_version IS NOT excluded.parse_version
+           OR transcript_checkpoints.state_file IS NOT excluded.state_file
+           OR transcript_checkpoints.file_mtime IS NOT excluded.file_mtime
         """,
-        (session_id,),
+        (
+            source_path,
+            session_id,
+            source,
+            checkpoint.dev,
+            checkpoint.ino,
+            checkpoint.offset,
+            checkpoint.prefix_sha256,
+            checkpoint.generation,
+            checkpoint.version,
+            state_file,
+            file_mtime,
+            now,
+        ),
     )
+
+
+def delete_transcript_checkpoint(conn, source_path: str) -> None:
+    conn.execute(
+        "DELETE FROM transcript_checkpoints WHERE source_path = ?", (source_path,)
+    )
+
+
+_CHECKPOINT_PAGE_ROWS = 500
+
+
+def iter_transcript_checkpoints(conn) -> Iterator[tuple[str, str, float | None]]:
+    """Yield (source_path, state_file, file_mtime) for every checkpoint.
+
+    Rows are read a page at a time in source_path order, with no cursor left
+    open between pages, so a caller may delete checkpoints while iterating
+    (garbage collection of state files does exactly that).
+    """
+    last_path: str | None = None
+    while True:
+        if last_path is None:
+            page = conn.execute(
+                "SELECT source_path, state_file, file_mtime FROM transcript_checkpoints "
+                "ORDER BY source_path LIMIT ?",
+                (_CHECKPOINT_PAGE_ROWS,),
+            ).fetchall()
+        else:
+            page = conn.execute(
+                "SELECT source_path, state_file, file_mtime FROM transcript_checkpoints "
+                "WHERE source_path > ? ORDER BY source_path LIMIT ?",
+                (last_path, _CHECKPOINT_PAGE_ROWS),
+            ).fetchall()
+        if not page:
+            return
+        for row in page:
+            yield row[0], row[1], row[2]
+        last_path = page[-1][0]
