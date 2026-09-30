@@ -2530,6 +2530,9 @@ def migrate_db(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TRIGGER IF EXISTS sessions_search_stale")
     conn.executescript(SEARCH_SCHEMA)
     _ensure_column(conn, "session_search_state", "artifact_hash", "TEXT")
+    from .search import ensure_search_checkpoint_columns  # search imports db
+
+    ensure_search_checkpoint_columns(conn)
     conn.execute(
         "INSERT OR REPLACE INTO logpile_meta (key, value) VALUES (?, ?)",
         ("search_fts_generation", str(SEARCH_INDEX_VERSION)),
