@@ -3691,7 +3691,11 @@ def _adopt_legacy_native_refresh_flag(conn) -> None:
 
 
 def drain_native_refresh(
-    conn, *, deadline: float | None = None, chunk_size: int = 500
+    conn,
+    *,
+    deadline: float | None = None,
+    chunk_size: int = 500,
+    should_stop=None,
 ) -> int:
     """Refresh queued sessions chunk by chunk; return how many remain queued.
 
@@ -3699,12 +3703,15 @@ def drain_native_refresh(
     chunk's queue entries, and then committed, so an interrupted drain keeps
     every finished chunk. The commit also commits whatever the caller had
     pending on ``conn``. ``deadline`` is a time.monotonic() value; the drain
-    checks it before each chunk and stops once it is reached.
+    checks it, and the optional ``should_stop`` callable, before each chunk
+    and stops once either says so.
     """
     if chunk_size < 1:
         raise ValueError("chunk_size must be at least 1")
     _adopt_legacy_native_refresh_flag(conn)
     while deadline is None or time.monotonic() < deadline:
+        if should_stop is not None and should_stop():
+            break
         chunk = [
             row[0]
             for row in conn.execute(

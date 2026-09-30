@@ -10,9 +10,10 @@ import json
 import os
 import tempfile
 import unittest
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 
+import legacy_parsers
 from hypothesis import HealthCheck, event, given, settings
 from hypothesis import strategies as st
 
@@ -37,6 +38,7 @@ TIMESTAMPS = st.sampled_from(
         "2026-09-29T10:15:00.123Z",
         "2026-09-30T08:00:00+02:00",
         "not-a-time",
+        "",
         None,
     ]
 )
@@ -298,14 +300,32 @@ codex_records = st.tuples(codex_head, st.lists(codex_body, max_size=14)).map(
 )
 
 
-def _serialize(records, trailing_newline, junk_line):
+def _serialize(records, trailing_newline, junk_line, newline="\n"):
     lines = [json.dumps(record, ensure_ascii=False) for record in records]
     if junk_line is not None and lines:
         lines.insert(junk_line % (len(lines) + 1), '{"truncated": ')
-    data = "\n".join(lines)
+    data = newline.join(lines)
     if lines and trailing_newline:
-        data += "\n"
+        data += newline
     return data.encode("utf-8")
+
+
+NEWLINES = st.sampled_from(["\n", "\r\n", "\r"])
+
+
+def _plain(info):
+    """Compare parse results across the new and the frozen legacy module."""
+    if info is None:
+        return None
+    if hasattr(info, "marker"):
+        return ("marker", info.session_id, info.source, info.marker)
+    data = {}
+    for item in fields(info):
+        value = getattr(info, item.name)
+        if item.name in {"tool_calls", "session_paths", "daily_usage", "message_usage"}:
+            value = [asdict(entry) for entry in value]
+        data[item.name] = value
+    return data
 
 
 def _materialize(info):
@@ -378,11 +398,12 @@ class IncrementalParseTests(unittest.TestCase):
         trailing_newline=st.booleans(),
         junk_line=st.one_of(st.none(), st.integers(0, 20)),
         cuts=st.lists(st.integers(0, 6000), max_size=5),
+        newline=NEWLINES,
     )
     def test_claude_incremental_equals_full_parse(
-        self, records, trailing_newline, junk_line, cuts
+        self, records, trailing_newline, junk_line, cuts, newline
     ):
-        data = _serialize(records, trailing_newline, junk_line)
+        data = _serialize(records, trailing_newline, junk_line, newline)
         event(f"resumed={self._run_appends('claudecode', data, cuts)}")
 
     @settings(
@@ -395,12 +416,59 @@ class IncrementalParseTests(unittest.TestCase):
         trailing_newline=st.booleans(),
         junk_line=st.one_of(st.none(), st.integers(0, 20)),
         cuts=st.lists(st.integers(0, 6000), max_size=5),
+        newline=NEWLINES,
     )
     def test_codex_incremental_equals_full_parse(
-        self, records, trailing_newline, junk_line, cuts
+        self, records, trailing_newline, junk_line, cuts, newline
     ):
-        data = _serialize(records, trailing_newline, junk_line)
+        data = _serialize(records, trailing_newline, junk_line, newline)
         event(f"resumed={self._run_appends('codex', data, cuts)}")
+
+    @settings(
+        max_examples=150,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+    )
+    @given(
+        source=st.sampled_from(["claudecode", "codex"]),
+        claude=claude_records,
+        codex=codex_records,
+        trailing_newline=st.booleans(),
+        junk_line=st.one_of(st.none(), st.integers(0, 20)),
+        newline=NEWLINES,
+    )
+    def test_streaming_parsers_match_the_legacy_two_pass_parsers(
+        self, source, claude, codex, trailing_newline, junk_line, newline
+    ):
+        records = claude if source == "claudecode" else codex
+        path = self.root / f"{source}-legacy.jsonl"
+        path.write_bytes(_serialize(records, trailing_newline, junk_line, newline))
+        legacy = (
+            legacy_parsers.parse_claudecode_session
+            if source == "claudecode"
+            else legacy_parsers.parse_codex_session
+        )(path)
+        self.assertEqual(_plain(FULL_PARSERS[source](path)), _plain(legacy))
+
+    def test_codex_empty_timestamps_match_the_legacy_parser(self):
+        path = self._write(
+            "empty-ts.jsonl",
+            [
+                {"type": "session_meta", "timestamp": "", "payload": {"id": "x"}},
+                {
+                    "type": "response_item",
+                    "timestamp": "",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hello there"}],
+                    },
+                },
+            ],
+        )
+        info = parse_codex_session(path)
+        self.assertEqual(info.first_timestamp, "")
+        self.assertEqual(_plain(info), _plain(legacy_parsers.parse_codex_session(path)))
 
     def _write(self, name, lines):
         path = self.root / name

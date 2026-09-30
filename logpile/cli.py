@@ -659,6 +659,30 @@ def show_command(session_id, backend, db, db_url, limit, json_output):
         raise click.ClickException(str(exc))
 
 
+class _BudgetSeconds(click.ParamType):
+    """Seconds as a non-negative number, or none/off/unlimited for no budget."""
+
+    name = "seconds"
+
+    def convert(self, value, param, ctx):
+        if isinstance(value, (int, float)):
+            number = float(value)
+        else:
+            text = str(value).strip().lower()
+            if text in {"none", "off", "unlimited"}:
+                return 0.0
+            try:
+                number = float(text)
+            except ValueError:
+                self.fail(f"{value!r} is not a number of seconds or 'off'", param, ctx)
+        if number < 0:
+            self.fail("the budget cannot be negative", param, ctx)
+        return number
+
+
+_BUDGET = _BudgetSeconds()
+
+
 @cli.command()
 @click.option(
     "--shared",
@@ -708,12 +732,13 @@ def show_command(session_id, backend, db, db_url, limit, json_output):
 @click.option(
     "--budget",
     "budget_seconds",
-    type=click.FloatRange(min=0),
+    type=_BUDGET,
     envvar="LOGPILE_SYNC_BUDGET_SECONDS",
-    default=900.0,
+    default="900",
     show_default=True,
-    help="Wall-clock budget in seconds for the local sync (0 = unlimited). "
-    "A sync that runs out stops at a session boundary; the next run resumes.",
+    help="Wall-clock budget in seconds for the local sync (0, none, off or "
+    "unlimited for no budget). A sync that runs out stops at a session "
+    "boundary; the next run resumes.",
 )
 @click.option(
     "--min-free-gib",

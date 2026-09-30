@@ -531,10 +531,11 @@ class SettledStructureTests(unittest.TestCase):
 
 class SyncLimitTests(unittest.TestCase):
     def _three_sessions(self, harness: SyncHarness) -> None:
-        for name in ("a", "b", "c"):
+        # Distinct message ids, so no claims (and no native refreshes) are shared.
+        for name, start in (("a", 0), ("b", 100), ("c", 200)):
             _append(
                 _claude_path(harness.home, f"session-{name}"),
-                _lines(_session_records(4)),
+                _lines(_session_records(4, start=start)),
             )
 
     def test_exhausted_budget_stops_after_one_session_and_converges(self):
@@ -645,6 +646,110 @@ class SyncLimitTests(unittest.TestCase):
             full.sync(FULL)
             self.assertEqual(harness.snapshot(), full.snapshot())
 
+    def test_stop_signal_skips_end_of_run_backfills(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = SyncHarness(Path(td), "tail")
+            self._three_sessions(harness)
+            harness.sync()
+            with closing(sqlite3.connect(harness.db)) as conn:
+                # Owed work from an earlier interrupted run.
+                conn.execute(
+                    "INSERT INTO native_refresh_queue (session_id) "
+                    "SELECT session_id FROM sessions"
+                )
+                conn.execute(
+                    "UPDATE session_search_state SET transcript_status = 'stale'"
+                )
+                conn.commit()
+            _append(
+                _claude_path(harness.home, "session-a"),
+                _lines(_session_records(1, start=4)),
+            )
+            real_parse = sync_module.parse_transcript
+
+            def parse_then_signal(*args, **kwargs):
+                os.kill(os.getpid(), signal.SIGTERM)
+                return real_parse(*args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    sync_module, "parse_transcript", side_effect=parse_then_signal
+                ),
+                mock.patch.object(
+                    sync_module,
+                    "drain_native_refresh",
+                    wraps=sync_module.drain_native_refresh,
+                ) as drain,
+            ):
+                result = harness.sync()
+            self.assertEqual(result.status, SyncStatus.PARTIAL)
+            self.assertEqual(result.reason, "received SIGTERM")
+            self.assertTrue(drain.call_args.kwargs["should_stop"]())
+            with closing(sqlite3.connect(harness.db)) as conn:
+                queued = conn.execute(
+                    "SELECT COUNT(*) FROM native_refresh_queue"
+                ).fetchone()[0]
+                stale = conn.execute(
+                    "SELECT COUNT(*) FROM session_search_state "
+                    "WHERE transcript_status = 'stale'"
+                ).fetchone()[0]
+            # This run's own session was refreshed; the rest stays owed.
+            self.assertEqual(queued, 2)
+            self.assertEqual(stale, 2)
+            self.assertEqual(harness.sync().status, SyncStatus.COMPLETED)
+
+    def test_second_sigterm_restores_the_default_disposition(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = SyncHarness(Path(td), "term2")
+            self._three_sessions(harness)
+            seen = []
+            real_parse = sync_module.parse_transcript
+
+            def parse_then_signal(*args, **kwargs):
+                if not seen:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    seen.append(signal.getsignal(signal.SIGTERM))
+                return real_parse(*args, **kwargs)
+
+            previous = signal.getsignal(signal.SIGTERM)
+            with mock.patch.object(
+                sync_module, "parse_transcript", side_effect=parse_then_signal
+            ):
+                harness.sync()
+            # After the first SIGTERM the handler is gone: a second one gets
+            # whatever disposition the process had before sync started.
+            self.assertEqual(seen, [previous])
+
+    def test_cli_budget_accepts_off_and_rejects_nonsense(self):
+        from click.testing import CliRunner
+
+        from logpile.cli import cli
+        from logpile.sync import SyncResult
+
+        with tempfile.TemporaryDirectory() as td:
+            args = [
+                "sync",
+                "--db",
+                str(Path(td) / "x.db"),
+                "--shared",
+                str(Path(td) / "shared"),
+                "--username",
+                "alice",
+            ]
+            for raw, expected in (("off", None), ("0", None), ("120", 120.0)):
+                with mock.patch(
+                    "logpile.sync.sync_sessions", return_value=SyncResult(0, 0, 0)
+                ) as sync:
+                    result = CliRunner().invoke(
+                        cli, args, env={"LOGPILE_SYNC_BUDGET_SECONDS": raw}
+                    )
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertEqual(
+                    sync.call_args.kwargs["limits"].budget_seconds, expected
+                )
+            result = CliRunner().invoke(cli, [*args, "--budget", "-1"])
+            self.assertEqual(result.exit_code, 2)
+
     def test_limits_from_env(self):
         limits = SyncLimits.from_env(
             {
@@ -706,6 +811,37 @@ class ArchivalCopyRaceTests(unittest.TestCase):
 
 
 class ParseStateCollectionTests(unittest.TestCase):
+    def test_marker_private_session_keeps_no_parse_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = SyncHarness(Path(td), "marker")
+            path = _claude_path(harness.home, "session-a")
+            _append(path, _lines(_session_records(4)))
+            harness.sync()
+            state_dir = parse_state_dir(harness.db)
+            self.assertEqual(len(list(state_dir.iterdir())), 1)
+            marker = "logpile" + ":private"
+            _append(
+                path,
+                _lines(
+                    [
+                        {
+                            "type": "user",
+                            "timestamp": "2026-09-29T11:00:00Z",
+                            "message": {"content": f"keep this {marker}"},
+                        }
+                    ]
+                ),
+            )
+            harness.sync()
+            self.assertEqual(list(state_dir.iterdir()), [])
+            with closing(sqlite3.connect(harness.db)) as conn:
+                visibility, checkpoints = conn.execute(
+                    "SELECT visibility, (SELECT COUNT(*) FROM transcript_checkpoints) "
+                    "FROM sessions"
+                ).fetchone()
+            self.assertEqual(visibility, "private")
+            self.assertEqual(checkpoints, 0)
+
     def test_damaged_state_file_falls_back_to_a_full_parse(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

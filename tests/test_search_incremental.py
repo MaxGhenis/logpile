@@ -1070,7 +1070,7 @@ class SearchBackfillTests(unittest.TestCase):
         self.assertTrue(_documents(self.conn, "a"))
         _assert_fts_consistent(self.conn)
 
-    def test_deadline_stops_after_a_batch_and_a_later_call_finishes(self):
+    def test_deadline_stops_after_one_transcript_and_a_later_call_finishes(self):
         names = [f"s{index}" for index in range(5)]
         # One load for all candidates, and one load per batch.
         for chunk in (2000, 2):
@@ -1083,8 +1083,11 @@ class SearchBackfillTests(unittest.TestCase):
                 for name in names:
                     self._session(name, f"{name} text")
                 expired = time.monotonic() - 1
+                # Past its deadline a call still indexes one transcript (so
+                # every call makes progress) and then stops, whatever the
+                # batch size.
                 first = backfill_search_index(self.conn, batch_size=2, deadline=expired)
-                self.assertEqual((first.indexed, first.deferred), (2, 3))
+                self.assertEqual((first.indexed, first.deferred), (1, 4))
                 # An interrupted pass is not recorded as a verification.
                 self.assertIsNone(get_meta(self.conn, "search_full_verify_at"))
                 self.assertFalse(self.conn.in_transaction)
@@ -1092,11 +1095,22 @@ class SearchBackfillTests(unittest.TestCase):
                 second = backfill_search_index(
                     self.conn, batch_size=2, deadline=expired
                 )
-                self.assertEqual((second.indexed, second.deferred), (2, 1))
+                self.assertEqual((second.indexed, second.deferred), (1, 3))
                 final = backfill_search_index(self.conn, batch_size=2)
-                self.assertEqual((final.indexed, final.deferred), (1, 0))
+                self.assertEqual((final.indexed, final.deferred), (3, 0))
                 self.assertIsNotNone(get_meta(self.conn, "search_full_verify_at"))
                 self.assertTrue(all(_is_current(self.conn, name) for name in names))
+
+    def test_should_stop_ends_backfill_before_any_transcript(self):
+        for name in ("s0", "s1", "s2"):
+            self._session(name, f"{name} text")
+        self.conn.commit()
+        stopped = backfill_search_index(self.conn, should_stop=lambda: True)
+        self.assertEqual((stopped.indexed, stopped.deferred), (0, 3))
+        self.assertIsNone(get_meta(self.conn, "search_full_verify_at"))
+        self.assertFalse(self.conn.in_transaction)
+        done = backfill_search_index(self.conn)
+        self.assertEqual((done.indexed, done.deferred), (3, 0))
 
     def test_verification_resumes_across_calls_one_chunk_at_a_time(self):
         names = [f"s{index}" for index in range(5)]

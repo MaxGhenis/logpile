@@ -6,6 +6,7 @@ import hashlib
 import os
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1019,12 +1020,14 @@ class _BackfillRun:
         batch_size: int,
         verbose: bool,
         deadline: float | None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> None:
         self.conn = conn
         self.shared_dir = shared_dir
         self.batch_size = max(1, batch_size)
         self.verbose = verbose
         self.deadline = deadline
+        self.should_stop = should_stop
         self.scanned = self.indexed = self.skipped = self.missing = 0
         self.errors = self.indexed_bytes = self.deferred = 0
         self.attempted_since_commit = 0
@@ -1033,7 +1036,17 @@ class _BackfillRun:
         self.attempted: set[str] = set()
 
     def deadline_passed(self) -> bool:
+        if self.should_stop is not None and self.should_stop():
+            return True
         return self.deadline is not None and time.monotonic() >= self.deadline
+
+    def must_stop_before_row(self) -> bool:
+        """``should_stop`` ends the run before any row; the deadline only
+        after this call has attempted one, so each call makes progress while
+        overrunning the deadline by at most one transcript."""
+        if self.should_stop is not None and self.should_stop():
+            return True
+        return bool(self.attempted) and self.deadline_passed()
 
     def commit(self) -> None:
         self.conn.commit()
@@ -1041,11 +1054,19 @@ class _BackfillRun:
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         self.attempted_since_commit = 0
 
+    def _defer_rest(self, rows: list[Any], start: int) -> None:
+        self.deferred += sum(
+            1
+            for rest in rows[start:]
+            if rest["session_id"] not in self.attempted and not _state_is_current(rest)
+        )
+
     def process(self, rows: list[Any]) -> int | None:
         """Index the stale rows in order.
 
         Returns None when every row was handled, or the position of the last
-        handled row when the deadline stopped the run at a batch commit.
+        handled row (-1 for none) when the deadline or ``should_stop`` ended
+        the run. Both are checked before every row (see must_stop_before_row).
         """
         for position, row in enumerate(rows):
             if row["session_id"] in self.attempted:
@@ -1054,18 +1075,18 @@ class _BackfillRun:
             if _state_is_current(row):
                 self.skipped += 1
                 continue
+            if self.must_stop_before_row():
+                if self.attempted_since_commit:
+                    self.commit()
+                self._defer_rest(rows, position)
+                return position - 1
             self.attempted.add(row["session_id"])
             self._index_row(row)
             self.attempted_since_commit += 1
             if self.attempted_since_commit >= self.batch_size:
                 self.commit()
                 if self.deadline_passed():
-                    self.deferred += sum(
-                        1
-                        for rest in rows[position + 1 :]
-                        if rest["session_id"] not in self.attempted
-                        and not _state_is_current(rest)
-                    )
+                    self._defer_rest(rows, position + 1)
                     return position
             done = self.indexed + self.missing + self.errors
             if self.verbose and done % 250 == 0:
@@ -1128,6 +1149,7 @@ def backfill_search_index(
     batch_size: int = 50,
     verbose: bool = False,
     deadline: float | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> SearchBackfillStats:
     """Resume the extracted-text index across every durable session row.
 
@@ -1138,10 +1160,12 @@ def backfill_search_index(
     rows at a time, and heals orphans in each chunk's id range; its cursor
     is committed after each chunk, so a pass spans as many calls as it needs.
 
-    ``deadline`` is a time.monotonic() value. Once it has passed, indexing
-    stops after the current batch commit, and verification after the
-    current chunk; either way each call makes progress. Stale rows known to
-    be left behind are reported as ``deferred``.
+    ``deadline`` is a time.monotonic() value. Once it has passed, no further
+    transcript is indexed after the first this call attempts, so each call
+    makes progress and overruns by at most one transcript. ``should_stop``
+    (a termination signal or low disk in sync) stops before any further
+    transcript. Finished work is committed and verification keeps its
+    cursor. Stale rows known to be left behind are reported as ``deferred``.
     """
     started = time.monotonic()
     now = datetime.now(UTC)
@@ -1151,6 +1175,7 @@ def backfill_search_index(
         batch_size=batch_size,
         verbose=verbose,
         deadline=deadline,
+        should_stop=should_stop,
     )
     candidates = _stale_candidate_ids(conn)
     stopped = None
@@ -1163,10 +1188,17 @@ def backfill_search_index(
             run.deferred += len(candidates[start + _BACKFILL_CHUNK :])
             break
     in_progress, cursor = _verification_cursor(conn)
-    if stopped is None and (in_progress or _full_verify_due(conn, now)):
+    if (
+        stopped is None
+        and not (run.should_stop is not None and run.should_stop())
+        and (in_progress or _full_verify_due(conn, now))
+    ):
         while True:
             chunk = _verification_chunk(conn, after=cursor)
             stopped = run.process(chunk)
+            if stopped == -1:
+                # Stopped before handling any row of this chunk.
+                break
             if stopped is not None:
                 # Heal up to the last handled row; the rest of the chunk is
                 # re-read from the cursor next time.

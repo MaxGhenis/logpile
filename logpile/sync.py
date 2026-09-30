@@ -266,20 +266,18 @@ class _SyncControl:
         )
         return None if decision.ok else decision.reason
 
-    def should_stop(self) -> bool:
+    def stop_requested(self) -> bool:
+        """A reason to stop now, whatever this run has finished: a stop
+        already decided, a termination signal, or free space below the floor.
+
+        End-of-run backfills take this as ``should_stop`` and the budget as
+        their ``deadline``, so a signal or low disk skips them outright."""
         if self.stop_reason is not None:
             return True
         if self.signal_name is not None:
             self.stop_reason = f"received {self.signal_name}"
             return True
         now = self._clock()
-        # Every run finishes at least one session before the budget can stop
-        # it, so a budget shorter than one session still converges.
-        if self.deadline is not None and now >= self.deadline and self.progress:
-            self.stop_reason = (
-                f"wall-clock budget of {self.limits.budget_seconds:.0f}s exhausted"
-            )
-            return True
         if self.limits.disk.enabled and now >= self._next_disk_check:
             self._next_disk_check = now + self.limits.disk_recheck_seconds
             if now >= self._next_snapshot_check:
@@ -297,14 +295,33 @@ class _SyncControl:
                 return True
         return False
 
+    def should_stop(self) -> bool:
+        """Whether to stop before the next session (or backfilled row)."""
+        if self.stop_requested():
+            return True
+        # Every run finishes at least one session before the budget can stop
+        # it, so a budget shorter than one session still converges.
+        if (
+            self.deadline is not None
+            and self._clock() >= self.deadline
+            and self.progress
+        ):
+            self.stop_reason = (
+                f"wall-clock budget of {self.limits.budget_seconds:.0f}s exhausted"
+            )
+            return True
+        return False
+
 
 @contextmanager
 def _graceful_termination(control: _SyncControl) -> Iterator[None]:
     """Turn the first SIGTERM into a cooperative stop at the next safe point.
 
     A launchd or supervisor SIGTERM would otherwise kill the process without
-    rolling back uncommitted storage moves. A second SIGTERM raises
-    KeyboardInterrupt, which takes the same rollback path as Ctrl-C.
+    rolling back uncommitted storage moves. The handler never raises (an
+    exception at an arbitrary bytecode could land between a commit and its
+    storage finalization); it restores the previous disposition, so a second
+    SIGTERM terminates the process as it would have without this handler.
     """
     if threading.current_thread() is not threading.main_thread():
         yield
@@ -312,9 +329,8 @@ def _graceful_termination(control: _SyncControl) -> Iterator[None]:
     previous = signal.getsignal(signal.SIGTERM)
 
     def handle(signum, _frame) -> None:
-        if control.signal_name is not None:
-            raise KeyboardInterrupt
         control.signal_name = signal.Signals(signum).name
+        signal.signal(signal.SIGTERM, previous)
 
     signal.signal(signal.SIGTERM, handle)
     try:
@@ -745,13 +761,14 @@ def _discard_temporary(path: Path) -> None:
         pass
 
 
-def _finalize_clone(src: Path, tmp: Path) -> bool:
+def _finalize_clone(src: Path, tmp: Path) -> tuple[int, int] | None:
     """Make a fresh clone private, regular, and durable before it is published.
 
     Clears the BSD flags the clone copied from its source, except
     UF_COMPRESSED, so the result matches the flag-free byte copy.  Returns
     False, and the caller discards the clone and byte-copies instead, when the
-    clone carries a flag only the superuser can clear or an extended ACL.  A
+    clone carries a flag only the superuser can clear or an extended ACL, and
+    otherwise returns the (st_dev, st_ino) it verified.  A
     clone never copies the source's ACL (CLONE_ACL is not passed), but
     clonefile(2) applies the destination directory's inheritable ACEs; the
     byte copy then receives the same inherited ACEs, so the fallback keeps
@@ -782,7 +799,7 @@ def _finalize_clone(src: Path, tmp: Path) -> bool:
             raise StorageSafetyError(f"Refusing replaced clone of {src}: {tmp}")
         file_flags = getattr(opened, "st_flags", 0)
         if file_flags & ~_UF_SETTABLE:
-            return False
+            return None
         if file_flags & ~_KEPT_CLONE_FLAGS:
             # Through the verified descriptor, never the path.
             apfs.set_file_flags(fd, file_flags & _KEPT_CLONE_FLAGS)
@@ -790,14 +807,14 @@ def _finalize_clone(src: Path, tmp: Path) -> bool:
                 raise StorageSafetyError(f"Could not clear clone flags on {tmp}")
         os.fchmod(fd, 0o600)
         if apfs.has_extended_acl(fd):
-            return False
+            return None
         os.fsync(fd)
     finally:
         os.close(fd)
-    return True
+    return (opened.st_dev, opened.st_ino)
 
 
-def _truncate_clone(tmp: Path, size: int) -> None:
+def _truncate_clone(tmp: Path, size: int, identity: tuple[int, int]) -> None:
     """Cut a fresh staging clone back to the bytes sync hashed.
 
     A live agent appends every few seconds, so the source can grow between
@@ -812,8 +829,9 @@ def _truncate_clone(tmp: Path, size: int) -> None:
     fd = os.open(tmp, flags)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise StorageSafetyError(f"Refusing to truncate non-regular clone: {tmp}")
+        # Only the exact file _finalize_clone verified may be truncated.
+        if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != identity:
+            raise StorageSafetyError(f"Refusing to truncate replaced clone: {tmp}")
         if info.st_size > size:
             os.ftruncate(fd, size)
             os.utime(fd, ns=(info.st_atime_ns, info.st_mtime_ns))
@@ -875,11 +893,12 @@ def _clone_to_temporary_sibling(
         raise StorageSafetyError(f"Could not reserve a clone name beside {dst}")
 
     try:
-        if not _finalize_clone(src, tmp):
+        identity = _finalize_clone(src, tmp)
+        if identity is None:
             _discard_temporary(tmp)
             return None
         if size_limit is not None:
-            _truncate_clone(tmp, size_limit)
+            _truncate_clone(tmp, size_limit, identity)
     except BaseException:
         _discard_temporary(tmp)
         raise
@@ -2281,6 +2300,8 @@ def _backfill_tokens_from_shared(
                 conn, row["session_id"], info.message_usage
             )
         backfilled += 1
+        if control is not None:
+            control.note_progress()
         if backfilled % 200 == 0:
             conn.commit()
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -2679,18 +2700,6 @@ class _ParseSlot:
         if self._parsed is not None:
             parsed, self._parsed = self._parsed, None
             parsed.close()
-
-
-def _dequeue_native_refresh(conn, session_ids) -> None:
-    ids = sorted(session_ids)
-    for start in range(0, len(ids), 500):
-        chunk = ids[start : start + 500]
-        conn.execute(
-            "DELETE FROM native_refresh_queue WHERE session_id IN ({})".format(
-                ",".join("?" * len(chunk))
-            ),
-            chunk,
-        )
 
 
 def _collect_parse_states(conn, state_dir: Path, limits: SyncLimits) -> None:
@@ -3131,6 +3140,7 @@ def _sync_sessions(
                         skipped_count += 1
                         continue
                     if isinstance(info, PrivateSessionMarker):
+                        delete_transcript_checkpoint(conn, str(jsonl_path))
                         if existing_row:
                             try:
                                 _tighten_private_marker(
@@ -3478,6 +3488,7 @@ def _sync_sessions(
                         skipped_count += 1
                         continue
                     if isinstance(info, PrivateSessionMarker):
+                        delete_transcript_checkpoint(conn, str(jsonl_path))
                         if existing_row:
                             try:
                                 _tighten_private_marker(
@@ -3718,7 +3729,6 @@ def _sync_sessions(
         # they always run: stats read right after a partial sync are current
         # for every session it touched.
         refresh_native_usage(conn, affected_native)
-        _dequeue_native_refresh(conn, affected_native)
 
         # Run committing batches only after all ordinary sync work and this
         # run's native refresh have succeeded. This preserves the existing
@@ -3726,12 +3736,15 @@ def _sync_sessions(
         # visibility/storage transitions instead of letting a backfill commit
         # them early. Refreshes owed by earlier, interrupted runs drain here
         # within the budget.
-        native_backlog = drain_native_refresh(conn, deadline=control.deadline)
+        native_backlog = drain_native_refresh(
+            conn, deadline=control.deadline, should_stop=control.stop_requested
+        )
         search_backfill = backfill_search_index(
             conn,
             shared_dir=shared_dir,
             verbose=verbose,
             deadline=control.deadline,
+            should_stop=control.stop_requested,
         )
         if search_backfill.indexed or search_backfill.missing or search_backfill.errors:
             gib = search_backfill.indexed_bytes / (1024**3)
