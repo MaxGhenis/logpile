@@ -1282,7 +1282,9 @@ class SearchIndexTests(unittest.TestCase):
             seen_paths: list[Path] = []
 
             def mutate_source_when_search_starts(path, source_kind):
-                seen_paths.append(Path(path))
+                # Search reads a byte range of the file as a text stream;
+                # the stream's name is the file it was opened from.
+                seen_paths.append(Path(getattr(path, "name", path)))
                 write_jsonl(source, [new_record])
                 return iter_session_search_text(path, source_kind)
 

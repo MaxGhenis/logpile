@@ -2846,6 +2846,8 @@ def _sync_sessions(
         default_visibility = (
             user_row["default_session_visibility"] if user_row else "unlisted"
         )
+        # Before loading rows, so this run already treats them as settled.
+        _stamp_settled_structure(conn)
         existing = {
             row["session_id"]: row
             for row in conn.execute(
@@ -2911,7 +2913,6 @@ def _sync_sessions(
         # resume from durable per-session state on an otherwise unchanged
         # next sync.
         set_meta(conn, "search_refresh_pending", "1")
-        _stamp_settled_structure(conn)
         conn.commit()
         state_dir = parse_state_dir(db_path)
         _secure_mkdir(state_dir)

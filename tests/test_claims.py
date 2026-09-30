@@ -694,20 +694,52 @@ class SyncClaimsIntegrationTests(unittest.TestCase):
                 self.assertEqual(parent["native_total_input_tokens"], 360)
                 self.assertEqual(parent["token_version"], SESSION_TOKEN_VERSION)
 
+    def test_interrupted_sync_queue_heals_on_next_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            home, shared, db_path = self._setup_chain(Path(td))
+            self._sync(home, shared, db_path)
+
+            with sqlite3.connect(db_path) as conn:
+                # Simulate a sync that died after committing rows (and the
+                # queue entries owed with them) but before its native refresh.
+                conn.execute(
+                    "UPDATE sessions SET native_total_input_tokens = 1"
+                    " WHERE session_id = 'zzz-parent'"
+                )
+                conn.execute(
+                    "INSERT INTO native_refresh_queue (session_id) VALUES ('zzz-parent')"
+                )
+                conn.commit()
+
+            self._sync(home, shared, db_path)  # no file changes
+
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                parent = conn.execute(
+                    "SELECT native_total_input_tokens FROM sessions"
+                    " WHERE session_id = 'zzz-parent'"
+                ).fetchone()
+                self.assertEqual(parent["native_total_input_tokens"], 360)
+                queued = conn.execute(
+                    "SELECT COUNT(*) FROM native_refresh_queue"
+                ).fetchone()[0]
+                self.assertEqual(queued, 0)
+
     def test_interrupted_sync_flag_forces_full_heal(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             home, shared, db_path = self._setup_chain(Path(td))
             self._sync(home, shared, db_path)
 
             with sqlite3.connect(db_path) as conn:
-                # Simulate a sync that died after committing rows but before
-                # its native refresh.
+                # Simulate an older sync (before native_refresh_queue) that
+                # died after committing rows but before its native refresh.
                 conn.execute(
                     "UPDATE sessions SET native_total_input_tokens = 1"
                     " WHERE session_id = 'zzz-parent'"
                 )
                 conn.execute(
-                    "UPDATE logpile_meta SET value = '1' WHERE key = 'native_refresh_pending'"
+                    "INSERT OR REPLACE INTO logpile_meta (key, value)"
+                    " VALUES ('native_refresh_pending', '1')"
                 )
                 conn.commit()
 

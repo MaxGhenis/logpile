@@ -23,6 +23,7 @@ from test_incremental_parse import _serialize, claude_records, codex_records
 
 import logpile.sync as sync_module
 from logpile.diskguard import GIB, DiskGuardDecision, DiskGuardPolicy
+from logpile.search import replace_session_search_index
 from logpile.sync import (
     SyncLimits,
     SyncStatus,
@@ -69,8 +70,14 @@ def snapshot(db_path: Path, shared: Path) -> dict:
         ):
             values = dict(zip([*columns, "shared_path"], tuple(row), strict=True))
             shared_path = values.pop("shared_path")
+            # Relative to the harness root, with the harness's own shared-dir
+            # name masked: the private archive root is named after it.
             values["shared_relpath"] = (
-                os.path.relpath(shared_path, shared) if shared_path else None
+                os.path.relpath(shared_path, shared.parent).replace(
+                    shared.name, "SHARED"
+                )
+                if shared_path
+                else None
             )
             sessions.append(values)
         daily_columns = [
@@ -215,69 +222,143 @@ def _lines(records) -> bytes:
     return "".join(json.dumps(record) + "\n" for record in records).encode()
 
 
-# A Claude record that first marks a file as a sidechain renames the session
-# (agent-<id>) mid-file; sync then leaves the earlier row behind, which is
-# pre-existing behavior unrelated to incremental parsing (the parser-level
-# property covers identity). The sync-level property uses stable identities.
-stable_claude_records = claude_records.map(
-    lambda records: [
-        record
-        for record in records
-        if not record.get("isSidechain") and not record.get("agentId")
-    ]
+def _without(records, predicate):
+    return [record for record in records if not predicate(record)]
+
+
+def _renames_session(record) -> bool:
+    return bool(record.get("isSidechain") or record.get("agentId"))
+
+
+def _marks_private(record) -> bool:
+    return ":private" in json.dumps(record)
+
+
+# Two sessions are history dependent by design, in the old code as in this
+# one: a file that first becomes a sidechain part-way through is renamed
+# (agent-<id>) and the earlier row is left behind, and a privacy marker
+# tightens an existing row to private (keeping its last stats) but keeps a
+# never-seen session out entirely. Comparing against a fresh sync of the
+# final bytes therefore uses records without those; the same-schedule
+# comparison below keeps them.
+history_free_claude = claude_records.map(
+    lambda records: _without(
+        records, lambda r: _renames_session(r) or _marks_private(r)
+    )
 )
+history_free_codex = codex_records.map(
+    lambda records: _without(records, _marks_private)
+)
+append_schedules = st.lists(
+    st.tuples(st.floats(0, 1), st.floats(0, 1)), min_size=1, max_size=4
+)
+
+
+def _full_search_replacement(
+    conn, session_id, *, transcript_path, scan, shared_dir=None
+):
+    del scan
+    return replace_session_search_index(
+        conn, session_id, transcript_path=transcript_path, shared_dir=shared_dir
+    )
+
+
+def _grow_and_sync(root, claude_data, codex_data, cuts, harnesses):
+    """Append each file up to every cut, syncing each harness after each step.
+
+    ``harnesses`` pairs a SyncHarness with its limits and a flag that forces
+    the reference behavior: no parse state and a full search replacement.
+    Returns whether any incremental parse resumed from a checkpoint.
+    """
+    home = harnesses[0][0].home
+    claude_path = _claude_path(home, "session-a")
+    codex_path = _codex_path(home, "rollout-2026-09-29-a")
+    written = [0, 0]
+    resumed = False
+    for claude_cut, codex_cut in [*sorted(cuts), (1.0, 1.0)]:
+        for index, (path, data, fraction) in enumerate(
+            (
+                (claude_path, claude_data, claude_cut),
+                (codex_path, codex_data, codex_cut),
+            )
+        ):
+            target = max(written[index], int(len(data) * fraction))
+            _append(path, data[written[index] : target])
+            written[index] = target
+        for harness, limits, reference in harnesses:
+            if reference:
+                with mock.patch.object(
+                    sync_module,
+                    "update_session_search_index",
+                    side_effect=_full_search_replacement,
+                ):
+                    harness.sync(limits)
+                continue
+            with mock.patch.object(
+                sync_module, "parse_transcript", wraps=sync_module.parse_transcript
+            ) as spy:
+                harness.sync(limits)
+            resumed = resumed or any(
+                call.kwargs.get("checkpoint") is not None for call in spy.call_args_list
+            )
+    return resumed
 
 
 class IncrementalSyncDifferentialTests(unittest.TestCase):
     @settings(
-        max_examples=25,
+        max_examples=60,
         deadline=None,
         suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
     )
     @given(
-        claude=stable_claude_records,
+        claude=claude_records,
         codex=codex_records,
         trailing=st.booleans(),
-        cuts=st.lists(
-            st.tuples(st.floats(0, 1), st.floats(0, 1)), min_size=1, max_size=4
-        ),
+        cuts=append_schedules,
+    )
+    def test_incremental_sync_matches_full_reprocessing_on_the_same_schedule(
+        self, claude, codex, trailing, cuts
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            incremental = SyncHarness(root, "incremental")
+            reference = SyncHarness(root, "reference")
+            resumed = _grow_and_sync(
+                root,
+                _serialize(claude, trailing, None),
+                _serialize(codex, trailing, None),
+                cuts,
+                [(incremental, INCREMENTAL, False), (reference, FULL, True)],
+            )
+            event(f"resumed={resumed}")
+            self.assertEqual(incremental.snapshot(), reference.snapshot())
+
+    @settings(
+        max_examples=60,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
+    )
+    @given(
+        claude=history_free_claude,
+        codex=history_free_codex,
+        trailing=st.booleans(),
+        cuts=append_schedules,
     )
     def test_incremental_sync_matches_full_sync_of_final_bytes(
         self, claude, codex, trailing, cuts
     ):
-        claude_data = _serialize(claude, trailing, None)
-        codex_data = _serialize(codex, trailing, None)
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             incremental = SyncHarness(root, "incremental")
-            claude_path = _claude_path(incremental.home, "session-a")
-            codex_path = _codex_path(incremental.home, "rollout-2026-09-29-a")
-            written = [0, 0]
-            resumed = False
-            for claude_cut, codex_cut in [*sorted(cuts), (1.0, 1.0)]:
-                for index, (path, data, fraction) in enumerate(
-                    (
-                        (claude_path, claude_data, claude_cut),
-                        (codex_path, codex_data, codex_cut),
-                    )
-                ):
-                    target = max(written[index], int(len(data) * fraction))
-                    _append(path, data[written[index] : target])
-                    written[index] = target
-                with mock.patch.object(
-                    sync_module,
-                    "parse_transcript",
-                    wraps=sync_module.parse_transcript,
-                ) as spy:
-                    incremental.sync()
-                resumed = resumed or any(
-                    call.kwargs.get("checkpoint") is not None
-                    for call in spy.call_args_list
-                )
+            resumed = _grow_and_sync(
+                root,
+                _serialize(claude, trailing, None),
+                _serialize(codex, trailing, None),
+                cuts,
+                [(incremental, INCREMENTAL, False)],
+            )
             event(f"resumed={resumed}")
-
             full = SyncHarness(root, "full")
-            self.assertEqual(full.home, incremental.home)
             full.sync(FULL)
             self.assertEqual(incremental.snapshot(), full.snapshot())
 

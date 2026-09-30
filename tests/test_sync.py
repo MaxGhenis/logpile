@@ -1813,9 +1813,12 @@ class SyncTests(unittest.TestCase):
             )
 
             with open_sqlite(db_path) as conn:
+                # A legacy row: written before structure_version, with its
+                # structure never computed.
                 conn.execute("DELETE FROM session_paths WHERE session_id = 'session-1'")
                 conn.execute(
-                    "UPDATE sessions SET workspace_root = NULL WHERE session_id = 'session-1'"
+                    "UPDATE sessions SET workspace_root = NULL, structure_version = 0 "
+                    "WHERE session_id = 'session-1'"
                 )
                 conn.commit()
 
