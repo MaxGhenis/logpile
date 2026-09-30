@@ -649,6 +649,40 @@ class DuplicateCopyMarkerTests(unittest.TestCase):
             self.assertEqual(rows, [])
             self.assertFalse(any(harness.shared.rglob("*.jsonl")))
 
+    def test_find_private_marker_refuses_to_conclude_from_a_failed_read(self):
+        from logpile.parsers import find_private_marker
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "copy.jsonl"
+            _append(path, _lines(_session_records(2)))
+            self.assertIsNone(find_private_marker(path))
+            with (
+                mock.patch("builtins.open", side_effect=PermissionError(13, "denied")),
+                self.assertRaises(OSError),
+            ):
+                find_private_marker(path)
+
+    def test_a_failed_cache_save_does_not_abort_sync(self):
+        with tempfile.TemporaryDirectory() as td:
+            harness = SyncHarness(Path(td), "dups")
+            self._copies(harness)
+            real_replace = os.replace
+
+            def fail_cache_replace(src, dst, *args, **kwargs):
+                if str(dst).endswith("copy-markers.json"):
+                    raise OSError(28, "No space left on device")
+                return real_replace(src, dst, *args, **kwargs)
+
+            with mock.patch.object(
+                sync_module.os, "replace", side_effect=fail_cache_replace
+            ):
+                result = harness.sync()
+            self.assertEqual(result.status, SyncStatus.COMPLETED)
+            state_dir = parse_state_dir(harness.db)
+            self.assertEqual(
+                [p.name for p in state_dir.iterdir() if p.name.endswith(".tmp")], []
+            )
+
     def test_unchanged_copies_are_not_rescanned_for_markers(self):
         with tempfile.TemporaryDirectory() as td:
             harness = SyncHarness(Path(td), "dups")

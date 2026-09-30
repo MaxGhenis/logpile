@@ -2518,7 +2518,7 @@ class _CopyMarkerCache:
         info = path.stat()
         identity = [info.st_dev, info.st_ino, info.st_size, info.st_mtime]
         cached = self.entries.get(str(path))
-        if isinstance(cached, list) and cached[:4] == identity:
+        if isinstance(cached, list) and len(cached) == 5 and cached[:4] == identity:
             return cached[4]
         marker = find_private_marker(path)
         self.entries[str(path)] = [*identity, marker]
@@ -2573,7 +2573,12 @@ def _canonical_claude_copies(
                 (markers.marker(path) is not None, path.stat().st_mtime, str(path))
                 for path in copies
             ]
-        except OSError:
+        except OSError as exc:
+            print(
+                f"Warning: skipped session {stem} this sync: a copy could not be "
+                f"read to check for a privacy marker ({exc}).",
+                file=sys.stderr,
+            )
             chosen[stem] = None
             continue
         chosen[stem] = Path(max(ranked)[2])
