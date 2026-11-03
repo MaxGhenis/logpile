@@ -549,10 +549,12 @@ def _row_security(conn) -> dict[str, bool]:
 
 
 def _privileges(conn, roles) -> list[tuple[str, str, str]]:
-    """Every privilege a role holds on a relation in the archive's schema.
+    """Every privilege a role holds on a relation in the archive's schema or on
+    one of its columns, system columns such as ctid included.
 
-    has_table_privilege and has_any_column_privilege count grants to PUBLIC and
-    to roles the role inherits from, as PostgreSQL does when it checks access.
+    has_table_privilege and has_column_privilege count grants to PUBLIC and to
+    roles the role inherits from, as PostgreSQL does when it checks access.
+    has_any_column_privilege skips system columns, so this asks about each one.
     """
     table_privileges = list(TABLE_PRIVILEGES)
     if conn.info.server_version >= 170000:
@@ -569,10 +571,12 @@ def _privileges(conn, roles) -> list[tuple[str, str, str]]:
              unnest(%(table_privileges)s::text[]) AS p(privilege)
         WHERE has_table_privilege(r.role, a.oid, p.privilege)
         UNION ALL
-        SELECT a.relname, r.role, 'column ' || p.privilege
-        FROM archive a, unnest(%(roles)s::text[]) AS r(role),
-             unnest(%(column_privileges)s::text[]) AS p(privilege)
-        WHERE has_any_column_privilege(r.role, a.oid, p.privilege)
+        SELECT a.relname, r.role, p.privilege || ' (' || col.attname || ')'
+        FROM archive a
+        JOIN pg_attribute col ON col.attrelid = a.oid AND NOT col.attisdropped
+        CROSS JOIN unnest(%(roles)s::text[]) AS r(role)
+        CROSS JOIN unnest(%(column_privileges)s::text[]) AS p(privilege)
+        WHERE has_column_privilege(r.role, a.oid, col.attnum, p.privilege)
         ORDER BY 1, 2, 3
         """,
         {
@@ -585,7 +589,10 @@ def _privileges(conn, roles) -> list[tuple[str, str, str]]:
 
 
 def _acl_entries(conn) -> list[tuple[str, str, str, str]]:
-    """Each (table, column or '', grantee or PUBLIC, privilege) the ACLs list."""
+    """Each (table, column or '', grantee or PUBLIC, privilege) the ACLs list.
+
+    A dropped column's ACL gives no access, so this leaves it out.
+    """
     return conn.execute(
         """
         SELECT c.relname, '', coalesce(r.rolname, 'PUBLIC'), acl.privilege_type
@@ -596,7 +603,7 @@ def _acl_entries(conn) -> list[tuple[str, str, str, str]]:
         UNION ALL
         SELECT c.relname, a.attname, coalesce(r.rolname, 'PUBLIC'), acl.privilege_type
         FROM pg_class c
-        JOIN pg_attribute a ON a.attrelid = c.oid
+        JOIN pg_attribute a ON a.attrelid = c.oid AND NOT a.attisdropped
         CROSS JOIN aclexplode(a.attacl) AS acl
         LEFT JOIN pg_roles r ON r.oid = acl.grantee
         WHERE c.relname = ANY(%(tables)s)
@@ -751,10 +758,11 @@ def test_row_level_security_hides_rows_from_a_later_grant(archive_db):
 
 
 TABLE_GRANTS = [*TABLE_PRIVILEGES]
+# ctid is a system column: a grant on it shows up only in has_column_privilege.
 COLUMNS = {
-    "logpile_raw_objects": ["sha256", "bucket"],
-    "logpile_raw_files": ["file_id", "source"],
-    "logpile_raw_chunks": ["file_id", "content"],
+    "logpile_raw_objects": ["sha256", "bucket", "ctid"],
+    "logpile_raw_files": ["file_id", "source", "ctid"],
+    "logpile_raw_chunks": ["file_id", "content", "ctid"],
 }
 
 
@@ -828,6 +836,25 @@ def test_ensure_schema_closes_any_grants_and_touches_nothing_else(
         versions_after = _catalog_versions(conn)
     rewritten = {t: versions_after[t] != versions_before[t] for t in TABLES}
     assert rewritten == needed_closing
+
+
+def test_a_grant_on_a_dropped_column_changes_nothing(archive_db):
+    """PostgreSQL 14 keeps a dropped column's ACL, which REVOKE can't clear."""
+    db = archive_db
+    archive = db.archive()
+    archive.ensure_schema()
+    with _connect(db.owner_url(), autocommit=True) as conn:
+        conn.execute("ALTER TABLE logpile_raw_files ADD COLUMN gone text")
+        conn.execute("GRANT SELECT (gone) ON logpile_raw_files TO anon, authenticated")
+        conn.execute("ALTER TABLE logpile_raw_files DROP COLUMN gone")
+    with _connect(db.admin_url) as conn:
+        before = _catalog_versions(conn)
+
+    archive.ensure_schema()
+
+    with _connect(db.admin_url) as conn:
+        assert _catalog_versions(conn) == before
+    _assert_closed(db)
 
 
 @pytest.mark.parametrize("search_index", [True, False])

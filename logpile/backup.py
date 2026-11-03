@@ -82,16 +82,19 @@ CREATE TABLE IF NOT EXISTS logpile_raw_chunks (
 """
 
 SUPABASE_ACCESS_SQL = """
--- Keep Supabase's Data API out of the archive. Supabase's default privileges give
--- anon and authenticated every new table in public. logpile connects as the
--- tables' owner, and row-level security doesn't limit an owner, so turning it on
--- with no policies costs logpile nothing. The block writes to the catalog only
--- where a table still lacks row-level security or PUBLIC, anon or authenticated
--- still holds a privilege on it, so a settled archive sees no catalog write and
--- no lock. ALTER TABLE needs an ACCESS EXCLUSIVE lock, and the block asks for
--- all three tables in one LOCK with NOWAIT: if another transaction holds one, the
--- block fails at once with "could not obtain lock" rather than queueing. If that
--- happens, run it again; ensure_schema retries on its own.
+-- Keep Supabase's Data API out of the archive. Supabase's initial schema sets
+-- default privileges in public that grant anon and authenticated all privileges
+-- on new tables. logpile connects as the tables' owner, and row-level security
+-- doesn't limit an owner, so turning it on with no policies costs logpile
+-- nothing. The block writes to the catalog only where a table still lacks
+-- row-level security or PUBLIC, anon or authenticated still holds a privilege on
+-- it or on one of its columns, so a settled archive sees no catalog write and no
+-- lock. It ignores grants on dropped columns, which give no access: PostgreSQL 14
+-- keeps them after the drop, and REVOKE can't clear them. ALTER TABLE needs an
+-- ACCESS EXCLUSIVE lock, and the block asks for all three tables in one LOCK with
+-- NOWAIT: if another transaction holds one, the block fails at once with "could
+-- not obtain lock" rather than queueing. If that happens, run it again;
+-- ensure_schema retries on its own.
 DO $$
 DECLARE
     archive_table regclass;
@@ -127,7 +130,7 @@ BEGIN
                 UNION ALL
                 SELECT acl.grantee
                 FROM pg_attribute a, aclexplode(a.attacl) AS acl
-                WHERE a.attrelid = archive_table
+                WHERE a.attrelid = archive_table AND NOT a.attisdropped
             ) AS grants
             LEFT JOIN pg_roles r ON r.oid = grants.grantee
             WHERE grants.grantee = 0 OR r.rolname IN ('anon', 'authenticated')
