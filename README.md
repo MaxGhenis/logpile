@@ -363,7 +363,9 @@ Backs up immutable raw logs to object storage and indexes exact searchable chunk
 # See the exact local files and bytes that would be preserved.
 logpile backup plan
 
-# Print the Postgres schema for Supabase.
+# Print the Postgres schema for Supabase. The Data API's anon and authenticated
+# roles can't reach the archive; the service_role key still can. Connect
+# LOGPILE_SUPABASE_DB_URL as the role that owns the tables.
 logpile backup schema
 
 # Upload raw objects to R2/S3 and index exact chunks in Supabase Postgres.
@@ -402,6 +404,19 @@ Full-text search is indexed by default, while substring search falls back to a
 direct scan so bulk imports do not create a very large trigram index unless a
 deployment chooses to add one later. The backup command never deletes local
 files.
+
+The schema turns on row-level security, with no policies, for the three archive
+tables and revokes the privileges that PUBLIC, anon and authenticated hold on
+them. The Data API's anon and authenticated roles then can't reach the archive;
+the service_role key still can, and so can the table owner that logpile
+connects as, since row-level security doesn't limit an owner. Cloud `sync`,
+`backup push` and `backup index` make the same change before they write, so a
+later grant to those roles lasts only until the next run. Turning row-level
+security on needs each table to itself for a moment: if another session holds
+one, the printed SQL stops with "could not obtain lock" (run it again), and the
+commands keep trying for 30 seconds before they stop and ask you to retry. The
+revoke can't reach a grant that another role made through a grant option; to
+remove one, revoke that role's grant option with CASCADE.
 
 ### `logpile serve`
 
