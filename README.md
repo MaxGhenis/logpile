@@ -363,7 +363,9 @@ Backs up immutable raw logs to object storage and indexes exact searchable chunk
 # See the exact local files and bytes that would be preserved.
 logpile backup plan
 
-# Print the Postgres schema for Supabase.
+# Print the Postgres schema for Supabase. It turns on row-level security and
+# revokes Supabase's anon and authenticated roles, so the Data API can't reach
+# the archive. Connect LOGPILE_SUPABASE_DB_URL as the role that owns the tables.
 logpile backup schema
 
 # Upload raw objects to R2/S3 and index exact chunks in Supabase Postgres.

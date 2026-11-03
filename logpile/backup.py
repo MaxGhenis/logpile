@@ -83,6 +83,34 @@ CREATE INDEX IF NOT EXISTS idx_logpile_raw_chunks_source
     ON logpile_raw_chunks(source);
 CREATE INDEX IF NOT EXISTS idx_logpile_raw_chunks_role
     ON logpile_raw_chunks(role);
+
+-- Keep Supabase's Data API out of the archive. Its default privileges grant anon
+-- and authenticated every new table in public, and the writer connects as the
+-- table owner, which row-level security does not limit. The catalog check spares
+-- later runs the exclusive lock that ALTER TABLE takes.
+DO $$
+DECLARE
+    table_name TEXT;
+    role_name TEXT;
+BEGIN
+    FOREACH table_name IN ARRAY ARRAY[
+        'logpile_raw_objects',
+        'logpile_raw_files',
+        'logpile_raw_chunks'
+    ] LOOP
+        IF NOT (
+            SELECT relrowsecurity FROM pg_class WHERE oid = table_name::regclass
+        ) THEN
+            EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
+        END IF;
+        FOR role_name IN
+            SELECT rolname FROM pg_roles WHERE rolname IN ('anon', 'authenticated')
+        LOOP
+            EXECUTE format('REVOKE ALL ON TABLE %I FROM %I', table_name, role_name);
+        END LOOP;
+    END LOOP;
+END
+$$;
 """
 
 SUPABASE_SEARCH_INDEX_SQL = """
@@ -530,12 +558,15 @@ def plan_to_dict(plan: BackupPlan) -> dict:
 
 def _sql_statements(sql: str) -> Iterator[str]:
     buffer: list[str] = []
+    in_dollar_quote = False
     for line in sql.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
         buffer.append(line)
-        if stripped.endswith(";"):
+        if stripped.count("$$") % 2:
+            in_dollar_quote = not in_dollar_quote
+        if stripped.endswith(";") and not in_dollar_quote:
             statement = "\n".join(buffer).strip()
             if statement:
                 yield statement
