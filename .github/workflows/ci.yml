@@ -22,6 +22,8 @@ jobs:
           --health-retries 10
     env:
       LOGPILE_TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      # Fail, rather than skip, any test that can't reach that server.
+      LOGPILE_REQUIRE_TEST_POSTGRES: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v9.0.0

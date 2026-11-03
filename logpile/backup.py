@@ -6,9 +6,11 @@ import hashlib
 import json
 import mimetypes
 import os
+import random
 import re
 import sqlite3
 import tempfile
+import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -24,7 +26,14 @@ from .parsers import _extract_text, _normalize_codex_record
 MAX_TEXT_CHARS = 12_000
 CHUNK_OVERLAP_CHARS = 400
 
-SUPABASE_BASE_SCHEMA_SQL = """
+# ensure_schema holds this advisory lock while it changes the schema, so two runs
+# never race each other's DDL. The key is the first 8 bytes of
+# sha256("logpile.backup.ensure_schema"), read as a signed integer.
+SCHEMA_LOCK_KEY = 8541411456439621444
+# How long ensure_schema keeps asking for the archive's tables before it gives up.
+ACCESS_LOCK_BUDGET_SECONDS = 30.0
+
+SUPABASE_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS logpile_raw_objects (
     sha256 TEXT PRIMARY KEY,
     size_bytes BIGINT NOT NULL,
@@ -70,55 +79,104 @@ CREATE TABLE IF NOT EXISTS logpile_raw_chunks (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (file_id, event_index, fragment_index, chunk_index)
 );
+"""
 
-CREATE INDEX IF NOT EXISTS idx_logpile_raw_files_sha256
-    ON logpile_raw_files(sha256);
-CREATE INDEX IF NOT EXISTS idx_logpile_raw_files_source
-    ON logpile_raw_files(source);
-CREATE INDEX IF NOT EXISTS idx_logpile_raw_files_relative_path
-    ON logpile_raw_files(relative_path);
-CREATE INDEX IF NOT EXISTS idx_logpile_raw_chunks_session
-    ON logpile_raw_chunks(session_id);
-CREATE INDEX IF NOT EXISTS idx_logpile_raw_chunks_source
-    ON logpile_raw_chunks(source);
-CREATE INDEX IF NOT EXISTS idx_logpile_raw_chunks_role
-    ON logpile_raw_chunks(role);
-
--- Keep Supabase's Data API out of the archive. Its default privileges grant anon
--- and authenticated every new table in public, and the writer connects as the
--- table owner, which row-level security does not limit. The catalog check spares
--- later runs the exclusive lock that ALTER TABLE takes.
+SUPABASE_ACCESS_SQL = """
+-- Keep Supabase's Data API out of the archive. Supabase's default privileges give
+-- anon and authenticated every new table in public. logpile connects as the
+-- tables' owner, and row-level security doesn't limit an owner, so turning it on
+-- with no policies costs logpile nothing. The block writes to the catalog only
+-- where a table still lacks row-level security or PUBLIC, anon or authenticated
+-- still holds a privilege on it, so a settled archive sees no catalog write and
+-- no lock. ALTER TABLE needs an ACCESS EXCLUSIVE lock, and the block asks for
+-- all three tables in one LOCK with NOWAIT: if another transaction holds one, the
+-- block fails at once with "could not obtain lock" rather than queueing. If that
+-- happens, run it again; ensure_schema retries on its own.
 DO $$
 DECLARE
-    table_name TEXT;
-    role_name TEXT;
+    archive_table regclass;
+    grantee_name text;
 BEGIN
-    FOREACH table_name IN ARRAY ARRAY[
+    IF EXISTS (
+        SELECT 1 FROM pg_class
+        WHERE oid IN (
+            'logpile_raw_objects'::regclass,
+            'logpile_raw_files'::regclass,
+            'logpile_raw_chunks'::regclass
+        )
+        AND NOT relrowsecurity
+    ) THEN
+        LOCK TABLE logpile_raw_objects, logpile_raw_files, logpile_raw_chunks
+            IN ACCESS EXCLUSIVE MODE NOWAIT;
+    END IF;
+    FOREACH archive_table IN ARRAY ARRAY[
         'logpile_raw_objects',
         'logpile_raw_files',
         'logpile_raw_chunks'
-    ] LOOP
-        IF NOT (
-            SELECT relrowsecurity FROM pg_class WHERE oid = table_name::regclass
-        ) THEN
-            EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', table_name);
+    ]::regclass[] LOOP
+        IF NOT (SELECT relrowsecurity FROM pg_class WHERE oid = archive_table) THEN
+            EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', archive_table);
         END IF;
-        FOR role_name IN
-            SELECT rolname FROM pg_roles WHERE rolname IN ('anon', 'authenticated')
+        FOR grantee_name IN
+            SELECT DISTINCT
+                CASE WHEN grants.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(r.rolname) END
+            FROM (
+                SELECT acl.grantee
+                FROM pg_class c, aclexplode(c.relacl) AS acl
+                WHERE c.oid = archive_table
+                UNION ALL
+                SELECT acl.grantee
+                FROM pg_attribute a, aclexplode(a.attacl) AS acl
+                WHERE a.attrelid = archive_table
+            ) AS grants
+            LEFT JOIN pg_roles r ON r.oid = grants.grantee
+            WHERE grants.grantee = 0 OR r.rolname IN ('anon', 'authenticated')
         LOOP
-            EXECUTE format('REVOKE ALL ON TABLE %I FROM %I', table_name, role_name);
+            EXECUTE format('REVOKE ALL ON TABLE %s FROM %s', archive_table, grantee_name);
         END LOOP;
     END LOOP;
 END
 $$;
 """
 
-SUPABASE_SEARCH_INDEX_SQL = """
-CREATE INDEX IF NOT EXISTS idx_logpile_raw_chunks_fts
-    ON logpile_raw_chunks USING gin (to_tsvector('english', content))
-    WHERE role IS DISTINCT FROM 'tool_result';
-"""
 
+@dataclass(frozen=True)
+class SchemaIndex:
+    name: str
+    table: str
+    sql: str
+
+
+def _btree_index(name: str, table: str, column: str) -> SchemaIndex:
+    sql = f"CREATE INDEX IF NOT EXISTS {name}\n    ON {table}({column});"
+    return SchemaIndex(name, table, sql)
+
+
+SUPABASE_INDEXES = (
+    _btree_index("idx_logpile_raw_files_sha256", "logpile_raw_files", "sha256"),
+    _btree_index("idx_logpile_raw_files_source", "logpile_raw_files", "source"),
+    _btree_index(
+        "idx_logpile_raw_files_relative_path", "logpile_raw_files", "relative_path"
+    ),
+    _btree_index("idx_logpile_raw_chunks_session", "logpile_raw_chunks", "session_id"),
+    _btree_index("idx_logpile_raw_chunks_source", "logpile_raw_chunks", "source"),
+    _btree_index("idx_logpile_raw_chunks_role", "logpile_raw_chunks", "role"),
+)
+SUPABASE_INDEX_SQL = "\n" + "\n".join(index.sql for index in SUPABASE_INDEXES) + "\n"
+
+SUPABASE_SEARCH_INDEX = SchemaIndex(
+    "idx_logpile_raw_chunks_fts",
+    "logpile_raw_chunks",
+    "CREATE INDEX IF NOT EXISTS idx_logpile_raw_chunks_fts\n"
+    "    ON logpile_raw_chunks USING gin (to_tsvector('english', content))\n"
+    "    WHERE role IS DISTINCT FROM 'tool_result';",
+)
+SUPABASE_SEARCH_INDEX_SQL = f"\n{SUPABASE_SEARCH_INDEX.sql}\n"
+
+# What `logpile backup schema` prints, in the order ensure_schema applies it.
+SUPABASE_BASE_SCHEMA_SQL = (
+    f"{SUPABASE_TABLES_SQL}\n{SUPABASE_ACCESS_SQL}\n{SUPABASE_INDEX_SQL}"
+)
 SUPABASE_SCHEMA_SQL = f"{SUPABASE_BASE_SCHEMA_SQL}\n{SUPABASE_SEARCH_INDEX_SQL}"
 
 
@@ -556,23 +614,148 @@ def plan_to_dict(plan: BackupPlan) -> dict:
     }
 
 
+# Whitespace to PostgreSQL's lexer. PostgreSQL 17 counts the vertical tab;
+# PostgreSQL 14 reports it as a syntax error.
+_SQL_WHITESPACE = " \t\n\r\f\v"
+# A dollar-quote delimiter: $$, or $tag$ where the tag starts with a letter, an
+# underscore or a non-ASCII character and goes on with those or digits.
+_DOLLAR_QUOTE_DELIMITER = re.compile(
+    r"\$(?:[A-Za-z_\u0080-\U0010ffff][A-Za-z0-9_\u0080-\U0010ffff]*)?\$"
+)
+
+
+def _starts_identifier(char: str) -> bool:
+    return char == "_" or not char.isascii() or char.isalpha()
+
+
+def _continues_identifier(char: str) -> bool:
+    return _starts_identifier(char) or char == "$" or "0" <= char <= "9"
+
+
+def _end_of_line(sql: str, i: int) -> int:
+    """Return the index of the line break that ends the line holding sql[i]."""
+    while i < len(sql) and sql[i] not in "\n\r":
+        i += 1
+    return i
+
+
+def _continuation(sql: str, i: int) -> int | None:
+    """Return the index of the quote that continues a string ending before sql[i].
+
+    PostgreSQL joins two string literals when only whitespace and -- comments
+    separate them and that stretch holds a line break. It reads the second
+    literal the way it read the first: after E'a' and a line break, 'b\\''
+    holds an escaped quote.
+    """
+    line_break = False
+    while i < len(sql):
+        if sql[i] in "\n\r":
+            line_break = True
+            i += 1
+        elif sql[i] in _SQL_WHITESPACE:
+            i += 1
+        elif sql.startswith("--", i):
+            i = _end_of_line(sql, i)
+        else:
+            return i if line_break and sql[i] == "'" else None
+    return None
+
+
+def _end_of_quoted(sql: str, start: int, quote: str, *, backslash: bool) -> int:
+    """Return the index just past the quoted run that opens at sql[start]."""
+    i = start + 1
+    while i < len(sql):
+        if backslash and sql[i] == "\\":
+            i += 2
+        elif sql[i] != quote:
+            i += 1
+        elif sql.startswith(quote, i + 1):
+            i += 2
+        else:
+            continued = _continuation(sql, i + 1) if quote == "'" else None
+            if continued is None:
+                return i + 1
+            i = continued + 1
+    return len(sql)
+
+
+def _end_of_block_comment(sql: str, start: int) -> int:
+    """Return the index just past the /* */ comment that opens at sql[start]."""
+    depth = 0
+    i = start
+    while i < len(sql):
+        if sql.startswith("/*", i):
+            depth += 1
+            i += 2
+        elif sql.startswith("*/", i):
+            depth -= 1
+            i += 2
+            if depth == 0:
+                return i
+        else:
+            i += 1
+    return len(sql)
+
+
 def _sql_statements(sql: str) -> Iterator[str]:
-    buffer: list[str] = []
-    in_dollar_quote = False
-    for line in sql.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        buffer.append(line)
-        if stripped.count("$$") % 2:
-            in_dollar_quote = not in_dollar_quote
-        if stripped.endswith(";") and not in_dollar_quote:
-            statement = "\n".join(buffer).strip()
-            if statement:
-                yield statement
-            buffer.clear()
-    if buffer:
-        yield "\n".join(buffer).strip()
+    """Split a SQL script at each semicolon outside quotes and comments.
+
+    The scanner follows PostgreSQL's lexer for everything that can hide a
+    semicolon: single-quoted strings with '' escapes, E'' strings with backslash
+    escapes, string literals that continue across a line break, double-quoted
+    identifiers, -- comments, nested /* */ comments, and $$ or $tag$ dollar
+    quotes. A $ inside an identifier, as in a$b$c, stays part of the identifier.
+    It doesn't count parentheses or BEGIN ATOMIC ... END, so it would cut a
+    multi-action CREATE RULE or a SQL-standard function body at their inner
+    semicolons, and it assumes standard_conforming_strings is on, PostgreSQL's
+    default. Each statement keeps its text exactly, comments included, minus
+    surrounding whitespace; a stretch that holds only comments and whitespace
+    yields nothing.
+    """
+    start = 0
+    has_code = False
+    i = 0
+    while i < len(sql):
+        char = sql[i]
+        if char == ";":
+            if has_code:
+                yield sql[start : i + 1].strip(_SQL_WHITESPACE)
+            start = i + 1
+            has_code = False
+            i += 1
+        elif char in _SQL_WHITESPACE:
+            i += 1
+        elif sql.startswith("--", i):
+            i = _end_of_line(sql, i)
+        elif sql.startswith("/*", i):
+            i = _end_of_block_comment(sql, i)
+        else:
+            has_code = True
+            if char in "'\"":
+                i = _end_of_quoted(sql, i, char, backslash=False)
+            elif char == "$":
+                opener = _DOLLAR_QUOTE_DELIMITER.match(sql, i)
+                if opener is None:
+                    i += 1
+                else:
+                    close = sql.find(opener.group(), opener.end())
+                    i = len(sql) if close < 0 else close + len(opener.group())
+            elif _starts_identifier(char):
+                end = i + 1
+                while end < len(sql) and _continues_identifier(sql[end]):
+                    end += 1
+                if end == i + 1 and char in "Ee" and sql.startswith("'", end):
+                    end = _end_of_quoted(sql, end, "'", backslash=True)
+                i = end
+            else:
+                i += 1
+    if has_code:
+        yield sql[start:].strip(_SQL_WHITESPACE)
+
+
+def _wait_before_retry() -> None:
+    """Back off 50 to 250 ms, at random, so retrying runs spread out."""
+    time.sleep(random.uniform(0.05, 0.25))
 
 
 def _json_dumps(value) -> str:
@@ -1036,12 +1219,83 @@ class SupabaseArchive:
         )
 
     def ensure_schema(self, *, create_search_index: bool = True) -> None:
-        with self.connect() as conn:
-            sql = SUPABASE_BASE_SCHEMA_SQL
-            if create_search_index:
-                sql = f"{sql}\n{SUPABASE_SEARCH_INDEX_SQL}"
-            for statement in _sql_statements(sql):
-                conn.execute(statement)
+        """Create the archive's tables and indexes and keep the Data API out.
+
+        Afterwards the Data API's anon and authenticated roles can't reach the
+        archive; the service_role key still can. Each step runs in its own
+        transaction: one creates the tables and closes them to anon and
+        authenticated, then each missing index gets one. The access change
+        commits before any index build starts, so a long build never runs under
+        the access block's ACCESS EXCLUSIVE locks. No step waits for a table
+        while it holds a lock that a push or `logpile backup index` could need,
+        so ensure_schema can't deadlock with either.
+        """
+        indexes = SUPABASE_INDEXES
+        if create_search_index:
+            indexes = (*indexes, SUPABASE_SEARCH_INDEX)
+        with self.connect(autocommit=True) as conn:
+            self._create_tables_and_close_access(conn)
+            self._create_missing_indexes(conn, indexes)
+
+    def _create_tables_and_close_access(self, conn) -> None:
+        statements = list(
+            _sql_statements(f"{SUPABASE_TABLES_SQL}\n{SUPABASE_ACCESS_SQL}")
+        )
+        # The budget starts at the first lock failure, so time spent waiting
+        # for another run's advisory lock doesn't count against it.
+        deadline = None
+        while True:
+            try:
+                with conn.transaction():
+                    conn.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK_KEY,))
+                    for statement in statements:
+                        conn.execute(statement)
+                return
+            except self._psycopg.errors.LockNotAvailable as exc:
+                now = time.monotonic()
+                if deadline is None:
+                    deadline = now + ACCESS_LOCK_BUDGET_SECONDS
+                elif now >= deadline:
+                    raise RuntimeError(
+                        "Another transaction held the archive tables for "
+                        f"{ACCESS_LOCK_BUDGET_SECONDS:g} seconds, so logpile could "
+                        "not turn on row-level security. Retry once it finishes."
+                    ) from exc
+                _wait_before_retry()
+
+    def _create_missing_indexes(self, conn, indexes: tuple[SchemaIndex, ...]) -> None:
+        for index in self._missing_indexes(conn, indexes):
+            with conn.transaction():
+                conn.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK_KEY,))
+                # Another run may have built it while this one waited for the lock.
+                if self._missing_indexes(conn, (index,)):
+                    conn.execute(index.sql)
+
+    @staticmethod
+    def _missing_indexes(conn, indexes: tuple[SchemaIndex, ...]) -> list[SchemaIndex]:
+        """Return the indexes whose names no relation in their table's schema has.
+
+        This mirrors CREATE INDEX IF NOT EXISTS, which skips when any relation in
+        the table's schema has the name, but takes no lock: CREATE INDEX IF NOT
+        EXISTS holds a SHARE lock on the table even when the index exists.
+        """
+        rows = conn.execute(
+            """
+            SELECT wanted.name
+            FROM unnest(%s::text[], %s::text[]) AS wanted(name, table_name)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM pg_class existing
+                WHERE existing.relname = wanted.name
+                  AND existing.relnamespace = (
+                      SELECT relnamespace FROM pg_class
+                      WHERE oid = wanted.table_name::regclass
+                  )
+            )
+            """,
+            ([index.name for index in indexes], [index.table for index in indexes]),
+        ).fetchall()
+        missing = {row["name"] for row in rows}
+        return [index for index in indexes if index.name in missing]
 
     def ensure_search_index(self) -> None:
         with self.connect() as conn:
